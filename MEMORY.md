@@ -18,7 +18,7 @@
 
 **ComfyUI Lifecycle Management:**
 - **Auto-start**: Automatically launches ComfyUI via embedded Python when needed (no manual startup required)
-- **Idle timeout auto-kill**: When `COMFYUI_AUTO_KILL=1`, ComfyUI is killed after `COMFYUI_IDLE_TIMEOUT` (default 180s) of inactivity instead of immediately. This allows chaining multiple ComfyUI tools without restarting each time, while still freeing VRAM when idle.
+- **Idle timeout auto-kill**: When `COMFYUI_AUTO_KILL=1`, ComfyUI is killed after `COMFYUI_IDLE_TIMEOUT` (default 60s) of inactivity instead of immediately. This allows chaining multiple ComfyUI tools without restarting each time, while still freeing VRAM when idle.
 - **Port management**: Handles Windows TIME_WAIT issues by waiting for port 8188 to be fully bindable
 - **3-strategy kill**: Direct process handle → port-based (netstat) → command-line matching (wmic)
 - **Pre-fetch output**: Downloads result bytes BEFORE killing ComfyUI when auto-kill is enabled
@@ -30,7 +30,7 @@
 - **Free memory**: If sufficient VRAM, calls free_memory() to unload models while keeping process warm
 - **Configured via**: `VRAM_PRESSURE_THRESHOLD_MB` (default: 8192)
 
-**OOM Issue:** Running ComfyUI directly (without auto-kill) causes major OOM when shared with vLLM on a 32GB GPU. The idle timeout (180s) balances convenience (chaining tools) with VRAM management (killing when idle).
+**OOM Issue:** Running ComfyUI directly (without auto-kill) causes major OOM when shared with vLLM on a 32GB GPU. The idle timeout (60s) balances convenience (chaining tools) with VRAM management (killing when idle).
 
 ---
 
@@ -38,7 +38,7 @@
 
 | File | Purpose | Key Classes/Functions |
 |------|---------|----------------------|
-| `config.py` | Configuration constants, model names, ComfyUI lifecycle | `COMFYUI_URL`, `COMFYUI_PYTHON`, `COMFYUI_MAIN`, `COMFYUI_ARGS`, `COMFYUI_AUTO_KILL`, `COMFYUI_IDLE_TIMEOUT`, `COMFYUI_START_TIMEOUT`, `WEBSOCKET_TIMEOUT`, `VRAM_PRESSURE_THRESHOLD_MB` |
+| `config.py` | Configuration constants, model names, ComfyUI lifecycle | `COMFYUI_URL`, `COMFYUI_START_CMD`, `COMFYUI_PYTHON`, `COMFYUI_MAIN`, `COMFYUI_ARGS`, `COMFYUI_AUTO_KILL`, `COMFYUI_IDLE_TIMEOUT`, `COMFYUI_START_TIMEOUT`, `WEBSOCKET_TIMEOUT`, `VRAM_PRESSURE_THRESHOLD_MB` |
 | `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
 | `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes, masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
 | `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()` |
@@ -62,7 +62,7 @@
 ### AI Image Generation (3)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=20, cfg=1.5, seed=None, negative_prompt="")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
+| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=6, cfg=1.5, seed=None, negative_prompt="")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
 | `img2img` | `(prompt, strength=0.7, guidance=4.0, seed=None)` | AI instructed editing via Flux Kontext |
 | `character_transform` | `(prompt, guidance=4.0, seed=None)` | Character pose/expression/action transforms |
 
@@ -156,7 +156,7 @@
 
 ### Idle Timeout Auto-Kill (when `COMFYUI_AUTO_KILL=1`)
 1. After workflow completes successfully: schedules idle kill via `_schedule_idle_kill()`
-2. Idle timer set to `COMFYUI_IDLE_TIMEOUT` (default 180s / 3 minutes)
+2. Idle timer set to `COMFYUI_IDLE_TIMEOUT` (default 60s / 1 minute)
 3. If a new workflow starts within the timeout: `_cancel_idle_kill()` cancels pending timer
 4. After timeout with no new workflow: `_do_idle_kill()` kills ComfyUI, freeing VRAM
 5. On error (RuntimeError, TimeoutError): immediate kill (no idle delay)
@@ -173,9 +173,10 @@
 |----------|---------|-------------|
 | `COMFYUI_PYTHON` | *(required via env var)* | Embedded Python path |
 | `COMFYUI_MAIN` | *(required via env var)* | ComfyUI entry point |
+| `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Launch args |
 | `COMFYUI_AUTO_KILL` | `0` | Kill after generation (0=use free_memory, 1=idle timeout) |
-| `COMFYUI_IDLE_TIMEOUT` | `180` | Seconds of inactivity before auto-killing (when AUTO_KILL=1) |
+| `COMFYUI_IDLE_TIMEOUT` | `60` | Seconds of inactivity before auto-killing (when AUTO_KILL=1) |
 | `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI startup |
 | `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion (10 min) |
 | `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM below this (MB) |
@@ -184,6 +185,7 @@
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
+| `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_INPUT_DIR` | `None` (auto-detected) | ComfyUI input directory |
 | `COMFYUI_OUTPUT_DIR` | `None` (auto-detected) | ComfyUI output directory |
 | `MAX_UNDO_STEPS` | `20` | Maximum undo history entries |
@@ -220,7 +222,7 @@
 - **Undo/Redo** — Full state snapshots (deepcopy via Layer.to_dict/from_dict), limited to 20 steps
 - **Session Management** — Canvas instances keyed by session ID, default session: "default"
 - **ComfyUI Auto-Start** — Eliminates manual ComfyUI startup
-- **Idle Timeout Kill** — 180s idle timeout balances tool chaining with VRAM management
+- **Idle Timeout Kill** — 60s idle timeout balances tool chaining with VRAM management
 - **Pre-Fetch Output** — Downloads result before killing ComfyUI
 - **VRAM Pressure Management** — Adaptive cleanup based on VRAM pressure from vLLM
 - **No External Test Scripts** — All testing done through MCP tool calls, not standalone Python scripts
@@ -235,7 +237,7 @@
 | Model | Directory | Purpose |
 |-------|-----------|---------|
 | `flux-2-klein-9b.safetensors` | diffusion_models | Text-to-image (photorealistic — Flux2 Klein 9B) — **CRITICAL: use 4-6 steps max** (quality diminishes after ~6 steps, artifacts/over-smoothing, increased latency) |
-| `qwen_3_4b.safetensors` | text_encoders | Flux2 Klein text encoder |
+| `qwen_3_8b_fp8mixed.safetensors` | text_encoders | Flux2 Klein text encoder |
 | `flux2-vae.safetensors` | vae | Flux2 Klein VAE |
 | `anima-aesthetic-v1.1.safetensors` | diffusion_models | Text-to-image (anime — ANIMA) |
 | `qwen_3_06b_base.safetensors` | text_encoders | ANIMA text encoder |
@@ -275,7 +277,7 @@ python server.py
         "COMFYUI_PYTHON": "<path-to-comfyui>/python_embeded/python.exe",
         "COMFYUI_MAIN": "<path-to-comfyui>/ComfyUI/main.py",
         "COMFYUI_AUTO_KILL": "1",
-        "COMFYUI_IDLE_TIMEOUT": "180",
+        "COMFYUI_IDLE_TIMEOUT": "60",
         "VRAM_PRESSURE_THRESHOLD_MB": "8192"
       }
     }
@@ -340,9 +342,9 @@ python server.py
 - Latency increases linearly with each additional step
 - Model is designed for fast, low-step generation (4-6 steps optimal)
 
-### 2026-08-12 — Idle Timeout Auto-Kill (180s)
+### 2026-08-12 — Idle Timeout Auto-Kill (60s)
 - Replaced immediate auto-kill with configurable idle timeout
-- `COMFYUI_IDLE_TIMEOUT` (default 180s) — kills ComfyUI after N seconds of inactivity
+- `COMFYUI_IDLE_TIMEOUT` (default 60s) — kills ComfyUI after N seconds of inactivity
 - Tool chaining works: timer resets on each new workflow call
 - Errors trigger immediate kill (no idle delay)
 - `_cancel_idle_kill()` called at start of each workflow

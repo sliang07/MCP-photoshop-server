@@ -28,7 +28,7 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 - `adjust` — Brightness, contrast, saturation, hue, sharpness
 - `levels` — Black point, mid point (gamma), white point adjustment
 - `curves` — Per-channel tone curves (R/G/B) with control points
-- `apply_filter` — 16 filters: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, find_edges, emboss, pixelate, posterize, solarize, invert, grayscale, sepia
+- `apply_filter` — 17 filters: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, edge_enhance_more, find_edges, smooth, smooth_more, emboss, pixelate, posterize, solarize, invert, grayscale, sepia
 - `add_text` — Text overlay with font, color, stroke support
 
 ### Upscaling
@@ -59,11 +59,19 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 - **ComfyUI** running locally on port 8188
 - **⚠️ VRAM Warning:** Running ComfyUI without auto-kill causes major OOM on shared GPUs (e.g., 32GB GPU with vLLM). Set `COMFYUI_AUTO_KILL=1` to enable idle timeout (60s) which frees VRAM after inactivity while still allowing tool chaining.
 - Required models installed in ComfyUI:
-  - `flux-2-klein-9b.safetensors` (diffusion_models) — **IMPORTANT: use 4-6 steps max**. Image quality actively diminishes after ~6 steps (artifacts, over-smoothing) and latency increases linearly with each additional step. The model is designed for fast, low-step generation.
-  - `anima-aesthetic-v1.1.safetensors` (diffusion_models) — ANIMA anime generation
-  - `qwen_3_06b_base.safetensors` (text_encoders) — ANIMA text encoder
-  - `qwen_image_vae.safetensors` (vae) — ANIMA VAE
-- `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
+
+  **Flux2 Klein (photorealistic generation):**
+  - `flux-2-klein-9b.safetensors` (diffusion_models) — **IMPORTANT: use 4-6 steps max**. Image quality actively diminishes after ~6 steps (artifacts, over-smoothing) and latency increases linearly with each additional step.
+  - `qwen_3_8b_fp8mixed.safetensors` (text_encoders) — Flux2 Klein text encoder
+  - `flux2-vae.safetensors` (vae) — Flux2 Klein VAE
+
+  **ANIMA (anime generation):**
+  - `anima-aesthetic-v1.1.safetensors` (diffusion_models)
+  - `qwen_3_06b_base.safetensors` (text_encoders)
+  - `qwen_image_vae.safetensors` (vae)
+
+  **Flux Kontext (img2img, inpaint, outpaint):**
+  - `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
 
 ### Install Dependencies
 ```bash
@@ -99,6 +107,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
+| `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
 | `COMFYUI_MAIN` | *(required for auto-start)* | Path to ComfyUI's `main.py` |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Extra startup arguments |

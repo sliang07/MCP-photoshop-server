@@ -412,6 +412,7 @@ def build_controlnet_workflow(
     Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple)."""
     nid = _make_node_id
     n1   = nid()  # LoadImage (control image)
+    n2   = nid()  # ImageScale (resize control image to match target dimensions)
     n_un = nid()  # UNETLoader
     n_cl = nid()  # CLIPLoader
     n_va = nid()  # VAELoader
@@ -430,6 +431,7 @@ def build_controlnet_workflow(
 
     return {
         n1:   {"class_type": "LoadImage", "inputs": {"image": image_filename}},
+        n2:   {"class_type": "ImageScale", "inputs": {"image": [n1, 0], "width": width, "height": height, "upscale_method": "lanczos", "crop": "disabled"}},
         n_un: {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
         n_cl: {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
         n_va: {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
@@ -437,7 +439,7 @@ def build_controlnet_workflow(
         n4:   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_cl, 0]}},
         n5:   {"class_type": "FluxGuidance", "inputs": {"conditioning": [n4, 0], "guidance": cfg}},
         n6:   {"class_type": "BasicGuider", "inputs": {"model": [n_un, 0], "conditioning": [n5, 0]}},
-        n7:   {"class_type": "ControlNetApply", "inputs": {"positive": [n5, 0], "control_net": [n3, 0], "image": [n1, 0], "strength": control_strength}},
+        n7:   {"class_type": "ControlNetApply", "inputs": {"positive": [n5, 0], "control_net": [n3, 0], "image": [n2, 0], "strength": control_strength}},
         n8:   {"class_type": "EmptyLatentImage", "inputs": {"width": width // 8, "height": height // 8, "batch_size": 1}},
         n9:   {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
         n10:  {"class_type": "BasicScheduler", "inputs": {"model": [n_un, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},

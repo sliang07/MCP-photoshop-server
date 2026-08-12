@@ -56,8 +56,8 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 
 ### Prerequisites
 - **Python 3.10+**
-- **ComfyUI** running locally on port 8188
-- **⚠️ VRAM Warning:** Running ComfyUI without auto-kill causes major OOM on shared GPUs (e.g., 32GB GPU with vLLM). Set `COMFYUI_AUTO_KILL=1` to enable idle timeout (60s) which frees VRAM after inactivity while still allowing tool chaining.
+- **ComfyUI** installed (auto-start supported — the server automatically launches ComfyUI when needed via `COMFYUI_PYTHON` + `COMFYUI_MAIN` env vars. You can also start ComfyUI manually on port 8188 if preferred.)
+- **⚠️ VRAM Warning:** Running ComfyUI without auto-kill causes major OOM on shared GPUs (e.g., 32GB GPU with vLLM). Set `COMFYUI_AUTO_KILL=1` (recommended) with `COMFYUI_IDLE_TIMEOUT=5` to kill ComfyUI 5 seconds after each task, preventing resource exhaustion and Cline freezes.
 - Required models installed in ComfyUI:
 
   **Flux2 Klein (photorealistic generation):**
@@ -70,8 +70,20 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
   - `qwen_3_06b_base.safetensors` (text_encoders)
   - `qwen_image_vae.safetensors` (vae)
 
-  **Flux Kontext (img2img, inpaint, outpaint):**
-  - `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
+   **Flux Kontext (img2img, inpaint, outpaint):**
+   - `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
+
+   **Upscaling:**
+   - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
+   - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
+
+   **ControlNet:**
+   - `control_v11f1p_sd15_depth_fp16.safetensors` (controlnet) — Depth guidance
+   - `control_v11p_sd15_canny_fp16.safetensors` (controlnet) — Canny guidance
+   - `control_v11p_sd15_openpose_fp16.safetensors` (controlnet) — Pose guidance
+
+   **Style Transfer:**
+   - `flux1-redux-dev.safetensors` (style_models) — Redux style transfer
 
 ### Install Dependencies
 ```bash
@@ -93,7 +105,7 @@ Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_confi
         "COMFYUI_PYTHON": "<path-to-comfyui>/python_embeded/python.exe",
         "COMFYUI_MAIN": "<path-to-comfyui>/ComfyUI/main.py",
         "COMFYUI_AUTO_KILL": "1",
-        "COMFYUI_IDLE_TIMEOUT": "60",
+        "COMFYUI_IDLE_TIMEOUT": "5",
         "VRAM_PRESSURE_THRESHOLD_MB": "8192"
       }
     }
@@ -111,8 +123,8 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
 | `COMFYUI_MAIN` | *(required for auto-start)* | Path to ComfyUI's `main.py` |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Extra startup arguments |
-| `COMFYUI_AUTO_KILL` | `0` | Kill after generation (`0`=VRAM pressure mode, `1`=idle timeout mode) |
-| `COMFYUI_IDLE_TIMEOUT` | `60` | Seconds of inactivity before auto-kill (when AUTO_KILL=1) |
+| `COMFYUI_AUTO_KILL` | `1` (recommended) | Kill after generation (`0`=VRAM pressure mode, `1`=idle timeout mode) |
+| `COMFYUI_IDLE_TIMEOUT` | `5` | Seconds of inactivity before auto-kill (when AUTO_KILL=1) |
 | `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI to start |
 | `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM drops below this (MB) |
 | `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion |

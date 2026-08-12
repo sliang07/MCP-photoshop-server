@@ -5,6 +5,15 @@ Configuration for the MCP Photoshop server.
 import logging
 import os
 
+# Load .env file if it exists (must be before reading env vars)
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv not installed, use system env vars
+
 # Logging configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING")
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.WARNING))

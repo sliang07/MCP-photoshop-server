@@ -175,8 +175,8 @@
 | `COMFYUI_MAIN` | *(required via env var)* | ComfyUI entry point |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Launch args |
-| `COMFYUI_AUTO_KILL` | `0` | Kill after generation (0=use free_memory, 1=idle timeout) |
-| `COMFYUI_IDLE_TIMEOUT` | `60` | Seconds of inactivity before auto-killing (when AUTO_KILL=1) |
+| `COMFYUI_AUTO_KILL` | `1` (recommended) | Kill after generation (0=use free_memory, 1=idle timeout) |
+| `COMFYUI_IDLE_TIMEOUT` | `5` | Seconds of inactivity before auto-killing (when AUTO_KILL=1) — 5s recommended to prevent Cline freezes |
 | `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI startup |
 | `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion (10 min) |
 | `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM below this (MB) |
@@ -202,9 +202,8 @@
 
 | Builder | Description | Key Nodes |
 |---------|-------------|-----------|
-| `build_txt2img_workflow()` | Text-to-image dispatcher (Flux2 or ANIMA) | Dispatches to builder below based on model param |
-| `build_flux2_workflow()` | Text-to-image for Flux2 Klein 9B | **UNETLoader**, **CLIPLoader** (type: "flux2"), **VAELoader**, **Flux2KleinSectionedEncoder**, **EmptyFlux2LatentImage**, **Flux2KleinKSamplerExperimental**, **VAEDecode**, **SaveImage** |
-| `build_anima_workflow()` | Text-to-image for ANIMA (anime) | **UNETLoader**, **CLIPLoader** (stable_diffusion), **VAELoader**, **CLIPTextEncode**, **EmptyLatentImage** (pixel dims), **KSampler** (er_sde), **VAEDecode**, **SaveImage** |
+| `build_txt2img_workflow()` | Text-to-image for Flux2 Klein 9B (dispatches to `build_anima_workflow()` when model="anima") | **UNETLoader**, **CLIPLoader** (type: "flux2"), **VAELoader**, **Flux2KleinSectionedEncoder**, **EmptyFlux2LatentImage**, **BasicGuider**, **RandomNoise**, **BasicScheduler**, **KSamplerSelect**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
+| `build_anima_workflow()` | Text-to-image for ANIMA (anime) | **UNETLoader**, **CLIPLoader** (stable_diffusion), **VAELoader**, **CLIPTextEncode** (positive + negative), **EmptyLatentImage** (pixel dims), **KSampler** (er_sde), **VAEDecode**, **SaveImage** |
 | `build_img2img_kontext_workflow()` | AI instructed editing | **LoadImage**, **UNETLoader**, **CLIPLoader**, **VAELoader**, **VAEEncode**, **Flux2KleinSectionedEncoder**, **BasicGuider**, **RandomNoise**, **BasicScheduler**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
 | `build_inpaint_workflow()` | Masked region inpainting | **LoadImage** (base+mask), **ImageToMask**, **UNETLoader** (Kontext), **DualCLIPLoader**, **VAELoader** (ae.safetensors), **VAEEncode**, **CLIPTextEncode**, **FluxGuidance**, **SetLatentNoiseMask**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
 | `build_outpaint_workflow()` | Canvas extension + inpaint | Same Flux.1 chain as inpaint, uses LoadImage native MASK output |
@@ -222,7 +221,6 @@
 - **Undo/Redo** — Full state snapshots (deepcopy via Layer.to_dict/from_dict), limited to 20 steps
 - **Session Management** — Canvas instances keyed by session ID, default session: "default"
 - **ComfyUI Auto-Start** — Eliminates manual ComfyUI startup
-- **Idle Timeout Kill** — 60s idle timeout balances tool chaining with VRAM management
 - **Pre-Fetch Output** — Downloads result before killing ComfyUI
 - **VRAM Pressure Management** — Adaptive cleanup based on VRAM pressure from vLLM
 - **No External Test Scripts** — All testing done through MCP tool calls, not standalone Python scripts
@@ -323,6 +321,13 @@ python server.py
 ---
 
 ## 11. Changelog
+
+### 2026-08-12 — Bug Fixes: Auto-Start, ControlNet, Auto-Kill
+- **Auto-start fix** (`comfy_client.py`): Added `await self.start_comfyui()` at the top of `upload_image()` so all tools that upload images before running workflows (img2img, inpaint, outpaint, upscale, controlnet_generate, style_transfer) now auto-start ComfyUI. Previously only `generate_image` triggered auto-start.
+- **ControlNet fix** (`server.py`): Added `ImageScale` node in `build_controlnet_workflow()` to resize the control image to match target `width x height` before passing to `ControlNetApply`. Fixes "images do not match" error when canvas size differs from requested output size.
+- **Auto-kill enabled** (`.env`): Set `COMFYUI_AUTO_KILL=1` and `COMFYUI_IDLE_TIMEOUT=5` to kill ComfyUI 5 seconds after each task, preventing resource exhaustion and Cline freezes.
+- **python-dotenv integration** (`config.py`, `requirements.txt`): Added `.env` file loading via `python-dotenv` so configuration is automatically read from `.env` on startup.
+- **All AI tools tested**: generate_image (flux2+anima), img2img, inpaint, upscale, controlnet_generate, outpaint — all working with auto-start and auto-kill.
 
 ### 2026-08-12 — Documentation & Memory Bank Update
 - Updated MEMORY.md to reflect current state (image-only, no video)

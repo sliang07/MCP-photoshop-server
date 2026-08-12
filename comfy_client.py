@@ -632,7 +632,11 @@ class ComfyUIClient:
         Upload an image to ComfyUI's input directory.
         Returns the filename as stored in ComfyUI.
         Retries on connection errors (e.g., after process restart or during free_memory).
+        Auto-starts ComfyUI if not already running.
         """
+        # Ensure ComfyUI is running before attempting upload
+        await self.start_comfyui()
+
         for attempt in range(max_retries):
             try:
                 files = {"image": (filename, image_bytes, "image/png")}

@@ -1,0 +1,193 @@
+# MCP Photoshop Server
+
+A local MCP (Model Context Protocol) server that combines **Photoshop-style image editing** with **AI image generation** powered by ComfyUI.
+
+## Features
+
+### Canvas Management
+- `new_canvas` — Create a blank canvas with custom dimensions and background color
+- `open_image` — Load an existing image file
+- `export` — Save to PNG/JPG/WEBP or return base64 data
+- `get_info` — View canvas dimensions, layers, undo/redo state
+
+### AI Image Generation & Editing
+- `generate_image` — Text-to-image via Flux2 (photorealistic) or ANIMA (anime)
+- `img2img` — AI instructed editing via Flux Kontext
+- `character_transform` — Pose/expression/action transforms with identity preservation
+- `inpaint` — AI fill masked region (requires mask from select_rect/select_ellipse)
+- `outpaint` — AI extend canvas in a direction (left, right, top, bottom)
+
+### AI-Guided Generation
+- `controlnet_generate` — Generate image guided by current canvas (depth/canny/pose)
+- `style_transfer` — Generate image with style of a reference image (Redux StyleModel)
+
+### Deterministic Editing (Pillow — no GPU needed)
+- `crop`, `resize`, `rotate`, `flip` — Transform operations
+- `adjust` — Brightness, contrast, saturation, hue, sharpness
+- `levels` — Black point, mid point (gamma), white point adjustment
+- `curves` — Per-channel tone curves (R/G/B) with control points
+- `apply_filter` — 16 filters: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, find_edges, emboss, pixelate, posterize, solarize, invert, grayscale, sepia
+- `add_text` — Text overlay with font, color, stroke support
+
+### Upscaling
+- `upscale` — AI upscaling via ComfyUI (ESRGAN/SUPIR models)
+
+### Layer System
+- `add_layer`, `select_layer`, `delete_layer`, `merge_down`, `reorder_layer`
+- `set_blend_mode` — 12 modes: normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion
+- `set_layer_opacity` — Per-layer transparency
+
+### Selections & Masks
+- `select_rect` — Rectangular mask
+- `select_ellipse` — Elliptical mask
+- `select_object` — Heuristic color/region selection (red, blue, sky, dark, etc.)
+- `clear_mask` — Remove layer mask
+
+### History
+- `undo` / `redo` — Full operation history (up to 20 steps)
+
+### System
+- `get_comfyui_status` — Check ComfyUI connection
+- `clear_vram` — Free GPU memory
+
+## Installation
+
+### Prerequisites
+- **Python 3.10+**
+- **ComfyUI** running locally on port 8188
+- **⚠️ VRAM Warning:** Running ComfyUI without auto-kill causes major OOM on shared GPUs (e.g., 32GB GPU with vLLM). Set `COMFYUI_AUTO_KILL=1` to enable idle timeout (60s) which frees VRAM after inactivity while still allowing tool chaining.
+- Required models installed in ComfyUI:
+  - `flux-2-klein-9b.safetensors` (diffusion_models) — **IMPORTANT: use 4-6 steps max**. Image quality actively diminishes after ~6 steps (artifacts, over-smoothing) and latency increases linearly with each additional step. The model is designed for fast, low-step generation.
+  - `anima-aesthetic-v1.1.safetensors` (diffusion_models) — ANIMA anime generation
+  - `qwen_3_06b_base.safetensors` (text_encoders) — ANIMA text encoder
+  - `qwen_image_vae.safetensors` (vae) — ANIMA VAE
+- `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
+
+### Install Dependencies
+```bash
+cd mcp-photoshop-server
+pip install -r requirements.txt
+```
+
+### Configure MCP Client
+Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "photoshop": {
+      "command": "python",
+      "args": ["<path-to-server>/server.py"],
+      "env": {
+        "COMFYUI_URL": "http://127.0.0.1:8188",
+        "COMFYUI_PYTHON": "<path-to-comfyui>/python_embeded/python.exe",
+        "COMFYUI_MAIN": "<path-to-comfyui>/ComfyUI/main.py",
+        "COMFYUI_AUTO_KILL": "1",
+        "COMFYUI_IDLE_TIMEOUT": "60",
+        "VRAM_PRESSURE_THRESHOLD_MB": "8192"
+      }
+    }
+  }
+}
+```
+
+### Environment Variables
+See [`.env_example`](.env_example) for a complete reference. Key variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
+| `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
+| `COMFYUI_MAIN` | *(required for auto-start)* | Path to ComfyUI's `main.py` |
+| `COMFYUI_ARGS` | `--windows-standalone-build` | Extra startup arguments |
+| `COMFYUI_AUTO_KILL` | `0` | Kill after generation (`0`=VRAM pressure mode, `1`=idle timeout mode) |
+| `COMFYUI_IDLE_TIMEOUT` | `60` | Seconds of inactivity before auto-kill (when AUTO_KILL=1) |
+| `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI to start |
+| `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM drops below this (MB) |
+| `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion |
+| `MAX_UNDO_STEPS` | `20` | Maximum undo history entries |
+| `LOG_LEVEL` | `WARNING` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+## Architecture
+
+```
+mcp-photoshop-server/
+├── server.py           # MCP server + 36 tool registrations
+├── config.py           # Configuration & model names
+├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
+├── canvas.py           # Layered document with blend modes + undo/redo
+├── session.py          # Per-session document management
+├── requirements.txt    # Python dependencies
+├── MEMORY.md           # Project memory bank
+├── .env_example        # Environment variable template
+├── .gitignore          # Git ignore rules
+└── README.md
+```
+
+### Design Philosophy
+- **AI operations** (generation, inpainting, transforms, ControlNet, style) → routed through ComfyUI
+- **Deterministic edits** (crop, resize, adjustments, filters) → executed locally with Pillow (fast, no GPU)
+- **Layered document model** → mirrors Photoshop's mental model with blend modes, masks, and undo history
+
+## Usage Examples
+
+### Generate and Edit
+```
+1. generate_image(prompt="a cat wearing sunglasses on a beach")
+2. adjust(brightness=1.2, saturation=1.3)
+3. apply_filter(name="sharpen")
+4. export(path="output/cat.png")
+```
+
+### Layer Compositing
+```
+1. open_image(path="background.jpg")
+2. add_layer(name="overlay", source_path="overlay.png")
+3. set_blend_mode(mode="multiply")
+4. set_layer_opacity(opacity=0.7)
+5. export(path="output/composite.png")
+```
+
+### AI Edit Workflow
+```
+1. open_image(path="portrait.jpg")
+2. img2img(prompt="change background to a forest at sunset")
+3. undo  # if not satisfied
+4. img2img(prompt="make the lighting warmer and softer")
+5. adjust(contrast=1.1)
+6. export(path="output/edited.jpg", format="JPG")
+```
+
+### Inpainting Workflow
+```
+1. open_image(path="photo.jpg")
+2. select_rect(x=100, y=50, width=200, height=150)
+3. inpaint(prompt="a red rose bouquet")
+4. export(path="output/inpainted.png")
+```
+
+### Upscaling
+```
+1. open_image(path="small_photo.jpg")
+2. upscale(model="4x_NMKD-Siax_200k.pth")
+3. export(path="output/upscaled.png")
+```
+
+### ControlNet Guided Generation
+```
+1. open_image(path="sketch.png")
+2. controlnet_generate(prompt="a detailed cityscape", controlnet="canny", strength=0.8)
+3. export(path="output/cityscape.png")
+```
+
+### Style Transfer
+```
+1. open_image(path="photo.jpg")
+2. style_transfer(prompt="the same scene", style_path="painting.jpg", strength=0.8)
+3. export(path="output/styled.png")
+```
+
+## Future Work
+- [ ] SAM-based semantic selection (replace heuristic with real segmentation model)
+- [ ] Batch processing / multi-session support
+- [ ] Additional ComfyUI custom nodes integration

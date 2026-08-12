@@ -2,6 +2,8 @@
 
 A local MCP (Model Context Protocol) server that combines **Photoshop-style image editing** with **AI image generation** powered by ComfyUI.
 
+> **Designed for use with [Cline](https://github.com/cline/cline)** — an AI-powered coding assistant. This server integrates as an MCP tool provider to enable image generation and editing directly from your Cline workflow.
+
 ## Features
 
 ### Canvas Management

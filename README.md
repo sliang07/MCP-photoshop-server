@@ -6,14 +6,12 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 
 ## Instruction editing upgrade
 
-See [EDITING_UPGRADE.md](EDITING_UPGRADE.md) for the verified local inventory, model downloads, known legacy limitations, and usage.
-
 - `preview_canvas` returns an image the assistant can inspect.
 - `get_editing_capabilities` reports live model/node availability.
 - `edit_image` adds instruction and reference-guided edits through native FLUX.2 or Qwen workflows, independent edit masks, protected outside pixels, previews, and undoable layers.
 - `upscale` now honors its size factor and preserves layer/mask alignment and transparency.
 
-`img2img` is a legacy FLUX.2 denoising transform, despite its old Kontext naming. Existing ControlNet/Redux style-transfer workflows require further repair; use `edit_image` for reference style guidance.
+`img2img` is a legacy FLUX.2 denoising transform, despite its old Kontext naming. The ControlNet/Redux style-transfer workflows were repaired 2026-09-18 (Flux2 pixel-dimension latents, current node input schemas, live model pre-checks); `edit_image` references remain the primary path for reference style/identity guidance.
 
 Reconnect the MCP server after saving any in-memory work to load the new tools.
 
@@ -38,8 +36,14 @@ Reconnect the MCP server after saving any in-memory work to load the new tools.
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
 
 ### AI-Guided Generation
-- `controlnet_generate` — Generate image guided by current canvas (depth/canny/pose)
-- `style_transfer` — Generate image with style of a reference image (Redux StyleModel)
+- `controlnet_generate` — Generate image guided by current canvas (depth/canny/pose); live model pre-check fails fast with an actionable error
+- `style_transfer` — Generate image with style of a reference image (Redux StyleModel); live model pre-check fails fast with an actionable error
+
+### Sessions & Batch (multi-document)
+- Every canvas tool accepts an optional `session_id` (default `"default"`), so multiple documents can be edited independently in one server process
+- `list_sessions` — List open sessions with size, layer count, and undo depth
+- `close_session` — Close a session by `session_id`, freeing its canvas
+- `batch_generate` — Queue a whole job list on ComfyUI in one pass (single WebSocket connection) and export each result to disk as it completes
 
 ### Deterministic Editing (Pillow — no GPU needed)
 - `crop`, `resize`, `rotate`, `flip` — Transform operations
@@ -70,7 +74,7 @@ Reconnect the MCP server after saving any in-memory work to load the new tools.
 - `get_comfyui_status` — Check ComfyUI connection
 - `clear_vram` — Free GPU memory
 
-> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. For multiple or long ComfyUI generations, queue the whole batch to run in the background, then ask the user for explicit approval to stop the `qwen38` container (stopping it ends the LLM session; the batch keeps running on the host). `searxng` is CPU-only and never needs stopping. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
+> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. For multiple or long ComfyUI generations, queue the whole batch to run in the background, then ask the user for explicit approval to stop the `qwen38` container (stopping it ends the LLM session; the batch keeps running on the host). `searxng` is CPU-only and never needs stopping. `batch_generate` implements the queue side server-side: it submits the whole job list up front on one WebSocket connection and exports each result as it completes; the `docker stop qwen38` approval step remains a conversation-level decision. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
 
 ## Installation
 
@@ -97,13 +101,14 @@ Reconnect the MCP server after saving any in-memory work to load the new tools.
    - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
    - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
 
-   **ControlNet:**
+   **ControlNet** (legacy — these SD1.5 models do not fit the Flux2 UNET; `controlnet_generate` pre-validates installed models and reports what is missing):
    - `control_v11f1p_sd15_depth_fp16.safetensors` (controlnet) — Depth guidance
    - `control_v11p_sd15_canny_fp16.safetensors` (controlnet) — Canny guidance
    - `control_v11p_sd15_openpose_fp16.safetensors` (controlnet) — Pose guidance
 
    **Style Transfer:**
-   - `flux1-redux-dev.safetensors` (style_models) — Redux style transfer
+   - `flux1-redux-dev.safetensors` (style_models) — Redux style transfer (Flux.1-based; best-effort on the Flux2 UNET)
+   - `sigclip_vision_patch14_384.safetensors` or `clip_vision.safetensors` (clip_vision) — required by `CLIPVisionEncode`
 
 ### Install Dependencies
 ```bash
@@ -155,7 +160,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 ```
 mcp-photoshop-server/
-├── server.py           # MCP server + 40 tool registrations (FastMCP initialize instructions carry the GPU batching rule)
+├── server.py           # MCP server + 43 tool registrations (canvas tools accept session_id; FastMCP initialize instructions carry the GPU batching rule)
 ◜─── editing.py          # Instruction editing backends (FLUX.2 / Qwen 2511) + live capabilities
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
@@ -163,8 +168,7 @@ mcp-photoshop-server/
 ├── session.py          # Per-session document management
 ├── requirements.txt    # Python dependencies
 ├── MEMORY.md           # Project memory bank
-◜─── EDITING_UPGRADE.md  # Editing backend model guide + live verification evidence
-◜─── tests/              # Regression suite (17 tests)
+◜─── tests/              # Regression suite (69 tests)
 ◜─── verification/       # Live GPU verification scripts + artifacts
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
@@ -236,7 +240,21 @@ mcp-photoshop-server/
 3. export(path="output/styled.png")
 ```
 
+### Multi-Document & Batch
+```
+1. new_canvas(width=1024, height=1024, session_id="doc_a")
+2. open_image(path="photo.jpg", session_id="doc_b")
+3. edit_image(prompt="...", session_id="doc_a")   # doc_b stays untouched
+4. batch_generate(jobs=[{"prompt": "a lighthouse", "steps": 4},
+                         {"prompt": "a paper crane", "steps": 4}],
+                  export_dir="output/batch")
+5. list_sessions()
+6. close_session(session_id="doc_b")
+```
+
 ## Future Work
 - [x] SAM-based semantic selection — delivered via the `semantic_select` tool (SAM 3 text/point/box prompts, live-verified 2026-09-17)
-- [ ] Batch processing / multi-session support
-- [ ] Additional ComfyUI custom nodes integration
+- [x] Multi-session support — all canvas tools accept `session_id`; `list_sessions`/`close_session` manage multiple open documents (2026-09-18)
+- [x] Batch processing — `batch_generate` queues a whole job list on one WebSocket connection and exports each result as it completes (live-verified 2026-09-18)
+- [x] Legacy ControlNet/Redux workflow repair — Flux2 pixel-dim latents, `ControlNetApply.conditioning`, `CLIPVisionLoader` + `crop`/`strength_type`, plus live capability pre-checks in `get_editing_capabilities` (2026-09-18)
+- [ ] Additional ComfyUI custom nodes integration (beyond ControlNet/Redux/SAM3 — e.g. new node packs)

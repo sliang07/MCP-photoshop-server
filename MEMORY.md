@@ -1,8 +1,8 @@
 # Memory Bank — MCP Photoshop Server
 
 > Last updated: 2026-09-18
-> Status: 40 tools — all confirmed working (image-only, no video); qwen2511 edit backend + semantic_select (SAM 3 text/point/box) deployed & live-verified; **2026-09-18**: alpha-aware blend modes + health-probe validation fixed and **live-verified after MCP server restart** (masked multiply confined to its mask; SAM 3 point select + undo/redo consistent); F4-fix regression (empty `{}` history) found during the re-check and fixed — 46 tests green
-> Location: `mcp-photoshop-server`
+> Status: 43 tools — all confirmed working (image-only, no video); qwen2511 edit backend + semantic_select (SAM 3 text/point/box) deployed & live-verified; **2026-09-18**: alpha-aware blend modes + health-probe validation fixed and live-verified after MCP server restart; multi-session support (`session_id` on all canvas tools + `list_sessions`/`close_session`), `batch_generate` (whole-batch WebSocket queue, per-job disk export), and ControlNet/Redux workflow repair (Flux2 pixel-dim latents, current node schemas, live capability pre-checks) shipped — 69 tests green
+> Location: project root of this repository (mcp-photoshop-server)
 
 ---
 
@@ -39,10 +39,10 @@
 | File | Purpose | Key Classes/Functions |
 |------|---------|----------------------|
 | `config.py` | Configuration constants, model names, ComfyUI lifecycle | `COMFYUI_URL`, `COMFYUI_START_CMD`, `COMFYUI_PYTHON`, `COMFYUI_MAIN`, `COMFYUI_ARGS`, `COMFYUI_AUTO_KILL`, `COMFYUI_IDLE_TIMEOUT`, `COMFYUI_START_TIMEOUT`, `WEBSOCKET_TIMEOUT`, `VRAM_PRESSURE_THRESHOLD_MB` |
-| `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
+| `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `batch_run_workflows()`, `_listen_for_many()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
 | `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes (all non-normal modes alpha-aware via `_blend_with_alpha` since 2026-09-18), masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
-| `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()` |
-| `server.py` | MCP server + all tool registrations + workflow builders | 40 `@app.tool()` registrations, `GPU_BATCH_RULE` passed as FastMCP `instructions`, 12 workflow builder functions, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()`, `list_sessions()` |
+| `server.py` | MCP server + all tool registrations + workflow builders | 43 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, 12 workflow builder functions, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
 | `editing.py` | Instruction editing backends + live capabilities | `edit_image` (flux2 / qwen / qwen2511 workflows, reference + white-to-edit mask routing), `get_editing_capabilities`, `preview_canvas`, backend profiles |
 | `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
@@ -50,7 +50,7 @@
 
 ---
 
-## 3. Tool Inventory (40 Tools)
+## 3. Tool Inventory (43 Tools)
 
 ### Canvas Management (4)
 | Tool | Signature | Description |
@@ -79,8 +79,8 @@
 ### AI-Guided Generation (2)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `controlnet_generate` | `(prompt, controlnet="depth", strength=0.8, width=1024, height=1024, steps=20, cfg=1.5, seed=None)` | Depth/canny/pose guided generation |
-| `style_transfer` | `(prompt, style_path, strength=0.8, width=1024, height=1024, steps=20, seed=None)` | Style transfer via Redux StyleModel |
+| `controlnet_generate` | `(prompt, controlnet="depth", strength=0.8, width=1024, height=1024, steps=20, cfg=1.5, seed=None, session_id="default")` | Depth/canny/pose guided generation; live model pre-check fails fast (no ControlNet models installed as of 2026-09-18) |
+| `style_transfer` | `(prompt, style_path, strength=0.8, width=1024, height=1024, steps=20, seed=None, style_model="flux1-redux-dev.safetensors", session_id="default")` | Style transfer via Redux StyleModel + CLIPVision; live model pre-check fails fast |
 
 ### Transforms (4)
 | Tool | Signature | Description |
@@ -145,6 +145,15 @@
 |------|-----------|-------------|
 | `get_comfyui_status` | `()` | Check ComfyUI connection and system info |
 | `clear_vram` | `()` | Free GPU VRAM by unloading cached models |
+
+### Sessions & Batch (3)
+| Tool | Signature | Description |
+|------|-----------|-------------|
+| `list_sessions` | `()` | All open document sessions with size/layers/active layer/undo depth |
+| `close_session` | `(session_id="default")` | Close a session, freeing its canvas |
+| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Whole-batch txt2img queue (flux2/anima) on one WebSocket; exports each result to disk as it completes, returns JSON summary |
+
+> Every canvas tool takes an optional `session_id` (default `"default"`) so multiple documents can be edited independently in one server process.
 
 ---
 
@@ -262,7 +271,8 @@
 | `control_v11f1p_sd15_depth_fp16.safetensors` | controlnet | Depth-guided ControlNet |
 | `control_v11p_sd15_canny_fp16.safetensors` | controlnet | Canny-guided ControlNet |
 | `control_v11p_sd15_openpose_fp16.safetensors` | controlnet | Pose-guided ControlNet |
-| `flux1-redux-fp16.safetensors` | style_models | Style transfer (Redux) |
+| `flux1-redux-dev.safetensors` | style_models | Style transfer (Redux) |
+| `sigclip_vision_patch14_384.safetensors` (or `clip_vision.safetensors`) | clip_vision | CLIPVision encoder required by the style-transfer workflow |
 
 ### Detection / Segmentation
 | Model | Directory | Purpose |
@@ -305,7 +315,7 @@ python server.py
 
 ## 9. Testing Status
 
-### Verified Working (40 tools)
+### Verified Working (43 tools)
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
 - Color Adjustments: `adjust`, `levels`, `curves` ✅
@@ -318,9 +328,10 @@ python server.py
 - AI Generation: `generate_image` (Flux2 + ANIMA), `img2img`, `character_transform` ✅
 - AI Editing: `inpaint`, `outpaint` ✅
 - Instruction Editing: `edit_image` (flux2 + qwen2511 live-verified 2026-09-17), `get_editing_capabilities`, `preview_canvas` ✅
-- AI-Guided: `controlnet_generate`, `style_transfer` ✅
+- AI-Guided: `controlnet_generate`, `style_transfer` — workflows repaired 2026-09-18; live capability pre-checks verified (fail fast with actionable errors); end-to-end generation on this host pending model installs (no ControlNet / Redux / CLIPVision files present — see §10)
 - Upscale: `upscale` (anime + face + x4plus general-photo model, live MCP test 2026-09-17) ✅
 - Semantic Selection: `semantic_select` (SAM 3 text/point/box, live CPU MCP test 2026-09-17) ✅
+- Sessions & Batch: `list_sessions`, `close_session`, `batch_generate` + `session_id` on all canvas tools (unit-verified 2026-09-18, 23 new tests; live batch run in `verification/_live_sessions_batch_nodes_test.py`) ✅
 
 ### Idle Timeout Chaining (tested 2026-08-12)
 - `generate_image` → `img2img` chained successfully without ComfyUI restart
@@ -335,7 +346,7 @@ python server.py
 - Undo stores full snapshots (memory-intensive)
 - No lasso/freehand selection
 - No brush/paint tools
-- No batch processing / multi-session support
+- `controlnet_generate` / `style_transfer` have no usable models on this host: `models/controlnet`, `models/style_models`, and `models/clip_vision` hold only 0-byte placeholder files (verified 2026-09-18). Both tools now fail fast with actionable pre-check errors (previously opaque ComfyUI input errors); a Flux2-compatible ControlNet plus `flux1-redux-dev.safetensors` + a CLIPVision model would enable end-to-end runs. SD1.5 ControlNets do not fit the Flux2 UNET
 - Running ComfyUI without auto-kill causes major OOM on shared GPU (32GB with vLLM)
 
 ---
@@ -372,6 +383,17 @@ python server.py
 
 ## 12. Changelog
 
+### 2026-09-18 — Public Repo Hygiene: Local Machine Paths Removed from Docs & History
+- `MEMORY.md` no longer carries absolute local paths (the "Location" header and the 2026-09-17 editing-upgrade changelog entries were rewritten path-free); the README's dead `EDITING_UPGRADE.md` references (intro line + architecture-tree line) were removed — that file was never committed and no longer exists.
+- Git history rewritten with `git filter-repo --replace-text` so no commit, message, or ref contains local machine paths; `master` force-pushed.
+
+### 2026-09-18 — Multi-Session Support, `batch_generate`, ControlNet/Redux Workflow Repair
+- **Multi-session support:** every canvas tool (34 in `server.py`, 3 in `editing.py`) now takes `session_id: str = "default"`; bodies resolve via `sessions.get_or_create(session_id)` (the shared `DEFAULT_SESSION` constant removed, `get_default_session()` no longer referenced by any tool). New tools `list_sessions` (size/layers/active layer/undo depth per session) and `close_session(session_id)`. `SessionManager.list_sessions()` added. `character_transform` passes `session_id` through to `img2img`.
+- **`batch_generate` (batch processing):** new tool queuing a whole job list (txt2img flux2/anima, per-job prompt/model/size/steps/cfg/seed/filename) on ONE WebSocket via `ComfyUIClient.batch_run_workflows()` — all `/prompt` submits up front so the batch runs unattended (GPU batching rule pattern), `_listen_for_many()` tracks every prompt_id with per-job error capture, queue-drain wait, per-job `_cached_file_bytes` pre-fetch before the idle kill, and a polling fallback if the WS is unavailable/closed. Results export to `export_dir` (default `<server>/batch_output`) as PNG/JPG; the tool returns a JSON summary (per-job status/file/seed). Flux2 jobs capped at 6 steps.
+- **ControlNet/Redux repair:** both legacy builders fixed against the live node schemas — `EmptyLatentImage(width//8)` → `EmptyFlux2LatentImage(pixel dims)` (the Flux2 convention `build_txt2img_workflow` already used), `ControlNetApply` now passes `conditioning` (the old `positive` input no longer exists in current ComfyUI), `StyleModelApply` gained `strength_type="multiply"`, `CLIPVisionEncode` gained its required `CLIPVisionLoader` upstream + `crop="center"`. `controlnet_generate`/`style_transfer` now pre-validate live model availability via `controlnet_capabilities()`/`style_transfer_capabilities()` (new, in `editing.py`, also surfaced in `get_editing_capabilities`) and fail fast with actionable errors before any upload; `style_transfer` gained a `style_model` parameter and `clip_vision` is resolved from live options.
+- **Docs:** README updated (Sessions & Batch section, future-work checkboxes, model prerequisites, batch usage example); 23 new tests — `tests/test_sessions.py` (8), `tests/test_batch_generate.py` (5), `tests/test_custom_nodes.py` (10, incl. builder-schema pins against the live node list and pre-check fail-fast paths). Full suite: **69 tests, 0 failures** (`python -m unittest discover -s tests`).
+- **Live status (2026-09-18):** `verification/live_status_2026-09-18_sessions_batch_nodes.json` (script `verification/_live_sessions_batch_nodes_test.py`) — all green: multi-session tools (created/inspected/closed two live sessions), capabilities report (flux2 + qwen2511 + SAM3 available), ControlNet pre-check failed fast as designed, live batch 2/2 flux2 jobs OK with both PNGs exported to `verification/batch_live/`; style_transfer live run **skipped** — `models/style_models` and `models/clip_vision` hold only 0-byte placeholder files (no Redux/SigCLIP installed), so the pre-check correctly reported unavailable
+
 ### 2026-09-18 — Blend-Mode Alpha Fix (F2) + ComfyUI Health-Probe Validation (F4)
 - **`canvas.py` — alpha-aware blend modes:** all 10 non-normal modes (`multiply`, `screen`, `overlay`, `darken`, `lighten`, `color_dodge`, `color_burn`, `hard_light`, `soft_light`, `exclusion`) previously ran per-channel ops on raw RGBA data, ignoring the top layer's per-pixel alpha — a masked edit layer set to `multiply` altered ~99.99% of the canvas and zeroed composite alpha outside its region (found in the 2026-09-17/18 MCP test campaign, F2, high severity). Now all modes route through `_blend_with_alpha()`: the formula applies to RGB only, top alpha (folded with layer opacity) scales the result toward the bottom (`out = bottom + a·(op(bottom,top) − bottom)/255`), output alpha is standard source-over. Transparent top pixels pass the bottom through **bit-exactly**; fully-opaque top is exactly the legacy formula (regression-pinned). `color_burn` gained a `t=0 → 255` guard (previously a latent division by zero). `merge_down` now applies the top layer's mask **before** blending (mirroring `composite()`).
 - **`comfy_client.py` — health-probe validation:** `is_running()` previously treated any HTTP 200 as "running", so a foreign process occupying port 8188 (e.g. a stub server) bypassed the stale-port self-heal and later failed with an opaque JSON-decode error (F4/T9.x). It now requires `/history` to return a JSON object — a fresh ComfyUI returns `{}`, which is valid (the `queue` keys belong to `/queue`, not `/history`); non-JSON or non-object 200 responses are logged as "foreign process occupies the port" and treated as not-running so the existing kill/stale-port/relaunch flow runs. `start_comfyui`'s final TimeoutError now hints at `netstat -ano | findstr :8188`.
@@ -391,8 +413,8 @@ python server.py
 - `get_editing_capabilities` now reports a `sam3` availability block (node + checkpoint). 11 unit tests added in `tests/test_semantic_select.py`; suite now 28 tests, all passing.
 - Still pending: text-prompted SAM 3 needs the SAM 3.1 checkpoint (`sam3.1_multiplex_fp16.safetensors`), which is not installed locally; `select_object` remains the fast heuristic fallback.
 
-### 2026-09-17 — Editing-Upgrade Guide Synced (Desktop Copy)
-- `EDITING_UPGRADE.md` now lives at `the user's Desktop\EDITING_UPGRADE.md` (moved out of the project root; the README's architecture tree still references the project-root path until that reference is updated or the file is restored).
+### 2026-09-17 — Editing-Upgrade Guide Synced (Out-of-Tree Copy)
+- `EDITING_UPGRADE.md` was moved out of the project root to a local, out-of-tree copy (not shipped in this repo); the README's stale architecture-tree reference to it was removed on 2026-09-18
 - RealESRGAN x4plus and SAM 3 sections updated from todo to deployed + live-verified (sizes, SHA-256, evidence files in `verification/`); SAM 3 heading now reflects checkpoint deployed, smoke-tested, MCP integration pending.
 - Corrected the record: the SAM 3.1 checkpoint (`sam3.1_multiplex_fp16.safetensors`) is not present in `models/checkpoints/` — text-prompted SAM 3 needs that separate gated download; point/box prompting works with the deployed `sam3.pt`.
 
@@ -410,7 +432,7 @@ python server.py
 - `semantic_select` now takes `prompt` alongside `point`/`box` (at least one required, combinations allowed): text runs `CheckpointLoaderSimple` → `CLIPTextEncode` → `SAM3_Detect(conditioning=...)` on the 3.1 checkpoint; point/box-only calls keep using `sam3.pt` via `ImageOnlyCheckpointLoader`. Missing 3.1 + `prompt` raises before upload/inference. `sam3_capabilities` reports `sam3_1` and `text_prompt_available`; capabilities note updated.
 - 6 unit tests added to `tests/test_semantic_select.py` (text graph wiring, prompt+point+box, missing-3.1 pre-upload error, blank prompt, 3.1 capability reporting); full suite now 34 tests, all passing.
 - Live-verified via fresh MCP stdio session against a temporary CPU-only ComfyUI on :8189 (`verification/_semantic31_live_test.py` → `verification/semantic31_live_status.json`): capabilities `text_prompt_available: true`; text "red circle" 64.9s, bbox [160, 161, 353, 353], coverage 0.1107; point regression (256,256) 42.9s, still on `sam3.pt` with identical segmentation; temp instance torn down (:8189 released), :8188 untouched.
-- Docs synced: Desktop `EDITING_UPGRADE.md` (check-off + SAM 3.1 verification section) and README future-work item ticked. `photoshop` MCP entry restarted and verified: the live `semantic_select` schema exposes `prompt`, and `get_editing_capabilities` against :8188 reports `sam3_1: sam3.1_multiplex_fp16.safetensors` and `text_prompt_available: true`.
+- Docs synced: out-of-tree `EDITING_UPGRADE.md` copy (check-off + SAM 3.1 verification section) and README future-work item ticked. `photoshop` MCP entry restarted and verified: the live `semantic_select` schema exposes `prompt`, and `get_editing_capabilities` against :8188 reports `sam3_1: sam3.1_multiplex_fp16.safetensors` and `text_prompt_available: true`.
 
 ### 2026-08-12 — Bug Fixes: Auto-Start, ControlNet, Auto-Kill
 - **Auto-start fix** (`comfy_client.py`): Added `await self.start_comfyui()` at the top of `upload_image()` so all tools that upload images before running workflows (img2img, inpaint, outpaint, upscale, controlnet_generate, style_transfer) now auto-start ComfyUI. Previously only `generate_image` triggered auto-start.

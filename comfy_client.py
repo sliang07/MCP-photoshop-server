@@ -521,6 +521,185 @@ class ComfyUIClient:
 
         raise TimeoutError(f"Workflow {prompt_id} did not complete within {effective_timeout}s")
 
+    async def _listen_for_many(self, ws, prompt_map: dict, timeout: Optional[int] = None) -> dict:
+        """Listen until every prompt in prompt_map (job_index -> prompt_id) completes.
+
+        Returns {job_index: history_entry} for completed jobs and
+        {job_index: {"_batch_error": str}} for jobs that errored or timed out.
+        Mirrors _listen_for_completion() but tracks many prompts on one connection.
+        """
+        effective_timeout = timeout if timeout is not None else max(WEBSOCKET_TIMEOUT, 60 * len(prompt_map))
+        deadline = asyncio.get_event_loop().time() + effective_timeout
+        pid_to_idx = {pid: idx for idx, pid in prompt_map.items()}
+        pending = set(pid_to_idx)
+        out = {}
+        while pending and asyncio.get_event_loop().time() < deadline:
+            try:
+                msg_raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if isinstance(msg_raw, bytes):
+                    continue  # Binary preview frame, not a JSON execution event.
+                msg = json.loads(msg_raw)
+                msg_type = msg.get("type")
+                data = msg.get("data", {})
+                pid = data.get("prompt_id")
+                if pid not in pending:
+                    continue
+                if msg_type == "executing":
+                    # node goes null when the queue finishes this prompt - success OR error
+                    if data.get("node") is None:
+                        history = None
+                        error = None
+                        for attempt in range(10):
+                            try:
+                                history = await self.get_history(pid)
+                            except RuntimeError as he:
+                                error = str(he)
+                                break
+                            if history is not None:
+                                break
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                        if history is not None:
+                            out[pid_to_idx[pid]] = history
+                        elif error is not None:
+                            logger.warning("batch job %d failed: %s", pid_to_idx[pid], error)
+                            out[pid_to_idx[pid]] = {"_batch_error": error}
+                        else:
+                            logger.warning("batch history for %s not available after retries", pid)
+                            out[pid_to_idx[pid]] = {"_batch_error": "history unavailable after completion"}
+                        pending.discard(pid)
+                elif msg_type in ("execution_error", "execution_interrupted"):
+                    logger.error("batch execution %s: %s", msg_type, data)
+                    out[pid_to_idx[pid]] = {"_batch_error": f"{msg_type}: {data}"}
+                    pending.discard(pid)
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                raise
+
+        # Final chance for anything still outstanding: check /history once more.
+        for pid in list(pending):
+            try:
+                history = await self.get_history(pid)
+            except RuntimeError:
+                history = None
+            if history is not None:
+                out[pid_to_idx[pid]] = history
+            else:
+                out[pid_to_idx[pid]] = {"_batch_error": f"did not complete within {effective_timeout}s"}
+        return out
+
+    async def batch_run_workflows(self, workflows: list, timeout: Optional[int] = None) -> list:
+        """Submit a whole batch and wait for every workflow on ONE WebSocket connection.
+
+        Queues all jobs up front (back-to-back /prompt calls) so the batch keeps
+        running unattended — the GPU batching rule pattern. Mirrors
+        run_workflow_and_wait() per job:
+          - returns one entry per job, aligned with `workflows`:
+            {"history": <history entry or None>, "error": <str or None>}
+          - when COMFYUI_AUTO_KILL is on, output bytes are pre-fetched into
+            history["_cached_file_bytes"] before the idle kill,
+          - schedules the idle kill after the batch (keeps ComfyUI warm for a follow-up).
+        timeout: seconds for the whole batch wait (default: max(WEBSOCKET_TIMEOUT, 60 * jobs)).
+        """
+        self._cancel_idle_kill()
+        await self.start_comfyui()
+
+        n = len(workflows)
+        effective_timeout = timeout if timeout is not None else max(WEBSOCKET_TIMEOUT, 60 * n)
+        client_id = str(uuid.uuid4())
+        ws_url = f"{self.base_url.replace('http', 'ws')}/ws?clientId={client_id}"
+
+        results = [{"history": None, "error": None} for _ in range(n)]
+        prompt_ids = [None] * n
+        ws = None
+
+        try:
+            try:
+                ws = await websockets.connect(ws_url, open_timeout=15)
+            except Exception as ws_error:
+                logger.warning("WebSocket unavailable for batch; using polling: %s", ws_error)
+
+            # Queue the entire batch up front.
+            for i, wf in enumerate(workflows):
+                try:
+                    prompt_ids[i] = await self.submit_workflow(wf, client_id=client_id)
+                except Exception as e:
+                    logger.error("batch job %d failed to submit: %s", i, e)
+                    results[i]["error"] = f"submission failed: {e}"
+
+            remaining = {i: pid for i, pid in enumerate(prompt_ids) if pid is not None}
+            if remaining:
+                if ws is None:
+                    for i, pid in remaining.items():
+                        try:
+                            history = await self._wait_via_polling(pid, None, timeout=effective_timeout)
+                            results[i]["history"] = history
+                            if history is None:
+                                results[i]["error"] = "workflow did not complete"
+                        except (RuntimeError, TimeoutError) as e:
+                            results[i]["error"] = str(e)
+                else:
+                    many = {}
+                    try:
+                        many = await self._listen_for_many(ws, remaining, timeout=effective_timeout)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("batch WebSocket closed; falling back to polling for %d jobs", len(remaining))
+                        many = {}
+                    for i, pid in remaining.items():
+                        value = many.get(i)
+                        if value is None:
+                            # Not reported (e.g. WS dropped): poll this one job.
+                            try:
+                                history = await self._wait_via_polling(pid, None, timeout=effective_timeout)
+                                results[i]["history"] = history
+                                if history is None:
+                                    results[i]["error"] = "workflow did not complete"
+                            except (RuntimeError, TimeoutError) as e:
+                                results[i]["error"] = str(e)
+                        elif "_batch_error" in value:
+                            results[i]["error"] = value["_batch_error"]
+                        else:
+                            results[i]["history"] = value
+            if any(r["history"] for r in results):
+                # Wait for the queue to drain (VAE decode, etc.) before pre-fetching.
+                try:
+                    await self._wait_for_queue_drain(timeout=600)
+                except Exception as e:
+                    logger.warning("queue drain wait failed: %s", e)
+
+                # Pre-fetch output bytes BEFORE the idle kill (same reason as run_workflow_and_wait).
+                if COMFYUI_AUTO_KILL:
+                    for i, res in enumerate(results):
+                        history = res["history"]
+                        if not history or history.get("_cached_file_bytes") is not None:
+                            continue
+                        try:
+                            outputs = history.get("outputs", {})
+                            save_image_ids = {nid for nid, d in workflows[i].items() if d["class_type"] == "SaveImage"}
+                            img_files = []
+                            for node_id, node_output in outputs.items():
+                                if node_id in save_image_ids:
+                                    img_files.extend(node_output.get("images", []))
+                            if img_files:
+                                first_img = img_files[0]
+                                history["_cached_file_bytes"] = await self.get_output_file(
+                                    first_img.get("filename", ""),
+                                    subfolder=first_img.get("subfolder", ""),
+                                    output_dir=first_img.get("type", "output"),
+                                )
+                                logger.info("batch pre-fetch job %d: %s", i, first_img.get("filename"))
+                        except Exception as e:
+                            logger.warning("failed to pre-fetch batch output for job %d: %s", i, e)
+            return results
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if COMFYUI_AUTO_KILL and any(r["history"] for r in results):
+                self._schedule_idle_kill()
+
     async def wait_for_completion(self, prompt_id: str, progress_callback=None) -> dict:
         """
         Wait for a workflow to complete using WebSocket for real-time progress.

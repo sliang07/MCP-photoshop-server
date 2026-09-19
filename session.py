@@ -40,3 +40,7 @@ class SessionManager:
     def get_default_session(self) -> Canvas:
         """Get or create a default session (for single-user setups)."""
         return self.get_or_create("default")
+
+    def list_sessions(self) -> Dict[str, Canvas]:
+        """Snapshot of all open sessions (id -> canvas)."""
+        return dict(self._sessions)

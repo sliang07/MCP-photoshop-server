@@ -30,3 +30,6 @@ desktop.ini
 # Local GPU verification outputs
 verification/
 _live_edit_check.py
+
+# Generated batch outputs (batch_generate default export dir)
+batch_output/

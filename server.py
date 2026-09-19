@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import subprocess
 import uuid
 from pathlib import Path
@@ -32,7 +33,10 @@ from config import (
 from comfy_client import ComfyUIClient
 from canvas import Canvas, BLEND_MODES
 from session import SessionManager
-from editing import register_editing_tools
+from editing import (
+    register_editing_tools, controlnet_capabilities, resolve_model,
+    style_transfer_capabilities,
+)
 
 # ----------------------------------------------------------------------- #
 #  Globals
@@ -54,8 +58,6 @@ Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
 app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE)
 comfy = ComfyUIClient(COMFYUI_URL)
 sessions = SessionManager()
-
-DEFAULT_SESSION = "default"
 
 
 async def free_or_kill_based_on_pressure(comfy_client: ComfyUIClient) -> None:
@@ -422,7 +424,9 @@ def build_controlnet_workflow(
     steps: int = 20, cfg: float = 1.5, seed: Optional[int] = None,
 ) -> dict:
     """Build a ControlNet-guided generation workflow using built-in ComfyUI nodes.
-    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple)."""
+    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple).
+    Latent follows the Flux2 convention: EmptyFlux2LatentImage with pixel dimensions.
+    ControlNetApply takes the Flux-era `conditioning` input (current ComfyUI schema)."""
     nid = _make_node_id
     n1   = nid()  # LoadImage (control image)
     n2   = nid()  # ImageScale (resize control image to match target dimensions)
@@ -434,7 +438,7 @@ def build_controlnet_workflow(
     n5   = nid()  # FluxGuidance
     n6   = nid()  # BasicGuider
     n7   = nid()  # ControlNetApply (apply control to conditioning)
-    n8   = nid()  # EmptyLatentImage
+    n8   = nid()  # EmptyFlux2LatentImage
     n9   = nid()  # RandomNoise
     n10  = nid()  # BasicScheduler
     n11  = nid()  # KSamplerSelect
@@ -452,8 +456,8 @@ def build_controlnet_workflow(
         n4:   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_cl, 0]}},
         n5:   {"class_type": "FluxGuidance", "inputs": {"conditioning": [n4, 0], "guidance": cfg}},
         n6:   {"class_type": "BasicGuider", "inputs": {"model": [n_un, 0], "conditioning": [n5, 0]}},
-        n7:   {"class_type": "ControlNetApply", "inputs": {"positive": [n5, 0], "control_net": [n3, 0], "image": [n2, 0], "strength": control_strength}},
-        n8:   {"class_type": "EmptyLatentImage", "inputs": {"width": width // 8, "height": height // 8, "batch_size": 1}},
+        n7:   {"class_type": "ControlNetApply", "inputs": {"conditioning": [n5, 0], "control_net": [n3, 0], "image": [n2, 0], "strength": control_strength}},
+        n8:   {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
         n9:   {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
         n10:  {"class_type": "BasicScheduler", "inputs": {"model": [n_un, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
         n11:  {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
@@ -467,12 +471,17 @@ def build_style_transfer_workflow(
     prompt: str, content_filename: str, style_filename: str,
     style_strength: float = 0.8, width: int = 1024, height: int = 1024,
     steps: int = 20, seed: Optional[int] = None,
+    style_model_name: str = "flux1-redux-dev.safetensors",
+    clip_vision_name: str = "sigclip_vision_patch14_384.safetensors",
 ) -> dict:
     """Build a style transfer workflow using CLIPVision + StyleModel (Redux) with built-in nodes.
-    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple)."""
+    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple).
+    CLIPVisionEncode requires a CLIPVisionLoader upstream and a `crop` input; StyleModelApply
+    requires `strength_type`. Latent follows the Flux2 convention (pixel dimensions)."""
     nid = _make_node_id
     n1   = nid()  # LoadImage (content)
     n2   = nid()  # LoadImage (style reference)
+    n_cv = nid()  # CLIPVisionLoader
     n_un = nid()  # UNETLoader
     n_cl = nid()  # CLIPLoader
     n_va = nid()  # VAELoader
@@ -482,7 +491,7 @@ def build_style_transfer_workflow(
     n7   = nid()  # FluxGuidance
     n8   = nid()  # BasicGuider
     n9   = nid()  # StyleModelApply
-    n10  = nid()  # EmptyLatentImage
+    n10  = nid()  # EmptyFlux2LatentImage
     n11  = nid()  # RandomNoise
     n12  = nid()  # BasicScheduler
     n13  = nid()  # KSamplerSelect
@@ -496,13 +505,14 @@ def build_style_transfer_workflow(
         n_un: {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
         n_cl: {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
         n_va: {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n4:   {"class_type": "CLIPVisionEncode", "inputs": {"image": [n2, 0]}},
-        n5:   {"class_type": "StyleModelLoader", "inputs": {"style_model_name": "flux1-redux-dev.safetensors"}},
+        n_cv: {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": clip_vision_name}},
+        n4:   {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": [n_cv, 0], "image": [n2, 0], "crop": "center"}},
+        n5:   {"class_type": "StyleModelLoader", "inputs": {"style_model_name": style_model_name}},
         n6:   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_cl, 0]}},
         n7:   {"class_type": "FluxGuidance", "inputs": {"conditioning": [n6, 0], "guidance": 1.5}},
         n8:   {"class_type": "BasicGuider", "inputs": {"model": [n_un, 0], "conditioning": [n7, 0]}},
-        n9:   {"class_type": "StyleModelApply", "inputs": {"conditioning": [n7, 0], "style_model": [n5, 0], "clip_vision_output": [n4, 0], "strength": style_strength}},
-        n10:  {"class_type": "EmptyLatentImage", "inputs": {"width": width // 8, "height": height // 8, "batch_size": 1}},
+        n9:   {"class_type": "StyleModelApply", "inputs": {"conditioning": [n7, 0], "style_model": [n5, 0], "clip_vision_output": [n4, 0], "strength": style_strength, "strength_type": "multiply"}},
+        n10:  {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
         n11:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
         n12:  {"class_type": "BasicScheduler", "inputs": {"model": [n_un, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
         n13:  {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
@@ -563,24 +573,24 @@ async def run_workflow(workflow: dict, output_type: str = "images", timeout: Opt
 # ======================================================================= #
 
 @app.tool("new_canvas")
-async def new_canvas(width: int = 1024, height: int = 1024, bg_color: str = "white"):
+async def new_canvas(width: int = 1024, height: int = 1024, bg_color: str = "white", session_id: str = "default"):
     """Create a new blank canvas."""
     try:
         img = Image.new("RGB", (1, 1), bg_color)
         color = img.getpixel((0, 0))
-        canvas = sessions.create(DEFAULT_SESSION, width, height, color)
+        canvas = sessions.create(session_id, width, height, color)
         return [TextContent(text=json.dumps(canvas.get_info()))]
     except Exception as e:
         return [TextContent(text=f"Error creating canvas: {str(e)}")]
 
 
 @app.tool("open_image")
-async def open_image(path: str):
+async def open_image(path: str, session_id: str = "default"):
     """Load an existing image as the active document."""
     try:
         img = Image.open(path).convert("RGBA")
         w, h = img.size
-        canvas = sessions.create(DEFAULT_SESSION, w, h)
+        canvas = sessions.create(session_id, w, h)
         canvas.layers.clear()
         canvas.undo_stack.clear()
         canvas.redo_stack.clear()
@@ -591,10 +601,10 @@ async def open_image(path: str):
 
 
 @app.tool("export")
-async def export(path: Optional[str] = None, format: str = "PNG", quality: int = 95):
+async def export(path: Optional[str] = None, format: str = "PNG", quality: int = 95, session_id: str = "default"):
     """Export the current canvas to a file."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         fmt = "JPEG" if format.upper() == "JPG" else format.upper()
         img = canvas.composite_rgb() if fmt == "JPEG" else canvas.composite()
         if not path:
@@ -606,10 +616,10 @@ async def export(path: Optional[str] = None, format: str = "PNG", quality: int =
 
 
 @app.tool("get_info")
-async def get_info():
+async def get_info(session_id: str = "default"):
     """Get current canvas dimensions, layer count, and session info."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         return [TextContent(text=json.dumps(canvas.get_info(), indent=2))]
     except Exception as e:
         return [TextContent(text=f"Error: {str(e)}")]
@@ -617,7 +627,8 @@ async def get_info():
 
 @app.tool("generate_image")
 async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, height: int = 1024,
-                         steps: int = 6, cfg: float = 1.5, seed: Optional[int] = None, negative_prompt: str = ""):
+                         steps: int = 6, cfg: float = 1.5, seed: Optional[int] = None, negative_prompt: str = "",
+                         session_id: str = "default"):
     """Generate an image from text. model: 'flux2' (photorealistic) or 'anima' (anime). Flux2 Klein requires 4-6 steps max."""
     try:
         # FLUX2 Klein 9B requires 4-6 steps max — cap to prevent failures
@@ -629,9 +640,9 @@ async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, h
         if not result:
             return [TextContent(text="Generation failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.width != img.width or canvas.height != img.height:
-            canvas = sessions.create(DEFAULT_SESSION, img.width, img.height)
+            canvas = sessions.create(session_id, img.width, img.height)
         idx = canvas.add_layer(name=f"Generated: {prompt[:30]}", image=img)
         return [TextContent(text=f"Generated image ({img.width}x{img.height}) as layer {idx}. Model: {model}")]
     except Exception as e:
@@ -639,10 +650,10 @@ async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, h
 
 
 @app.tool("img2img")
-async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0, seed: Optional[int] = None):
+async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0, seed: Optional[int] = None, session_id: str = "default"):
     """Legacy Flux2 denoising transform. Prefer edit_image for instruction/reference editing. guidance is unused."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         composite = canvas.composite()
         temp_name = f"img2img_{uuid.uuid4().hex[:8]}.png"
         buffer = io.BytesIO()
@@ -661,16 +672,17 @@ async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0
 
 
 @app.tool("character_transform")
-async def character_transform(prompt: str, guidance: float = 4.0, seed: Optional[int] = None):
+async def character_transform(prompt: str, guidance: float = 4.0, seed: Optional[int] = None, session_id: str = "default"):
     """Legacy denoising transform. Prefer edit_image with reference_paths for identity guidance."""
-    return await img2img_tool(prompt=prompt, strength=0.7, guidance=guidance, seed=seed)
+    return await img2img_tool(prompt=prompt, strength=0.7, guidance=guidance, seed=seed,
+                              session_id=session_id)
 
 
 @app.tool("crop")
-async def crop_tool(x: int, y: int, width: int, height: int):
+async def crop_tool(x: int, y: int, width: int, height: int, session_id: str = "default"):
     """Crop the active layer to the specified region."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         # Crop all layers to preserve alignment
         for layer in canvas.layers:
             layer.image = layer.image.crop((x, y, x + width, y + height))
@@ -683,10 +695,10 @@ async def crop_tool(x: int, y: int, width: int, height: int):
 
 
 @app.tool("resize")
-async def resize_tool(width: int, height: int, maintain_aspect: bool = False):
+async def resize_tool(width: int, height: int, maintain_aspect: bool = False, session_id: str = "default"):
     """Resize the active layer."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image
         if maintain_aspect:
@@ -706,10 +718,10 @@ async def resize_tool(width: int, height: int, maintain_aspect: bool = False):
 
 
 @app.tool("rotate")
-async def rotate_tool(degrees: float, expand: bool = True, bg_color: str = "transparent"):
+async def rotate_tool(degrees: float, expand: bool = True, bg_color: str = "transparent", session_id: str = "default"):
     """Rotate the active layer (counter-clockwise)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         fill_color = (0, 0, 0, 0) if bg_color == "transparent" else bg_color
         layer.image = layer.image.rotate(degrees, expand=expand, fillcolor=fill_color, resample=Image.BICUBIC)
@@ -720,10 +732,10 @@ async def rotate_tool(degrees: float, expand: bool = True, bg_color: str = "tran
 
 
 @app.tool("flip")
-async def flip_tool(axis: str = "horizontal"):
+async def flip_tool(axis: str = "horizontal", session_id: str = "default"):
     """Flip the active layer. axis: 'horizontal' or 'vertical'."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         layer.image = ImageOps.mirror(layer.image) if axis == "horizontal" else ImageOps.flip(layer.image)
         canvas._save_state()
@@ -734,10 +746,11 @@ async def flip_tool(axis: str = "horizontal"):
 
 @app.tool("adjust")
 async def adjust_tool(brightness: Optional[float] = None, contrast: Optional[float] = None,
-                      saturation: Optional[float] = None, hue: Optional[float] = None, sharpness: Optional[float] = None):
+                      saturation: Optional[float] = None, hue: Optional[float] = None, sharpness: Optional[float] = None,
+                      session_id: str = "default"):
     """Adjust colors. Each parameter is a multiplier (1.0=no change). hue is in degrees (0-360)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image
         if brightness is not None:
@@ -792,10 +805,10 @@ def _apply_sepia(img: Image.Image) -> Image.Image:
 
 
 @app.tool("apply_filter")
-async def apply_filter(name: str, **params):
+async def apply_filter(name: str, session_id: str = "default", **params):
     """Apply a filter: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, find_edges, emboss, pixelate, posterize, solarize, invert, grayscale, sepia."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image
         filters = {
@@ -828,10 +841,11 @@ async def apply_filter(name: str, **params):
 
 @app.tool("add_text")
 async def add_text(text: str, x: int = 50, y: int = 50, font_size: int = 48, color: str = "white",
-                   font: Optional[str] = None, stroke_width: int = 0, stroke_color: str = "black"):
+                   font: Optional[str] = None, stroke_width: int = 0, stroke_color: str = "black",
+                   session_id: str = "default"):
     """Add text overlay to the active layer."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image.copy()
         draw = ImageDraw.Draw(img)
@@ -851,10 +865,11 @@ async def add_text(text: str, x: int = 50, y: int = 50, font_size: int = 48, col
 
 @app.tool("add_layer")
 async def add_layer_tool(name: Optional[str] = None, source_path: Optional[str] = None,
-                         opacity: float = 1.0, blend_mode: str = "normal"):
+                         opacity: float = 1.0, blend_mode: str = "normal",
+                         session_id: str = "default"):
     """Add a new layer. Optionally load from source_path."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         img = Image.open(source_path).convert("RGBA") if source_path else None
         layer_name = name or f"Layer {len(canvas.layers)}"
         idx = canvas.add_layer(name=layer_name, image=img, opacity=opacity, blend_mode=blend_mode)
@@ -864,10 +879,10 @@ async def add_layer_tool(name: Optional[str] = None, source_path: Optional[str] 
 
 
 @app.tool("select_layer")
-async def select_layer_tool(index: int):
+async def select_layer_tool(index: int, session_id: str = "default"):
     """Select a layer by index (0 = bottom)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.select_layer(index):
             return [TextContent(text=f"Selected layer {index}: {canvas.layers[index].name}")]
         return [TextContent(text=f"Invalid layer index: {index}")]
@@ -876,10 +891,10 @@ async def select_layer_tool(index: int):
 
 
 @app.tool("set_blend_mode")
-async def set_blend_mode_tool(mode: str, index: Optional[int] = None):
+async def set_blend_mode_tool(mode: str, index: Optional[int] = None, session_id: str = "default"):
     """Set blend mode: normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.set_blend_mode(mode, index):
             return [TextContent(text=f"Blend mode set to '{mode}'")]
         return [TextContent(text=f"Invalid blend mode: {mode}")]
@@ -888,10 +903,10 @@ async def set_blend_mode_tool(mode: str, index: Optional[int] = None):
 
 
 @app.tool("set_layer_opacity")
-async def set_layer_opacity_tool(opacity: float, index: Optional[int] = None):
+async def set_layer_opacity_tool(opacity: float, index: Optional[int] = None, session_id: str = "default"):
     """Set layer opacity (0.0=transparent, 1.0=opaque)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.set_layer_opacity(index, opacity):
             return [TextContent(text=f"Opacity set to {opacity}")]
         return [TextContent(text="Invalid layer index")]
@@ -900,10 +915,10 @@ async def set_layer_opacity_tool(opacity: float, index: Optional[int] = None):
 
 
 @app.tool("merge_down")
-async def merge_down_tool():
+async def merge_down_tool(session_id: str = "default"):
     """Merge active layer into the layer below."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.merge_down():
             return [TextContent(text="Merged down.")]
         return [TextContent(text="Cannot merge: already on bottom layer.")]
@@ -912,10 +927,10 @@ async def merge_down_tool():
 
 
 @app.tool("delete_layer")
-async def delete_layer_tool(index: Optional[int] = None):
+async def delete_layer_tool(index: Optional[int] = None, session_id: str = "default"):
     """Delete a layer by index or the active layer."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.delete_layer(index):
             return [TextContent(text="Layer deleted.")]
         return [TextContent(text="Cannot delete layer.")]
@@ -924,10 +939,10 @@ async def delete_layer_tool(index: Optional[int] = None):
 
 
 @app.tool("reorder_layer")
-async def reorder_layer_tool(index: Optional[int] = None, direction: str = "up"):
+async def reorder_layer_tool(index: Optional[int] = None, direction: str = "up", session_id: str = "default"):
     """Move layer up or down in the stack."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         idx = index if index is not None else canvas.active_layer_index
         if canvas.reorder_layer(idx, direction):
             return [TextContent(text=f"Layer moved {direction}.")]
@@ -937,10 +952,10 @@ async def reorder_layer_tool(index: Optional[int] = None, direction: str = "up")
 
 
 @app.tool("select_rect")
-async def select_rect(x: int, y: int, width: int, height: int):
+async def select_rect(x: int, y: int, width: int, height: int, session_id: str = "default"):
     """Create a rectangular selection mask on the active layer."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         mask = Image.new("L", layer.image.size, 0)
         draw = ImageDraw.Draw(mask)
@@ -953,10 +968,10 @@ async def select_rect(x: int, y: int, width: int, height: int):
 
 
 @app.tool("select_ellipse")
-async def select_ellipse(x: int, y: int, rx: int, ry: int):
+async def select_ellipse(x: int, y: int, rx: int, ry: int, session_id: str = "default"):
     """Create an elliptical selection mask centered at (x,y)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         mask = Image.new("L", layer.image.size, 0)
         draw = ImageDraw.Draw(mask)
@@ -969,10 +984,10 @@ async def select_ellipse(x: int, y: int, rx: int, ry: int):
 
 
 @app.tool("clear_mask")
-async def clear_mask_tool(index: Optional[int] = None):
+async def clear_mask_tool(index: Optional[int] = None, session_id: str = "default"):
     """Remove the mask from the active layer."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         idx = index if index is not None else canvas.active_layer_index
         if 0 <= idx < len(canvas.layers):
             canvas.layers[idx].mask = None
@@ -984,10 +999,10 @@ async def clear_mask_tool(index: Optional[int] = None):
 
 
 @app.tool("undo")
-async def undo_tool():
+async def undo_tool(session_id: str = "default"):
     """Undo the last operation."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.undo():
             return [TextContent(text="Undone.")]
         return [TextContent(text="Nothing to undo.")]
@@ -996,10 +1011,10 @@ async def undo_tool():
 
 
 @app.tool("redo")
-async def redo_tool():
+async def redo_tool(session_id: str = "default"):
     """Redo the last undone operation."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         if canvas.redo():
             return [TextContent(text="Redone.")]
         return [TextContent(text="Nothing to redo.")]
@@ -1030,10 +1045,10 @@ async def clear_vram_tool():
 # ---- Inpaint / Outpaint ----
 
 @app.tool("inpaint")
-async def inpaint_tool(prompt: str, guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None):
+async def inpaint_tool(prompt: str, guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None, session_id: str = "default"):
     """AI inpaint the masked region of the active layer. Requires a mask set via select_rect/select_ellipse first."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         if layer.mask is None:
             return [TextContent(text="No mask set. Use select_rect or select_ellipse first.")]
@@ -1063,10 +1078,11 @@ async def inpaint_tool(prompt: str, guidance: float = 4.0, steps: int = 30, seed
 
 @app.tool("outpaint")
 async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256,
-                        guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None):
+                        guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None,
+                        session_id: str = "default"):
     """AI outpaint: extend the canvas in a direction and fill the new area. direction: left, right, top, bottom."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         w, h = layer.image.size
         directions = {
@@ -1112,10 +1128,10 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
 # ---- Levels / Curves ----
 
 @app.tool("levels")
-async def levels_tool(black_point: int = 0, mid_point: float = 1.0, white_point: int = 255):
+async def levels_tool(black_point: int = 0, mid_point: float = 1.0, white_point: int = 255, session_id: str = "default"):
     """Adjust levels. black_point: 0-255 (input black), mid_point: 0.1-2.0 (gamma), white_point: 0-255 (input white)."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image.convert("RGB")
         # Build 256-point lookup table
@@ -1134,7 +1150,7 @@ async def levels_tool(black_point: int = 0, mid_point: float = 1.0, white_point:
 
 
 @app.tool("curves")
-async def curves_tool(red: str = "", green: str = "", blue: str = ""):
+async def curves_tool(red: str = "", green: str = "", blue: str = "", session_id: str = "default"):
     """Adjust curves. Each channel is a comma-separated list of (input,output) pairs, e.g. '0,0 128,140 255,255'."""
     def _parse_curve(s: str) -> list:
         if not s:
@@ -1151,7 +1167,7 @@ async def curves_tool(red: str = "", green: str = "", blue: str = ""):
         return lut
 
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image.convert("RGB")
         r, g, b = img.split()
@@ -1171,14 +1187,14 @@ async def curves_tool(red: str = "", green: str = "", blue: str = ""):
 # ---- Upscale ----
 
 @app.tool("upscale")
-async def upscale_tool(factor: int = 2, model: str = "anime"):
+async def upscale_tool(factor: int = 2, model: str = "anime", session_id: str = "default"):
     """Upscale by factor (1-4), preserving layer alignment. model: anime, face, or an installed model filename."""
     try:
         if factor not in (1, 2, 3, 4):
             raise ValueError("factor must be 1, 2, 3, or 4")
         model_map = {"anime": MODEL_UPSCALE_ANIME, "face": MODEL_UPSCALE_FACE}
         upscale_model = model_map.get(model, model)
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         original_state = canvas.undo_stack[-1]
         layer = canvas.layers[canvas.active_layer_index]
         target_size = (canvas.width * factor, canvas.height * factor)
@@ -1194,7 +1210,7 @@ async def upscale_tool(factor: int = 2, model: str = "anime"):
             img = opened.convert("RGBA").resize(target_size, Image.Resampling.LANCZOS)
         # ComfyUI's RGB upscaler cannot retain source transparency itself.
         img.putalpha(layer.image.convert("RGBA").getchannel("A").resize(target_size, Image.Resampling.LANCZOS))
-        if sessions.get_default_session() is not canvas or canvas.undo_stack[-1] is not original_state:
+        if sessions.get_or_create(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
             raise RuntimeError("Canvas changed during upscaling; result was not applied")
         resized = []
         for existing in canvas.layers:
@@ -1213,14 +1229,14 @@ async def upscale_tool(factor: int = 2, model: str = "anime"):
 # ---- Semantic Selection (simple threshold-based, SAM-ready) ----
 
 @app.tool("select_object")
-async def select_object_tool(description: str, threshold: int = 128):
+async def select_object_tool(description: str, threshold: int = 128, session_id: str = "default"):
     """
     Create a selection mask using simple color/region heuristics.
     description: color name or keyword (red, blue, green, sky, dark, light, white, black).
     Uses PIL getdata/putdata for batch processing (no numpy, no pixel-by-pixel loop).
     """
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image.convert("RGB")
         w, h = img.size
@@ -1283,23 +1299,37 @@ async def select_object_tool(description: str, threshold: int = 128):
 @app.tool("controlnet_generate")
 async def controlnet_generate(prompt: str, controlnet: str = "depth", strength: float = 0.8,
                                width: int = 1024, height: int = 1024, steps: int = 20,
-                               cfg: float = 1.5, seed: Optional[int] = None):
-    """Generate an image guided by the current canvas via ControlNet. controlnet: 'depth', 'canny', or 'pose'."""
+                               cfg: float = 1.5, seed: Optional[int] = None,
+                               session_id: str = "default"):
+    """Generate an image guided by the current canvas via ControlNet. controlnet: 'depth', 'canny', or 'pose' (or an installed model name)."""
     try:
-        canvas = sessions.get_default_session()
-        composite = canvas.composite()
-        ctrl_name = f"ctrlnet_{uuid.uuid4().hex[:8]}.png"
-        buf = io.BytesIO()
-        composite.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), ctrl_name)
+        canvas = sessions.get_or_create(session_id)
         controlnet_map = {
             "depth": "control_v11f1p_sd15_depth_fp16.safetensors",
             "canny": "control_v11p_sd15_canny_fp16.safetensors",
             "pose": "control_v11p_sd15_openpose_fp16.safetensors",
         }
         model_name = controlnet_map.get(controlnet, controlnet)
+        # Readiness check before upload: report exactly what is missing.
+        await comfy.start_comfyui()
+        info = await comfy.get_object_info()
+        caps = controlnet_capabilities(info)
+        if not caps["models"]:
+            return [TextContent(text="ControlNet unavailable: no models in models/controlnet. Install a "
+                                      "ControlNet that matches the Flux2 UNET (SD1.5 controlnets do not work with "
+                                      "Flux2). Call get_editing_capabilities to see what is installed; for guided "
+                                      "edits, edit_image with reference_paths is the supported path.")]
+        resolved = resolve_model(caps["models"], model_name)
+        if resolved is None:
+            return [TextContent(text=f"ControlNet model '{model_name}' is not installed. "
+                                     f"Available: {', '.join(caps['models'])}")]
+        composite = canvas.composite()
+        ctrl_name = f"ctrlnet_{uuid.uuid4().hex[:8]}.png"
+        buf = io.BytesIO()
+        composite.save(buf, format="PNG")
+        await comfy.upload_image(buf.getvalue(), ctrl_name)
         workflow = build_controlnet_workflow(prompt=prompt, image_filename=ctrl_name,
-                                             controlnet_name=model_name, control_strength=strength,
+                                             controlnet_name=resolved, control_strength=strength,
                                              width=width, height=height, steps=steps, cfg=cfg, seed=seed)
         result = await run_workflow(workflow)
         if not result:
@@ -1316,10 +1346,30 @@ async def controlnet_generate(prompt: str, controlnet: str = "depth", strength: 
 @app.tool("style_transfer")
 async def style_transfer_tool(prompt: str, style_path: str, strength: float = 0.8,
                                width: int = 1024, height: int = 1024, steps: int = 20,
-                               seed: Optional[int] = None):
-    """Generate an image with the style of a reference image. Uses Redux StyleModel for style transfer."""
+                               seed: Optional[int] = None,
+                               style_model: str = "flux1-redux-dev.safetensors",
+                               session_id: str = "default"):
+    """Generate an image with the style of a reference image. Uses Redux StyleModel for style transfer.
+    Pre-validates live model availability; style_model selects an installed model from models/style_models."""
     try:
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
+        # Readiness check before upload: report exactly what is missing.
+        await comfy.start_comfyui()
+        info = await comfy.get_object_info()
+        caps = style_transfer_capabilities(info)
+        if not caps["style_models"]:
+            return [TextContent(text="Style transfer unavailable: no models in models/style_models "
+                                     "(expected flux1-redux-dev.safetensors). Note the Redux model is "
+                                     "Flux.1-based, so on the Flux2 UNET results are best-effort; for style "
+                                     "guidance prefer edit_image with reference_paths.")]
+        if not caps["clip_vision_models"]:
+            return [TextContent(text="Style transfer unavailable: no CLIPVision model in models/clip_vision "
+                                     "(expected clip_vision.safetensors or sigclip_vision_patch14_384.safetensors).")]
+        resolved_style = resolve_model(caps["style_models"], style_model)
+        if resolved_style is None:
+            return [TextContent(text=f"Style model '{style_model}' is not installed. "
+                                     f"Available: {', '.join(caps['style_models'])}")]
+        clip_vision = caps["clip_vision_models"][0]
         # Upload content (current canvas)
         content_name = f"style_content_{uuid.uuid4().hex[:8]}.png"
         composite = canvas.composite()
@@ -1334,7 +1384,8 @@ async def style_transfer_tool(prompt: str, style_path: str, strength: float = 0.
         await comfy.upload_image(buf2.getvalue(), style_name)
         workflow = build_style_transfer_workflow(prompt=prompt, content_filename=content_name,
                                                   style_filename=style_name, style_strength=strength,
-                                                  width=width, height=height, steps=steps, seed=seed)
+                                                  width=width, height=height, steps=steps, seed=seed,
+                                                  style_model_name=resolved_style, clip_vision_name=clip_vision)
         result = await run_workflow(workflow)
         if not result:
             return [TextContent(text="Style transfer failed.")]
@@ -1343,6 +1394,119 @@ async def style_transfer_tool(prompt: str, style_path: str, strength: float = 0.
         return [TextContent(text=f"Style transfer complete. Layer {idx}.")]
     except Exception as e:
         return [TextContent(text=f"Style transfer error: {str(e)}")]
+
+
+# ---- Sessions (multi-document) ----
+
+@app.tool("list_sessions")
+async def list_sessions_tool():
+    """List all open document sessions: id, canvas size, layer count, active layer, and undo depth."""
+    try:
+        report = {}
+        for sid in sorted(sessions.list_sessions()):
+            c = sessions.get(sid)
+            report[sid] = {"size": [c.width, c.height], "layers": len(c.layers),
+                           "active_layer": c.active_layer_index,
+                           "undo_depth": max(0, len(c.undo_stack) - 1)}
+        return [TextContent(text=json.dumps(report, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"List sessions error: {str(e)}")]
+
+
+@app.tool("close_session")
+async def close_session_tool(session_id: str = "default"):
+    """Close a document session, freeing its canvas. Every canvas tool takes a session_id (default 'default')."""
+    try:
+        if sessions.delete(session_id):
+            return [TextContent(text=f"Session '{session_id}' closed.")]
+        return [TextContent(text=f"No open session named '{session_id}'. See list_sessions.")]
+    except Exception as e:
+        return [TextContent(text=f"Close session error: {str(e)}")]
+
+
+# ---- Batch Generation ----
+
+DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_output"
+
+
+@app.tool("batch_generate")
+async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
+                              export_format: str = "PNG", timeout: Optional[int] = None):
+    """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass and export each result.
+
+    jobs: list of job objects, each with 'prompt' (required) and optional
+    'model' ('flux2' photorealistic / 'anima' anime), 'width', 'height', 'steps', 'cfg',
+    'seed', 'negative_prompt', and 'filename' (output basename without extension).
+    Flux2 jobs are capped at 6 steps (distilled model - quality degrades after ~6).
+    All jobs are submitted up front so the batch runs unattended (GPU batching rule:
+    for long batches, get user approval to stop the qwen38 LLM container first).
+    export_dir defaults to <server>/batch_output; export_format: PNG or JPG.
+    timeout: seconds for the whole batch wait. Returns a JSON summary with per-job
+    status, output file path, and seed.
+    """
+    try:
+        if not jobs:
+            return [TextContent(text="jobs must contain at least one job")]
+        workflows = []
+        seeds = []
+        for i, job in enumerate(jobs):
+            if not isinstance(job, dict) or not str(job.get("prompt", "")).strip():
+                return [TextContent(text=f"Job {i} is invalid: each job needs a non-empty 'prompt' string")]
+            model = job.get("model", "flux2")
+            if model not in ("flux2", "anima"):
+                return [TextContent(text=f"Job {i}: 'model' must be 'flux2' or 'anima'")]
+            steps = int(job.get("steps", 6 if model == "flux2" else 20))
+            if model == "flux2" and steps > 6:
+                steps = 6
+            seed = job.get("seed")
+            seed = int(seed) if seed is not None else secrets.randbits(63)
+            workflows.append(build_txt2img_workflow(
+                prompt=str(job["prompt"]), negative_prompt=str(job.get("negative_prompt", "")),
+                width=int(job.get("width", DEFAULT_WIDTH)), height=int(job.get("height", DEFAULT_HEIGHT)),
+                steps=steps, cfg=float(job.get("cfg", DEFAULT_CFG)), seed=seed, model=model))
+            seeds.append(seed)
+        batch = await comfy.batch_run_workflows(workflows, timeout=timeout)
+        batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
+        out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fmt = export_format.upper()
+        results = []
+        for i, entry in enumerate(batch):
+            job = jobs[i]
+            record = {"index": i, "prompt": job.get("prompt"), "model": job.get("model", "flux2"),
+                      "seed": seeds[i], "status": "ok", "file": None}
+            history = entry.get("history")
+            data = history.get("_cached_file_bytes") if history else None
+            if data is None and history:
+                files = ComfyUIClient.get_output_files_from_history(history, file_type="images")
+                if files:
+                    first = files[0]
+                    data = await comfy.get_output_file(
+                        first.get("filename", ""), subfolder=first.get("subfolder", ""),
+                        output_dir=first.get("type", "output"))
+            if not data:
+                record["status"] = "failed"
+                record["error"] = entry.get("error") or "no output image"
+                results.append(record)
+                continue
+            base = str(job.get("filename") or f"batch_{i:03d}")
+            base = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)[:60]
+            ext = "jpg" if fmt in ("JPG", "JPEG") else fmt.lower()
+            path = out_dir / f"{base}.{ext}"
+            with Image.open(io.BytesIO(data)) as img:
+                if fmt in ("JPG", "JPEG"):
+                    img.convert("RGB").save(path, "JPEG", quality=95)
+                else:
+                    img.save(path, ext)
+                record["size"] = list(img.size)
+            record["file"] = str(path)
+            results.append(record)
+        summary = {"jobs": len(results), "ok": sum(1 for r in results if r["status"] == "ok"),
+                   "failed": sum(1 for r in results if r["status"] != "ok"),
+                   "export_dir": str(out_dir), "format": ext}
+        return [TextContent(text=json.dumps({"summary": summary, "results": results}, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"Batch generation error: {str(e)}")]
 
 
 # ======================================================================= #

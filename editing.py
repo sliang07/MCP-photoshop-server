@@ -179,6 +179,26 @@ def sam3_capabilities(info):
     }
 
 
+def controlnet_capabilities(info):
+    """Report ControlNet readiness from live node info without starting it or loading GPU models."""
+    models = model_options(info, "ControlNetLoader", "control_net_name")
+    return {
+        "available": bool(models),
+        "models": models,
+    }
+
+
+def style_transfer_capabilities(info):
+    """Report Redux style-transfer readiness (StyleModel + CLIPVision) from live node info."""
+    style_models = model_options(info, "StyleModelLoader", "style_model_name")
+    clip_vision = model_options(info, "CLIPVisionLoader", "clip_name")
+    return {
+        "available": bool(style_models) and bool(clip_vision),
+        "style_models": style_models,
+        "clip_vision_models": clip_vision,
+    }
+
+
 def count_selection_regions(mask, max_side=256):
     """Approximate object count: connected components of a downsampled binary mask."""
     if mask.getbbox() is None:
@@ -249,9 +269,9 @@ def build_semantic_select_workflow(ckpt, image, point=None, box=None, prompt=Non
 
 def register_editing_tools(app, comfy, sessions, run_workflow):
     @app.tool("preview_canvas")
-    async def preview_canvas(max_size: int = 1024):
+    async def preview_canvas(max_size: int = 1024, session_id: str = "default"):
         """See the current canvas as an MCP image. Use before editing and to inspect results."""
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         return [TextContent(type="text", text=json.dumps(canvas.get_info())),
                 preview_content(canvas.composite(), max_size)]
 
@@ -271,11 +291,14 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                        "vae": model_options(info, "VAELoader", "vae_name"),
                        "upscalers": model_options(info, "UpscaleModelLoader", "model_name")},
             "sam3": sam3_capabilities(info),
+            "controlnet": controlnet_capabilities(info),
+            "style_transfer": style_transfer_capabilities(info),
             "notes": ["Availability checks files and nodes; it does not benchmark generation or guarantee VRAM fit.",
                       "semantic_select runs SAM 3 text/point/box prompts on the canvas (point/box use sam3.pt; text prompts use sam3.1_multiplex_fp16.safetensors, both in models/checkpoints). select_object stays the fast color-heuristic fallback.",
                       "edit_image supports independent white-to-edit masks and returns a new undoable layer.",
                       "Legacy select_object uses color heuristics, not semantic object segmentation.",
-                      "Legacy ControlNet/style_transfer need repair; use edit_image references for style or identity guidance.",
+                      "controlnet_generate and style_transfer pre-validate live model availability before uploading or generating (see their sections in this report). SD1.5 controlnets do not fit the Flux2 UNET; the Redux model is Flux.1-based, so for style/identity guidance edit_image references remain the primary path.",
+                      "batch_generate queues a whole job list on one WebSocket connection and exports each result to disk as it completes (see the GPU batching rule).",
                       "GPU batching rule: the host GPU is shared with the qwen38 LLM docker; for multiple or long generations (qwen2511 ~8 min), queue the whole batch to run unattended, then ask the user for explicit approval to `docker stop qwen38` (it ends the LLM session; the batch keeps running on the host). searxng is CPU-only - never stop it for GPU speed.",
                       "Full GPU batching procedure: MEMORY.md, section 'GPU Contention & Batching Rule'."],
         }
@@ -285,7 +308,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
     async def edit_image(prompt: str, backend: str = "flux2", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
-                         max_side: int = 1024):
+                         max_side: int = 1024, session_id: str = "default"):
         """Instruction-edit the canvas: remove objects, replace backgrounds, restyle, or use identity references.
 
         backend: flux2 (fast, up to two extra references), qwen (original single-image editor),
@@ -306,7 +329,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             seed = secrets.randbits(63)
         if not 0 <= seed < 2**64:
             raise ValueError("seed must be an unsigned 64-bit integer")
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         original_state = canvas.undo_stack[-1]
         source = canvas.composite()
         mask = make_edit_mask(source.size, mask_path, region, feather)
@@ -340,7 +363,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             edited = opened.convert("RGBA")
         if edited.size != source.size:
             edited = edited.resize(source.size, Image.Resampling.LANCZOS)
-        if sessions.get_default_session() is not canvas or canvas.undo_stack[-1] is not original_state:
+        if sessions.get_or_create(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
             raise RuntimeError("Canvas changed during generation; result was not applied. It remains in ComfyUI output.")
         if mask is not None:
             edited.putalpha(ImageChops.multiply(edited.getchannel("A"), mask))
@@ -352,7 +375,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
     @app.tool("semantic_select")
     async def semantic_select(prompt: str | None = None, point: list[int] | None = None, box: list[int] | None = None,
-                              threshold: float = 0.5, refine: int = 2, timeout: int | None = None):
+                              threshold: float = 0.5, refine: int = 2, timeout: int | None = None,
+                              session_id: str = "default"):
         """Select a semantic object on the active layer using SAM 3 (text, point, and/or box prompts).
 
         prompt: text description of the object (e.g. "red circle") - runs the SAM 3.1
@@ -372,7 +396,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             raise ValueError("point must be [x, y] integers in canvas pixels")
         if box is not None and (len(box) != 4 or any(type(v) is not int for v in box)):
             raise ValueError("box must be [x, y, width, height] integers in canvas pixels")
-        canvas = sessions.get_default_session()
+        canvas = sessions.get_or_create(session_id)
         original_state = canvas.undo_stack[-1]
         source = canvas.composite()
         width, height = source.size
@@ -411,7 +435,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             mask = opened.convert("L")
         if mask.size != source.size:
             mask = mask.resize(source.size, Image.Resampling.LANCZOS)
-        if sessions.get_default_session() is not canvas or canvas.undo_stack[-1] is not original_state:
+        if sessions.get_or_create(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
             raise RuntimeError("Canvas changed during detection; result was not applied.")
         bbox = mask.getbbox()
         if bbox is None:

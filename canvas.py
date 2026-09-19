@@ -5,6 +5,7 @@ Mirrors the mental model of a Photoshop document.
 
 import copy
 import io
+from functools import partial
 from typing import Optional, Tuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
@@ -21,136 +22,140 @@ def _clamp(value: int) -> int:
 
 
 def blend_normal(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    return Image.blend(bottom, top, opacity)
+    """Composite using per-pixel alpha; transparent edit regions reveal lower layers."""
+    top = top.convert("RGBA").copy()
+    opacity = max(0.0, min(1.0, opacity))
+    if opacity != 1.0:
+        top.putalpha(top.getchannel("A").point(lambda value: round(value * opacity)))
+    return Image.alpha_composite(bottom.convert("RGBA"), top)
+
+
+def _channel_loop_op(bottom_img: Image.Image, top_img: Image.Image, fn) -> Image.Image:
+    """Apply a per-pixel pair function fn(b, t) -> value to every channel of two images."""
+    channels = []
+    for bottom_ch, top_ch in zip(bottom_img.split(), top_img.split()):
+        bottom_data = bottom_ch.getdata()
+        top_data = top_ch.getdata()
+        ch = bottom_ch.copy()
+        ch.putdata([fn(b, t) for b, t in zip(bottom_data, top_data)])
+        channels.append(ch)
+    return Image.merge(bottom_img.mode, channels)
+
+
+def _blend_with_alpha(bottom: Image.Image, top: Image.Image, rgb_op, opacity: float = 1.0) -> Image.Image:
+    """Alpha-aware blend with Photoshop semantics:
+
+    out_rgb   = bottom + top_alpha * (rgb_op(bottom, top) - bottom) / 255
+    out_alpha = screen(bottom_alpha, top_alpha)   (standard source-over)
+
+    top_alpha is the top layer's per-pixel alpha folded with the layer opacity.
+    Where the top layer is transparent, the bottom passes through bit-exactly,
+    so a masked edit layer in a non-normal blend mode never corrupts the rest
+    of the canvas (and never zeroes the composite's alpha). Where the top
+    layer is fully opaque, out is exactly rgb_op(bottom, top).
+
+    rgb_op maps two same-size RGB images to their per-channel blend
+    (e.g. ImageChops.multiply or _channel_loop_op).
+    """
+    bottom = bottom.convert("RGBA")
+    top = top.convert("RGBA")
+    opacity = max(0.0, min(1.0, opacity))
+    if opacity == 0.0:
+        return bottom.copy()
+
+    bottom_rgb = bottom.split()[:3]
+    top_alpha = top.getchannel("A")
+    if opacity != 1.0:
+        top_alpha = top_alpha.point(lambda value: round(value * opacity))
+    if top_alpha.getextrema() == (0, 0):
+        return bottom.copy()
+
+    blended = rgb_op(Image.merge("RGB", bottom_rgb), Image.merge("RGB", top.split()[:3]))
+
+    out_channels = []
+    top_alpha_data = top_alpha.getdata()
+    for bottom_ch, blended_ch in zip(bottom_rgb, blended.split()):
+        bottom_data = bottom_ch.getdata()
+        blended_data = blended_ch.getdata()
+        ch = blended_ch.copy()
+        ch.putdata([
+            _clamp(b + (t - b) * a / 255)
+            for b, t, a in zip(bottom_data, blended_data, top_alpha_data)
+        ])
+        out_channels.append(ch)
+
+    out_channels.append(ImageChops.screen(bottom.getchannel("A"), top_alpha))
+    return Image.merge("RGBA", out_channels)
 
 
 def blend_multiply(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    result = ImageChops.multiply(bottom, top)
-    return Image.blend(bottom, result, opacity)
+    return _blend_with_alpha(bottom, top, ImageChops.multiply, opacity)
 
 
 def blend_screen(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    result = ImageChops.screen(bottom, top)
-    return Image.blend(bottom, result, opacity)
+    return _blend_with_alpha(bottom, top, ImageChops.screen, opacity)
 
 
 def blend_overlay(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
     """Overlay: multiply if bottom < 128, screen if bottom >= 128."""
-    b_arr = bottom.split()
-    t_arr = top.split()
-    channels = []
-    for b_ch, t_ch in zip(b_arr, t_arr):
-        b_data = b_ch.getdata()
-        t_data = t_ch.getdata()
-        out = []
-        for b, t in zip(b_data, t_data):
-            if b < 128:
-                out.append(_clamp((b * t) / 255))
-            else:
-                out.append(_clamp(255 - ((255 - b) * (255 - t)) / 255))
-        ch = b_ch.copy()
-        ch.putdata(out)
-        channels.append(ch)
-    result = Image.merge(bottom.mode, channels)
-    return Image.blend(bottom, result, opacity)
+    def op(b, t):
+        if b < 128:
+            return _clamp((b * t) / 255)
+        return _clamp(255 - ((255 - b) * (255 - t)) / 255)
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 def blend_darken(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    result = ImageChops.darker(bottom, top)
-    return Image.blend(bottom, result, opacity)
+    return _blend_with_alpha(bottom, top, ImageChops.darker, opacity)
 
 
 def blend_lighten(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    result = ImageChops.lighter(bottom, top)
-    return Image.blend(bottom, result, opacity)
+    return _blend_with_alpha(bottom, top, ImageChops.lighter, opacity)
 
 
 def blend_color_dodge(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    b_arr = bottom.split()
-    t_arr = top.split()
-    channels = []
-    for b_ch, t_ch in zip(b_arr, t_arr):
-        b_data = b_ch.getdata()
-        t_data = t_ch.getdata()
-        out = []
-        for b, t in zip(b_data, t_data):
-            if t >= 255:
-                out.append(255)
-            else:
-                out.append(_clamp((b * 255) / (255 - t)))
-        ch = b_ch.copy()
-        ch.putdata(out)
-        channels.append(ch)
-    result = Image.merge(bottom.mode, channels)
-    return Image.blend(bottom, result, opacity)
+    def op(b, t):
+        if t >= 255:
+            return 255
+        return _clamp((b * 255) / (255 - t))
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 def blend_color_burn(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    b_arr = bottom.split()
-    t_arr = top.split()
-    channels = []
-    for b_ch, t_ch in zip(b_arr, t_arr):
-        b_data = b_ch.getdata()
-        t_data = t_ch.getdata()
-        out = []
-        for b, t in zip(b_data, t_data):
-            if b <= 0:
-                out.append(0)
-            else:
-                out.append(_clamp(255 - ((255 - b) * 255) / t))
-        ch = b_ch.copy()
-        ch.putdata(out)
-        channels.append(ch)
-    result = Image.merge(bottom.mode, channels)
-    return Image.blend(bottom, result, opacity)
+    def op(b, t):
+        if t <= 0:
+            return 255
+        if b <= 0:
+            return 0
+        return _clamp(255 - ((255 - b) * 255) / t)
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 def blend_hard_light(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
     """Same as overlay but swap roles of bottom and top."""
-    return blend_overlay(top, bottom, opacity)
+    def op(b, t):
+        if t < 128:
+            return _clamp((b * t) / 255)
+        return _clamp(255 - ((255 - b) * (255 - t)) / 255)
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 def blend_soft_light(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    b_arr = bottom.split()
-    t_arr = top.split()
-    channels = []
-    for b_ch, t_ch in zip(b_arr, t_arr):
-        b_data = b_ch.getdata()
-        t_data = t_ch.getdata()
-        out = []
-        for b, t in zip(b_data, t_data):
-            dark = (b * t) / 255
-            light = 255 - ((255 - b) * (255 - t)) / 255
-            result = t * dark + b * light - dark * light
-            out.append(_clamp(result))
-        ch = b_ch.copy()
-        ch.putdata(out)
-        channels.append(ch)
-    result = Image.merge(bottom.mode, channels)
-    return Image.blend(bottom, result, opacity)
+    def op(b, t):
+        dark = (b * t) / 255
+        light = 255 - ((255 - b) * (255 - t)) / 255
+        return _clamp(t * dark + b * light - dark * light)
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 def blend_difference(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    result = ImageChops.difference(bottom, top)
-    return Image.blend(bottom, result, opacity)
+    return _blend_with_alpha(bottom, top, ImageChops.difference, opacity)
 
 
 def blend_exclusion(bottom: Image.Image, top: Image.Image, opacity: float = 1.0) -> Image.Image:
-    b_arr = bottom.split()
-    t_arr = top.split()
-    channels = []
-    for b_ch, t_ch in zip(b_arr, t_arr):
-        b_data = b_ch.getdata()
-        t_data = t_ch.getdata()
-        out = []
-        for b, t in zip(b_data, t_data):
-            result = b + t - (2 * b * t) / 255
-            out.append(_clamp(result))
-        ch = b_ch.copy()
-        ch.putdata(out)
-        channels.append(ch)
-    result = Image.merge(bottom.mode, channels)
-    return Image.blend(bottom, result, opacity)
+    def op(b, t):
+        return _clamp(b + t - (2 * b * t) / 255)
+    return _blend_with_alpha(bottom, top, partial(_channel_loop_op, fn=op), opacity)
 
 
 BLEND_MODES = {
@@ -342,10 +347,13 @@ class Canvas:
             return False
         bottom = self.layers[idx - 1]
         top = self.layers[idx]
-        effective = self._apply_blend(bottom.image, top.image, top.blend_mode, top.opacity)
+        # Apply the top layer's mask first (mirroring composite()), then blend,
+        # so content outside the mask keeps the bottom layer's pixels and alpha.
         if top.mask is not None:
-            effective = self._apply_mask(effective, top.mask)
-        bottom.image = effective
+            top_image = self._apply_mask(top.image.convert("RGBA"), top.mask)
+        else:
+            top_image = top.image
+        bottom.image = self._apply_blend(bottom.image, top_image, top.blend_mode, top.opacity)
         self.layers.pop(idx)
         self.active_layer_index = idx - 1
         self._save_state()

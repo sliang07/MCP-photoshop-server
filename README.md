@@ -4,6 +4,19 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 
 > **Designed for use with [Cline](https://github.com/cline/cline)** — an AI-powered coding assistant. This server integrates as an MCP tool provider to enable image generation and editing directly from your Cline workflow.
 
+## Instruction editing upgrade
+
+See [EDITING_UPGRADE.md](EDITING_UPGRADE.md) for the verified local inventory, model downloads, known legacy limitations, and usage.
+
+- `preview_canvas` returns an image the assistant can inspect.
+- `get_editing_capabilities` reports live model/node availability.
+- `edit_image` adds instruction and reference-guided edits through native FLUX.2 or Qwen workflows, independent edit masks, protected outside pixels, previews, and undoable layers.
+- `upscale` now honors its size factor and preserves layer/mask alignment and transparency.
+
+`img2img` is a legacy FLUX.2 denoising transform, despite its old Kontext naming. Existing ControlNet/Redux style-transfer workflows require further repair; use `edit_image` for reference style guidance.
+
+Reconnect the MCP server after saving any in-memory work to load the new tools.
+
 ## Features
 
 ### Canvas Management
@@ -14,10 +27,15 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 
 ### AI Image Generation & Editing
 - `generate_image` — Text-to-image via Flux2 (photorealistic) or ANIMA (anime)
-- `img2img` — AI instructed editing via Flux Kontext
-- `character_transform` — Pose/expression/action transforms with identity preservation
+- `img2img` — Legacy FLUX.2 denoising transform; prefer `edit_image` for instructions
+- `character_transform` — Legacy pose/expression denoising transform; use `edit_image` references for identity guidance
 - `inpaint` — AI fill masked region (requires mask from select_rect/select_ellipse)
 - `outpaint` — AI extend canvas in a direction (left, right, top, bottom)
+
+### Instruction Editing
+- `edit_image` — Instruction and reference-guided editing: FLUX.2 (fast, ~4 steps) or Qwen Image Edit 2511 FP8 ("qwen2511", ~40 steps); up to 2 extra references, optional white-to-edit mask, new undoable layer
+- `get_editing_capabilities` — Live ComfyUI model/node availability for every editing backend (notes also carry the GPU batching rule)
+- `preview_canvas` — Render the current canvas so the assistant can inspect results
 
 ### AI-Guided Generation
 - `controlnet_generate` — Generate image guided by current canvas (depth/canny/pose)
@@ -51,6 +69,8 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 ### System
 - `get_comfyui_status` — Check ComfyUI connection
 - `clear_vram` — Free GPU memory
+
+> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. For multiple or long ComfyUI generations, queue the whole batch to run in the background, then ask the user for explicit approval to stop the `qwen38` container (stopping it ends the LLM session; the batch keeps running on the host). `searxng` is CPU-only and never needs stopping. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
 
 ## Installation
 
@@ -135,13 +155,17 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 ```
 mcp-photoshop-server/
-├── server.py           # MCP server + 36 tool registrations
+├── server.py           # MCP server + 40 tool registrations (FastMCP initialize instructions carry the GPU batching rule)
+◜─── editing.py          # Instruction editing backends (FLUX.2 / Qwen 2511) + live capabilities
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
 ├── canvas.py           # Layered document with blend modes + undo/redo
 ├── session.py          # Per-session document management
 ├── requirements.txt    # Python dependencies
 ├── MEMORY.md           # Project memory bank
+◜─── EDITING_UPGRADE.md  # Editing backend model guide + live verification evidence
+◜─── tests/              # Regression suite (17 tests)
+◜─── verification/       # Live GPU verification scripts + artifacts
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md
@@ -174,11 +198,13 @@ mcp-photoshop-server/
 ### AI Edit Workflow
 ```
 1. open_image(path="portrait.jpg")
-2. img2img(prompt="change background to a forest at sunset")
+2. edit_image(prompt="change background to a forest at sunset", backend="flux2")
 3. undo  # if not satisfied
-4. img2img(prompt="make the lighting warmer and softer")
-5. adjust(contrast=1.1)
-6. export(path="output/edited.jpg", format="JPG")
+4. edit_image(prompt="match the jacket color to the reference", backend="qwen2511", reference_paths=["ref.jpg"])
+5. preview_canvas()
+6. adjust(contrast=1.1)
+7. export(path="output/edited.jpg", format="JPG")
+# Several qwen2511 jobs: queue the whole batch first, then follow the GPU batching rule (System section above).
 ```
 
 ### Inpainting Workflow
@@ -211,6 +237,6 @@ mcp-photoshop-server/
 ```
 
 ## Future Work
-- [ ] SAM-based semantic selection (replace heuristic with real segmentation model)
+- [x] SAM-based semantic selection — delivered via the `semantic_select` tool (SAM 3 text/point/box prompts, live-verified 2026-09-17)
 - [ ] Batch processing / multi-session support
 - [ ] Additional ComfyUI custom nodes integration

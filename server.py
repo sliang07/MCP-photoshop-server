@@ -32,13 +32,26 @@ from config import (
 from comfy_client import ComfyUIClient
 from canvas import Canvas, BLEND_MODES
 from session import SessionManager
+from editing import register_editing_tools
 
 # ----------------------------------------------------------------------- #
 #  Globals
 # ----------------------------------------------------------------------- #
 
 logger = logging.getLogger(__name__)
-app = FastMCP("mcp-photoshop-server")
+
+# Delivered to every LLM client in the MCP initialize response (the `instructions`
+# field). Spec-conformant clients fold this text into the model context, so the
+# GPU batching rule applies no matter which LLM is driving this server.
+GPU_BATCH_RULE = """GPU batching rule: this host's single 32GB GPU is shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). ComfyUI generation running alongside `qwen38` slows exponentially.
+- Single short generation (e.g. flux2, ~4 steps): just run it.
+- Multiple generations or any long job (e.g. qwen2511, ~8 min): first plan the complete job list, then queue the whole batch so it runs unattended (back-to-back tool calls, or a detached host script posting every prompt to http://127.0.0.1:8188/prompt), exporting each result to disk as it completes.
+- Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval, and only once the batch is fully queued in the background.
+- Warning: `qwen38` serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to run `docker start qwen38 open-webui` afterwards.
+- `searxng` is CPU-only; never stop it for GPU speed.
+Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
+
+app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE)
 comfy = ComfyUIClient(COMFYUI_URL)
 sessions = SessionManager()
 
@@ -627,7 +640,7 @@ async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, h
 
 @app.tool("img2img")
 async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0, seed: Optional[int] = None):
-    """Transform the current canvas using AI instructed editing (Flux Kontext)."""
+    """Legacy Flux2 denoising transform. Prefer edit_image for instruction/reference editing. guidance is unused."""
     try:
         canvas = sessions.get_default_session()
         composite = canvas.composite()
@@ -649,7 +662,7 @@ async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0
 
 @app.tool("character_transform")
 async def character_transform(prompt: str, guidance: float = 4.0, seed: Optional[int] = None):
-    """Transform a character (pose, expression, action) using Flux Kontext."""
+    """Legacy denoising transform. Prefer edit_image with reference_paths for identity guidance."""
     return await img2img_tool(prompt=prompt, strength=0.7, guidance=guidance, seed=seed)
 
 
@@ -1159,30 +1172,40 @@ async def curves_tool(red: str = "", green: str = "", blue: str = ""):
 
 @app.tool("upscale")
 async def upscale_tool(factor: int = 2, model: str = "anime"):
-    """Upscale the active layer using an AI upscaling model via ComfyUI. model: 'anime' (RealESRGAN_x4plus_anime_6B) or 'face' (4xFaceUpDAT)."""
+    """Upscale by factor (1-4), preserving layer alignment. model: anime, face, or an installed model filename."""
     try:
-        model_map = {
-            "anime": MODEL_UPSCALE_ANIME,
-            "face": MODEL_UPSCALE_FACE,
-        }
-        # Allow direct model name pass-through
+        if factor not in (1, 2, 3, 4):
+            raise ValueError("factor must be 1, 2, 3, or 4")
+        model_map = {"anime": MODEL_UPSCALE_ANIME, "face": MODEL_UPSCALE_FACE}
         upscale_model = model_map.get(model, model)
         canvas = sessions.get_default_session()
+        original_state = canvas.undo_stack[-1]
         layer = canvas.layers[canvas.active_layer_index]
+        target_size = (canvas.width * factor, canvas.height * factor)
         img_name = f"upscale_{uuid.uuid4().hex[:8]}.png"
         buf = io.BytesIO()
         layer.image.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), img_name)
+        img_name = await comfy.upload_image(buf.getvalue(), img_name)
         workflow = build_upscale_workflow(image_filename=img_name, upscale_model=upscale_model)
         result = await run_workflow(workflow)
         if not result:
             return [TextContent(text="Upscale failed.")]
-        img = Image.open(io.BytesIO(result)).convert("RGBA")
-        layer.image = img
-        canvas.width = img.width
-        canvas.height = img.height
+        with Image.open(io.BytesIO(result)) as opened:
+            img = opened.convert("RGBA").resize(target_size, Image.Resampling.LANCZOS)
+        # ComfyUI's RGB upscaler cannot retain source transparency itself.
+        img.putalpha(layer.image.convert("RGBA").getchannel("A").resize(target_size, Image.Resampling.LANCZOS))
+        if sessions.get_default_session() is not canvas or canvas.undo_stack[-1] is not original_state:
+            raise RuntimeError("Canvas changed during upscaling; result was not applied")
+        resized = []
+        for existing in canvas.layers:
+            new_image = img if existing is layer else existing.image.resize(target_size, Image.Resampling.LANCZOS)
+            new_mask = existing.mask.resize(target_size, Image.Resampling.LANCZOS) if existing.mask is not None else None
+            resized.append((existing, new_image, new_mask))
+        for existing, new_image, new_mask in resized:
+            existing.image, existing.mask = new_image, new_mask
+        canvas.width, canvas.height = target_size
         canvas._save_state()
-        return [TextContent(text=f"Upscaled to {img.width}x{img.height} with model '{upscale_model}'.")]
+        return [TextContent(text=f"Upscaled to {img.width}x{img.height} ({factor}x) with model '{upscale_model}'.")]
     except Exception as e:
         return [TextContent(text=f"Upscale error: {str(e)}")]
 
@@ -1325,6 +1348,8 @@ async def style_transfer_tool(prompt: str, style_path: str, strength: float = 0.
 # ======================================================================= #
 #  Main
 # ======================================================================= #
+
+register_editing_tools(app, comfy, sessions, run_workflow)
 
 if __name__ == "__main__":
     app.run()

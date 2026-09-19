@@ -27,3 +27,6 @@ desktop.ini
 *.swp
 *.swo
 *~
+# Local GPU verification outputs
+verification/
+_live_edit_check.py

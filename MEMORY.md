@@ -1,7 +1,7 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-08-12
-> Status: 36 tools — all confirmed working (image-only, no video)
+> Last updated: 2026-09-18
+> Status: 40 tools — all confirmed working (image-only, no video); qwen2511 edit backend + semantic_select (SAM 3 text/point/box) deployed & live-verified; **2026-09-18**: alpha-aware blend modes + health-probe validation fixed and **live-verified after MCP server restart** (masked multiply confined to its mask; SAM 3 point select + undo/redo consistent); F4-fix regression (empty `{}` history) found during the re-check and fixed — 46 tests green
 > Location: `mcp-photoshop-server`
 
 ---
@@ -40,16 +40,17 @@
 |------|---------|----------------------|
 | `config.py` | Configuration constants, model names, ComfyUI lifecycle | `COMFYUI_URL`, `COMFYUI_START_CMD`, `COMFYUI_PYTHON`, `COMFYUI_MAIN`, `COMFYUI_ARGS`, `COMFYUI_AUTO_KILL`, `COMFYUI_IDLE_TIMEOUT`, `COMFYUI_START_TIMEOUT`, `WEBSOCKET_TIMEOUT`, `VRAM_PRESSURE_THRESHOLD_MB` |
 | `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
-| `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes, masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
+| `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes (all non-normal modes alpha-aware via `_blend_with_alpha` since 2026-09-18), masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
 | `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()` |
-| `server.py` | MCP server + all tool registrations + workflow builders | 36 `@app.tool()` registrations, 12 workflow builder functions, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `server.py` | MCP server + all tool registrations + workflow builders | 40 `@app.tool()` registrations, `GPU_BATCH_RULE` passed as FastMCP `instructions`, 12 workflow builder functions, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `editing.py` | Instruction editing backends + live capabilities | `edit_image` (flux2 / qwen / qwen2511 workflows, reference + white-to-edit mask routing), `get_editing_capabilities`, `preview_canvas`, backend profiles |
 | `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
 | `MEMORY.md` | This file — project memory bank |
 
 ---
 
-## 3. Tool Inventory (36 Tools)
+## 3. Tool Inventory (40 Tools)
 
 ### Canvas Management (4)
 | Tool | Signature | Description |
@@ -63,14 +64,17 @@
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=6, cfg=1.5, seed=None, negative_prompt="")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
-| `img2img` | `(prompt, strength=0.7, guidance=4.0, seed=None)` | AI instructed editing via Flux Kontext |
+| `img2img` | `(prompt, strength=0.7, guidance=4.0, seed=None)` | Legacy FLUX.2 denoising transform; prefer `edit_image` for instruction/reference editing |
 | `character_transform` | `(prompt, guidance=4.0, seed=None)` | Character pose/expression/action transforms |
 
-### AI Editing (2)
+### AI Editing + Instruction Editing (5)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `inpaint` | `(prompt, guidance=4.0, steps=30, seed=None)` | AI fill masked region (requires mask from select_rect/select_ellipse) |
 | `outpaint` | `(prompt, direction="right", amount=256, guidance=4.0, steps=30, seed=None)` | Extend canvas + AI fill (direction: left/right/top/bottom) |
+| `edit_image` | (prompt, backend="flux2", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024) | Instruction + reference-guided editing: FLUX.2 (fast) or Qwen Image Edit 2511 FP8 (up to 2 references, ~40 steps); white-to-edit mask; new undoable layer |
+| `get_editing_capabilities` | () | Live model/node availability for all editing backends; notes carry the GPU batching rule |
+| `preview_canvas` | (max_size=1024) | Render current canvas as an image for assistant inspection |
 
 ### AI-Guided Generation (2)
 | Tool | Signature | Description |
@@ -119,12 +123,13 @@
 | `delete_layer` | `(index=None)` | Delete layer by index or active |
 | `reorder_layer` | `(index=None, direction="up")` | Move layer up/down in stack |
 
-### Selections & Masks (4)
+### Selections & Masks (5)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `select_rect` | `(x, y, width, height)` | Rectangular mask |
 | `select_ellipse` | `(x, y, rx, ry)` | Elliptical mask centered at (x,y) |
 | `select_object` | `(description, threshold=128)` | Heuristic color/region selection |
+| `semantic_select` | (prompt=None, point=None, box=None, threshold=0.5, refine=2, timeout=None) | SAM 3 semantic object mask; text prompts run `sam3.1_multiplex_fp16.safetensors` (via `CheckpointLoaderSimple` + `CLIPTextEncode`), point/box run `sam3.pt` (via `ImageOnlyCheckpointLoader`) — both in `models/checkpoints/`; applies the union mask to the active layer |
 | `clear_mask` | `(index=None)` | Remove layer mask |
 
 **select_object supported descriptions:** `red, blue, green, sky, dark, shadow, light, white, black, yellow, purple, orange, cyan, pink, brown`
@@ -242,6 +247,13 @@
 | `qwen_image_vae.safetensors` | vae | ANIMA VAE |
 | `flux1-dev-kontext_fp8_scaled.safetensors` | diffusion_models | img2img, inpaint, outpaint (Flux Kontext) |
 
+### Instruction Editing ("edit_image" backends)
+| Model | Directory | Purpose |
+|-------|-----------|---------|
+| `Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors` | `diffusion_models/qwen-image-edit/` | `qwen2511` backend — Qwen Image Edit 2511 FP8, community 1038lab e4m3fn build (SHA-256 verified 2026-09-17, ~20.5 GB) |
+| `qwen_2.5_vl_7b_fp8_scaled.safetensors` | text_encoders | Qwen 2511 text encoder |
+| `qwen_image_vae.safetensors` | vae | Qwen 2511 VAE (same file as ANIMA) |
+
 ### Upscaling & ControlNet
 | Model | Directory | Purpose |
 |-------|-----------|---------|
@@ -251,6 +263,12 @@
 | `control_v11p_sd15_canny_fp16.safetensors` | controlnet | Canny-guided ControlNet |
 | `control_v11p_sd15_openpose_fp16.safetensors` | controlnet | Pose-guided ControlNet |
 | `flux1-redux-fp16.safetensors` | style_models | Style transfer (Redux) |
+
+### Detection / Segmentation
+| Model | Directory | Purpose |
+|-------|-----------|---------|
+| `sam3.pt` | detection | SAM 3 open-vocabulary segmentation — ComfyUI 0.33.0 native `SAM3_Detect` node; checkpoint deployed and smoke-tested 2026-09-17; integrated via the `semantic_select` MCP tool (live-verified same day) |
+| `sam3.1_multiplex_fp16.safetensors` | checkpoints | SAM 3.1 text-prompted segmentation — Comfy-Org open repack, deployed 2026-09-17 (SHA-256 verified); feeds `semantic_select(prompt=...)`; listed live without restart |
 
 ---
 
@@ -287,7 +305,7 @@ python server.py
 
 ## 9. Testing Status
 
-### Verified Working (36 tools)
+### Verified Working (40 tools)
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
 - Color Adjustments: `adjust`, `levels`, `curves` ✅
@@ -299,8 +317,10 @@ python server.py
 - System: `get_comfyui_status`, `clear_vram` ✅
 - AI Generation: `generate_image` (Flux2 + ANIMA), `img2img`, `character_transform` ✅
 - AI Editing: `inpaint`, `outpaint` ✅
+- Instruction Editing: `edit_image` (flux2 + qwen2511 live-verified 2026-09-17), `get_editing_capabilities`, `preview_canvas` ✅
 - AI-Guided: `controlnet_generate`, `style_transfer` ✅
-- Upscale: `upscale` (anime + face models) ✅
+- Upscale: `upscale` (anime + face + x4plus general-photo model, live MCP test 2026-09-17) ✅
+- Semantic Selection: `semantic_select` (SAM 3 text/point/box, live CPU MCP test 2026-09-17) ✅
 
 ### Idle Timeout Chaining (tested 2026-08-12)
 - `generate_image` → `img2img` chained successfully without ComfyUI restart
@@ -310,7 +330,7 @@ python server.py
 
 ## 10. Known Limitations & Future Work
 
-- `select_object` uses color/region heuristics (not SAM)
+- `select_object` uses color/region heuristics (not SAM); `semantic_select` covers SAM 3 text, point, and box prompts (SAM 3.1 checkpoint deployed 2026-09-17; open Comfy-Org repack, not gated)
 - Single ComfyUI instance (no concurrent workflows)
 - Undo stores full snapshots (memory-intensive)
 - No lasso/freehand selection
@@ -320,7 +340,77 @@ python server.py
 
 ---
 
-## 11. Changelog
+## 11. GPU Contention & Batching Rule
+
+> Added 2026-09-17. This is a standing rule for any LLM that calls this MCP server. It is delivered to every client in the MCP `initialize` response (server `instructions`, see `GPU_BATCH_RULE` in `server.py`) and is also repeated in the `get_editing_capabilities` notes.
+
+**The problem.** One 32 GB GPU (RTX 5090). The `qwen38` docker runs the LLM itself (Ollama-compatible API on `:11434`) and holds most of the VRAM while serving. ComfyUI is a host process (`:8188`, python from `COMFYUI_PYTHON` in `.env`), not a container. Generation sharing the GPU with a loaded LLM slows exponentially (qwen2511 alone peaked at ~32.1 GB).
+
+**Container inventory:**
+
+| Container | Port | Uses GPU? | Action before a generation batch |
+|-----------|------|-----------|----------------------------------|
+| `qwen38` | `:11434` | Yes — the LLM backend | **Ask the user for explicit approval, then `docker stop qwen38`** |
+| `open-webui` | `:3000` | No (frontend for qwen38) | Optional stop; only useful if qwen38 stops too |
+| `searxng` | `:8080` | No (CPU-only) | Never stop it for GPU speed |
+
+**Procedure (any LLM client):**
+1. Single short generation (e.g. `flux2`, ~4 steps): just run it.
+2. Multiple generations or any long job (e.g. `qwen2511`, ~8 min each):
+   a. Plan the complete job list with the user first.
+   b. Queue the whole batch so it runs unattended — back-to-back MCP tool calls in one turn, or (better) a detached host script that posts every prompt to `http://127.0.0.1:8188/prompt` and waits for history. The batch must not depend on the LLM staying alive.
+   c. `export` each result to disk as it completes.
+   d. **Ask the user for explicit approval** to run `docker stop qwen38` (plus `open-webui` if desired). Stop only after approval, and only once the batch is fully backgrounded.
+   e. The batch then runs on the full GPU; results accumulate in ComfyUI's output dir / exported files.
+3. Afterwards, tell the user to `docker start qwen38 open-webui` to restore the LLM.
+
+**Self-kill warning.** `qwen38` serves the LLM that is driving the MCP calls. Stopping it terminates the session — that is exactly what the rule anticipates, and it is only acceptable because step 2b guarantees the batch continues on the host. Never stop `qwen38` mid-conversation with work that still depends on the LLM.
+
+**Side note.** With `COMFYUI_AUTO_KILL=1` and `VRAM_PRESSURE_THRESHOLD_MB=8192`, a loaded `qwen38` can trip the server's VRAM-pressure heuristic (`free_or_kill_based_on_pressure`) and kill ComfyUI mid-batch. Another reason the batch should only be queued after the docker stop (or the threshold raised for the run).
+
+---
+
+## 12. Changelog
+
+### 2026-09-18 — Blend-Mode Alpha Fix (F2) + ComfyUI Health-Probe Validation (F4)
+- **`canvas.py` — alpha-aware blend modes:** all 10 non-normal modes (`multiply`, `screen`, `overlay`, `darken`, `lighten`, `color_dodge`, `color_burn`, `hard_light`, `soft_light`, `exclusion`) previously ran per-channel ops on raw RGBA data, ignoring the top layer's per-pixel alpha — a masked edit layer set to `multiply` altered ~99.99% of the canvas and zeroed composite alpha outside its region (found in the 2026-09-17/18 MCP test campaign, F2, high severity). Now all modes route through `_blend_with_alpha()`: the formula applies to RGB only, top alpha (folded with layer opacity) scales the result toward the bottom (`out = bottom + a·(op(bottom,top) − bottom)/255`), output alpha is standard source-over. Transparent top pixels pass the bottom through **bit-exactly**; fully-opaque top is exactly the legacy formula (regression-pinned). `color_burn` gained a `t=0 → 255` guard (previously a latent division by zero). `merge_down` now applies the top layer's mask **before** blending (mirroring `composite()`).
+- **`comfy_client.py` — health-probe validation:** `is_running()` previously treated any HTTP 200 as "running", so a foreign process occupying port 8188 (e.g. a stub server) bypassed the stale-port self-heal and later failed with an opaque JSON-decode error (F4/T9.x). It now requires `/history` to return a JSON object — a fresh ComfyUI returns `{}`, which is valid (the `queue` keys belong to `/queue`, not `/history`); non-JSON or non-object 200 responses are logged as "foreign process occupies the port" and treated as not-running so the existing kill/stale-port/relaunch flow runs. `start_comfyui`'s final TimeoutError now hints at `netstat -ano | findstr :8188`.
+- **Tests:** new `tests/test_blend_modes.py` (8 tests: all modes × transparent/partial/zero-alpha, opaque-top oracles vs ImageChops + pinned formulas, masked-edit multiply F2 scenario, `merge_down` == `composite`); 4 `is_running()` tests in `tests/test_editing.py` (non-JSON 200 rejected, JSON non-object rejected, valid history accepted, fresh empty `{}` history accepted — the last added after the re-check caught regression F5). Full suite: **46 tests, 0 failures** (Python 3.10, `python -m unittest discover -s tests`).
+- **Live status (2026-09-18, post-restart): LIVE-VERIFIED.** After the user restarted the `photoshop` MCP server: (1) **F2** — masked `multiply` layer confined its effect to the mask (0 changed px outside, alpha extrema (255,255)); unmasked control shows full-canvas multiply. (2) **F3** — `semantic_select(point)` on a synthetic red circle returned the exact bbox (70,797 px, 1 object); `undo` cleared `has_mask`, `redo` restored it — the 2026-09-18 anomaly confirmed as version skew, fully resolved. (3) The re-check caught a **regression in the F4 fix (F5)**: `is_running()` required a `queue` key in the `/history` JSON, but a fresh ComfyUI returns `{}` — healthy fresh instances were misread as foreign port occupants, causing a kill/relaunch loop ending in "ComfyUI did not become reachable within 180s". Fixed: accept any JSON object (new unit test; suite 45 → 46). Also raised the Cline MCP client `timeout` for `photoshop` 300 → 1800 s (SAM 3 CPU inference exceeds 300 s). Evidence: test-campaign `REPORT.md` §5.4–5.6 (`fix2_check_masked_multiply.png`, `fix2_check_nomask_multiply.png`, `comfy_poll.log`).
+
+### 2026-09-17 — RealESRGAN x4plus + SAM 3 Supporting Models
+- `RealESRGAN_x4plus.pth` (67,040,989 bytes; SHA-256 `4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1`) installed in `models/upscale_models` from the official Real-ESRGAN release (v0.1.0 asset per the project README; the v0.2.0 download link 404s). Live MCP stdio test `verification/_realesrgan_test.py` upscaled a 512px canvas to 1024px (15.1s cold / 7.7s warm, alpha intact); evidence `verification/realesrgan_test_status.json`, `verification/realesrgan_upscaled.png`.
+- `sam3.pt` (3,450,062,241 bytes; SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`) installed in `models/detection/`. Official `facebook/sam3` HF repo is access-gated (local token not approved), so the `cubert-gmbh/sam3` mirror was used — verified byte-identical by matching LFS pointer OID.
+- ComfyUI 0.33.0 `SAM3_Detect` smoke-tested via `/prompt` on a temporary CPU instance (GPU saturated by qwen38): point-prompt mask in 42.2s, white fraction 0.110 matching the synthetic circle; evidence `verification/sam3_smoke_status.json`, `verification/sam3_smoke_mask.png`. Found: `CheckpointLoaderSimple` fails on the original SAM 3 clip (wrapper expects SAM 3.1 shapes); `ImageOnlyCheckpointLoader` + point/box prompts work; text prompting needs the SAM 3.1 checkpoint. MCP semantic-mask integration remains pending (no server code changed, no MCP restart needed).
+- ComfyUI model folders rescan per request (`folder_paths` mtime cache) — new model files appear in loader dropdowns without a restart.
+
+### 2026-09-17 — semantic_select (SAM 3) MCP Tool
+- Added `semantic_select(point, box, threshold, refine, timeout)` in `editing.py` (`register_editing_tools`): uploads the canvas composite, runs `ImageOnlyCheckpointLoader` → `SAM3_Detect` → `MaskToImage` → `SaveImage`, and sets the union mask as the active layer's selection (undoable, same mechanism as `select_rect`). Returns coverage/bbox/object-count plus a mask preview; an empty detection leaves the layer untouched. Tool count 39 → 40.
+- Deployment fix: `ImageOnlyCheckpointLoader` lists `ckpt_name` only from `models/checkpoints` (the `detection` folder is used only by MediaPipe nodes), so `sam3.pt` is hardlinked into `models/checkpoints/` (same inode, zero extra disk); ComfyUI's per-request rescan listed it without a restart.
+- Live-verified through a fresh MCP stdio session against a temporary CPU-only ComfyUI on :8189 (`verification/_semantic_live_test.py` → `verification/semantic_live_status.json`): point prompt (256,256) and box prompt [160,160,192,192] both segmented the synthetic red circle exactly (bbox [160,161,353,353], coverage 0.1107, 1 object, ~42s each on CPU); `get_info` shows `has_mask: true`; temp instance torn down, :8189 released, :8188 untouched. Evidence PNGs: `verification/semantic_mask_point.png`, `verification/semantic_mask_box.png`.
+- `get_editing_capabilities` now reports a `sam3` availability block (node + checkpoint). 11 unit tests added in `tests/test_semantic_select.py`; suite now 28 tests, all passing.
+- Still pending: text-prompted SAM 3 needs the SAM 3.1 checkpoint (`sam3.1_multiplex_fp16.safetensors`), which is not installed locally; `select_object` remains the fast heuristic fallback.
+
+### 2026-09-17 — Editing-Upgrade Guide Synced (Desktop Copy)
+- `EDITING_UPGRADE.md` now lives at `the user's Desktop\EDITING_UPGRADE.md` (moved out of the project root; the README's architecture tree still references the project-root path until that reference is updated or the file is restored).
+- RealESRGAN x4plus and SAM 3 sections updated from todo to deployed + live-verified (sizes, SHA-256, evidence files in `verification/`); SAM 3 heading now reflects checkpoint deployed, smoke-tested, MCP integration pending.
+- Corrected the record: the SAM 3.1 checkpoint (`sam3.1_multiplex_fp16.safetensors`) is not present in `models/checkpoints/` — text-prompted SAM 3 needs that separate gated download; point/box prompting works with the deployed `sam3.pt`.
+
+### 2026-09-17 — Documentation Synced to 39 Tools
+- README.md: added `### Instruction Editing` feature subsection (`edit_image`, `get_editing_capabilities`, `preview_canvas`); AI Edit Workflow example now uses `edit_image` ("flux2" fast path, "qwen2511" reference path) with `preview_canvas` and a GPU batching rule comment; architecture tree lists 39 tools plus `editing.py`, `EDITING_UPGRADE.md`, `tests/`, `verification/`.
+- MEMORY.md: tool inventory updated to 39, file architecture adds `editing.py` and notes `GPU_BATCH_RULE` in `instructions`, Qwen 2511 model files added under Instruction Editing, testing status now 39 tools.
+
+### 2026-09-17 — GPU Contention & Batching Rule
+- Added standing rule: batch all ComfyUI generations in the background, then (with explicit user approval) stop the `qwen38` LLM docker so generation gets the full GPU. Stopping `qwen38` ends the LLM session, which is acceptable only after the batch is fully queued; remind the user to `docker start qwen38 open-webui` afterwards.
+- Delivered via three channels: FastMCP `instructions` (MCP `initialize` response, `GPU_BATCH_RULE` in `server.py`), `get_editing_capabilities` notes (`editing.py`), and this MEMORY.md section.
+- Context: qwen2511 FP8 `e4m3fn` (1038lab) deployed and live-verified (see EDITING_UPGRADE.md); running it alongside the `qwen38` LLM causes severe GPU contention.
+
+### 2026-09-17 — SAM 3.1 Text Prompting for semantic_select
+- Deployed `sam3.1_multiplex_fp16.safetensors` (1,745,546,848 bytes; SHA-256 `9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03`) to `models/checkpoints/` from the open `Comfy-Org/sam3.1` HF repo (not gated). Header parses (1,590 tensors incl. `language_backbone`); live :8188 ComfyUI listed it under `CheckpointLoaderSimple` + `ImageOnlyCheckpointLoader` via per-request rescan — no restart.
+- `semantic_select` now takes `prompt` alongside `point`/`box` (at least one required, combinations allowed): text runs `CheckpointLoaderSimple` → `CLIPTextEncode` → `SAM3_Detect(conditioning=...)` on the 3.1 checkpoint; point/box-only calls keep using `sam3.pt` via `ImageOnlyCheckpointLoader`. Missing 3.1 + `prompt` raises before upload/inference. `sam3_capabilities` reports `sam3_1` and `text_prompt_available`; capabilities note updated.
+- 6 unit tests added to `tests/test_semantic_select.py` (text graph wiring, prompt+point+box, missing-3.1 pre-upload error, blank prompt, 3.1 capability reporting); full suite now 34 tests, all passing.
+- Live-verified via fresh MCP stdio session against a temporary CPU-only ComfyUI on :8189 (`verification/_semantic31_live_test.py` → `verification/semantic31_live_status.json`): capabilities `text_prompt_available: true`; text "red circle" 64.9s, bbox [160, 161, 353, 353], coverage 0.1107; point regression (256,256) 42.9s, still on `sam3.pt` with identical segmentation; temp instance torn down (:8189 released), :8188 untouched.
+- Docs synced: Desktop `EDITING_UPGRADE.md` (check-off + SAM 3.1 verification section) and README future-work item ticked. `photoshop` MCP entry restarted and verified: the live `semantic_select` schema exposes `prompt`, and `get_editing_capabilities` against :8188 reports `sam3_1: sam3.1_multiplex_fp16.safetensors` and `text_prompt_available: true`.
 
 ### 2026-08-12 — Bug Fixes: Auto-Start, ControlNet, Auto-Kill
 - **Auto-start fix** (`comfy_client.py`): Added `await self.start_comfyui()` at the top of `upload_image()` so all tools that upload images before running workflows (img2img, inpaint, outpaint, upscale, controlnet_generate, style_transfer) now auto-start ComfyUI. Previously only `generate_image` triggered auto-start.

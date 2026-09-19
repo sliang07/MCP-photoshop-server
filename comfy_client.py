@@ -100,14 +100,34 @@ class ComfyUIClient:
 
     async def is_running(self) -> bool:
         """Check if ComfyUI is reachable by hitting /history. Retries before giving up,
-        since a busy ComfyUI can be briefly slow to respond."""
+        since a busy ComfyUI can be briefly slow to respond.
+
+        Also verifies the response is ComfyUI's JSON history object. A foreign
+        HTTP listener on port 8188 can answer 200 with a non-JSON body; without
+        this check it would be mistaken for a running ComfyUI and the documented
+        stale-port self-heal (free the port, relaunch) would never trigger."""
         for attempt in range(3):
             try:
                 resp = await self.session.get(f"{self.base_url}/history", timeout=8.0)
-                return resp.status_code == 200
             except Exception:
                 if attempt < 2:
                     await asyncio.sleep(1.0)
+                continue
+            if resp.status_code != 200:
+                return False
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning("Port 8188 answered /history with a non-JSON body; a foreign "
+                               "process occupies the port. start_comfyui will attempt to free it.")
+                return False
+            if not isinstance(data, dict):
+                logger.warning("Port 8188 answered /history with JSON that is not an object; "
+                               "a foreign process occupies the port. start_comfyui will attempt to free it.")
+                return False
+            # Note: a fresh ComfyUI returns {} (empty object) - that is valid.
+            # The /queue endpoint (not /history) is the one with queue_running/queue_pending.
+            return True
         return False
 
     def _start_process(self):
@@ -319,7 +339,8 @@ class ComfyUIClient:
 
         raise TimeoutError(
             f"ComfyUI did not become reachable within {COMFYUI_START_TIMEOUT}s (even after retry). "
-            "Check that the start command is correct and ComfyUI can start."
+            "Check that the start command is correct and ComfyUI can start. If another process "
+            "holds port 8188, find it with `netstat -ano | findstr :8188`, end it, and retry."
         )
 
     # ------------------------------------------------------------------ #
@@ -371,32 +392,26 @@ class ComfyUIClient:
         success = False
 
         try:
-            # Retry loop for WebSocket connection — ComfyUI's HTTP port may be ready
-            # before the WebSocket server is fully initialized, especially after a restart.
-            ws_max_retries = 30  # up to 60 seconds (30 × 2s)
-            ws_connected = False
-            for ws_attempt in range(ws_max_retries):
-                try:
-                    async with websockets.connect(ws_url, timeout=15) as ws:
-                        # Submit AFTER WebSocket is connected and listening
-                        prompt_id = await self.submit_workflow(workflow, client_id=client_id)
+            # Only connection establishment may fall back to polling. Once a prompt
+            # is submitted, never resubmit it after a lost WebSocket or timeout.
+            ws = None
+            try:
+                ws = await websockets.connect(ws_url, open_timeout=15)
+            except Exception as ws_error:
+                logger.warning("WebSocket unavailable; using polling: %s", ws_error)
+            try:
+                prompt_id = await self.submit_workflow(workflow, client_id=client_id)
+                if ws is None:
+                    result = await self._wait_via_polling(prompt_id, progress_callback, timeout=timeout)
+                else:
+                    try:
                         result = await self._listen_for_completion(ws, prompt_id, progress_callback, timeout=timeout)
-                        success = True
-                        ws_connected = True
-                        break
-                except RuntimeError:
-                    # ComfyUI-reported execution error — re-raise after cleanup
-                    raise
-                except Exception as ws_err:
-                    if ws_attempt < ws_max_retries - 1:
-                        logger.warning("WebSocket not ready (attempt %d/%d): %s, retrying...", ws_attempt+1, ws_max_retries, ws_err)
-                        await asyncio.sleep(2.0)
-                    else:
-                        # Fallback: submit without websocket and poll
-                        logger.warning("WebSocket connection failed after %d attempts, falling back to polling...", ws_max_retries)
-                        prompt_id = await self.submit_workflow(workflow)
+                    except websockets.exceptions.ConnectionClosed:
                         result = await self._wait_via_polling(prompt_id, progress_callback, timeout=timeout)
-                        success = True
+                success = True
+            finally:
+                if ws is not None:
+                    await ws.close()
 
             # Wait for queue to drain (VAE decode, etc.) before pre-fetching
             # This ensures post-processing nodes complete before we kill ComfyUI
@@ -459,6 +474,8 @@ class ComfyUIClient:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 msg_raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if isinstance(msg_raw, bytes):
+                    continue  # Binary preview frame, not a JSON execution event.
                 msg = json.loads(msg_raw)
                 msg_type = msg.get("type")
                 data = msg.get("data", {})
@@ -488,9 +505,8 @@ class ComfyUIClient:
                         return None
 
                 elif msg_type == "executed":
-                    # Legacy: per-node executed event
-                    await asyncio.sleep(0.1)
-                    return await self.get_history(prompt_id)
+                    # A node completed; downstream nodes may still be running.
+                    continue
 
                 elif msg_type == "execution_error":
                     raise RuntimeError(f"ComfyUI execution error: {data}")
@@ -501,7 +517,7 @@ class ComfyUIClient:
             except asyncio.TimeoutError:
                 continue
             except websockets.exceptions.ConnectionClosed:
-                break
+                raise
 
         raise TimeoutError(f"Workflow {prompt_id} did not complete within {effective_timeout}s")
 
@@ -548,7 +564,14 @@ class ComfyUIClient:
             response.raise_for_status()
             data = response.json()
             _debug_log(f"[get_history] prompt_id={prompt_id}, keys={list(data.keys())}")
-            return data.get(prompt_id)
+            entry = data.get(prompt_id)
+            if entry:
+                status = entry.get("status", {})
+                if status.get("status_str") == "error":
+                    raise RuntimeError(f"ComfyUI execution failed: {status.get('messages', [])}")
+                if status.get("completed") is False:
+                    return None
+            return entry
         except Exception as e:
             _debug_log(f"[get_history] EXCEPTION: {type(e).__name__}: {e}")
             raise
@@ -634,6 +657,8 @@ class ComfyUIClient:
         Retries on connection errors (e.g., after process restart or during free_memory).
         Auto-starts ComfyUI if not already running.
         """
+        # An upload starts a new operation; cancel the previous idle timer.
+        self._cancel_idle_kill()
         # Ensure ComfyUI is running before attempting upload
         await self.start_comfyui()
 
@@ -647,7 +672,10 @@ class ComfyUIClient:
                     files=files,
                 )
                 response.raise_for_status()
-                return filename
+                uploaded = response.json()
+                name = uploaded["name"]
+                subfolder = uploaded.get("subfolder", "").strip("/\\")
+                return f"{subfolder}/{name}" if subfolder else name
             except Exception as e:
                 if attempt < max_retries - 1:
                     wait = 2.0 ** attempt
@@ -659,6 +687,12 @@ class ComfyUIClient:
     # ------------------------------------------------------------------ #
     #  System info
     # ------------------------------------------------------------------ #
+
+    async def get_object_info(self) -> dict:
+        """Read live nodes/model choices without auto-starting ComfyUI."""
+        response = await self.session.get(f"{self.base_url}/object_info", timeout=15.0)
+        response.raise_for_status()
+        return response.json()
 
     async def get_system_stats(self) -> dict:
         """Get ComfyUI system statistics."""

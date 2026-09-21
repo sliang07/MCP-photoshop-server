@@ -129,15 +129,31 @@ Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_confi
 
 ### Using with Open WebUI
 
-The server can also serve Open WebUI over MCP **streamable-HTTP** — each client gets its own server process, so Cline's stdio connection is unaffected:
+The server can also serve Open WebUI over MCP **streamable-HTTP** — it registers as an **external tool server**, so it appears in chat as the **"Mcp Photoshop" tool** (enabled per-chat via the Tools panel, which requires the "Direct Tool Servers" user permission). Each client gets its own server process, so Cline's stdio connection is unaffected.
 
 1. Double-click `run_openwebui.bat` in this folder. It sets `MCP_TRANSPORT=streamable-http` and serves `127.0.0.1:8000` (endpoint `/mcp`); logs append to `mcp_http.log`.
-2. In Open WebUI (admin only — the personal Integrations page accepts OpenAPI servers only): Settings → **Admin** → Integrations → External Tool Servers → **Add New** → Type **MCP (Streamable HTTP)**, URL `http://host.docker.internal:8000/mcp`, Auth: None.
+2. Register the tool server in Open WebUI — admin only, the personal Integrations page accepts OpenAPI servers only. Two ways:
+   - **UI (current `open-webui:main` builds):** Settings → **Admin** → **Integrations** → **External Tool Servers** → **Manage Direct Connections** → **Add Connection** → click the **OpenAPI** toggle to switch it to **MCP** (badge shows "MCP Streamable HTTP") → URL `http://host.docker.internal:8000/mcp`, API key left blank (optional), Name `Mcp Photoshop` → Save.
+   - **Direct DB (required on v0.11.3 — its connection dialog was type-locked to OpenAPI and could not create an MCP connection):** stop the container, upsert this entry into the SQLite config (`/app/backend/data/webui.db`, table `config`, key `tool_server.connections`), then start it:
+     ```json
+     [{
+       "url": "http://host.docker.internal:8000/mcp",
+       "path": "",
+       "type": "mcp",
+       "auth_type": "none",
+       "config": { "enable": true },
+       "info": {
+         "id": "mcp-photoshop",
+         "name": "Mcp Photoshop",
+         "description": "Photoshop MCP server (Streamable HTTP): canvas, layers, text, effects, AI generation via ComfyUI"
+       }
+     }]
+     ```
 
 Known limitations (details in `MEMORY.md`):
 
 - Open WebUI discards the MCP `initialize` instructions, so the GPU batching rule never reaches the OWUI model. Compensate in the OWUI model's system prompt: use a distinct `session_id` per chat and include a summary of the GPU batching rule. Cline receives the instructions natively.
-- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Qwen edits (up to 1800 s server-side) fail unless the container is recreated with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800` (see `verification/recreate_open_webui.bat`).
+- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Qwen edits (up to 1800 s server-side) fail unless the container is run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`. The current container already has it; if you ever recreate the container (e.g. via the Desktop Docker manager script), include that env var in `docker run`.
 - OWUI chat uploads land in OWUI storage, not Windows paths — `open_image` cannot see them directly. Use `export` to a shared folder, then `open_image` with that path.
 
 ### Environment Variables

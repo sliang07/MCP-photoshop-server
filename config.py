@@ -64,6 +64,12 @@ MODEL_UPSCALE_ANIME = "RealESRGAN_x4plus_anime_6B.pth"
 
 # Server settings
 SERVER_NAME = "mcp-photoshop-server"
+# Master prompt files (flux2prompt.txt, anima_prompt.txt, the two Qwen 2.1 masters)
+# read by get_prompt_guidance. Defaults to the repository-local masters/ folder;
+# point MASTER_PROMPT_DIR elsewhere (e.g. in .env) for a personal collection.
+# Missing files raise a clear ValueError from get_prompt_guidance.
+MASTER_PROMPT_DIR = os.getenv("MASTER_PROMPT_DIR", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "masters"))
 
 # VRAM pressure management: kill ComfyUI entirely if free VRAM drops below this
 # threshold, otherwise just call free_memory(). Default 8192 MB (8 GB) for a

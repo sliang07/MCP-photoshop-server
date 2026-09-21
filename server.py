@@ -34,6 +34,7 @@ from canvas import Canvas, BLEND_MODES
 from session import SessionManager
 from editing import (register_editing_tools, model_profiles, build_generation_workflow,
                      build_edit_workflow, prepare_image, png_bytes)
+from prompt_rules import get_prompt_guidance, prepare_prompts, unwrap_prompt, with_prompt_rules
 
 # ----------------------------------------------------------------------- #
 #  Globals
@@ -43,9 +44,11 @@ logger = logging.getLogger(__name__)
 
 # Some clients ignore initialize instructions, so tool descriptions also state
 # the automatic-startup behavior.
-GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order (<image1> is the canvas). For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 remains an explicit fast option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
+GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 remains an explicit fast option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
 
 Model selection: generate_image and batch_generate accept model=flux2 (fast), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+
+Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3/video and audio masters do not define Photoshop image prompts. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
@@ -249,7 +252,22 @@ async def get_info(session_id: str = "default"):
         return [TextContent(text=f"Error: {str(e)}")]
 
 
+@app.tool("get_prompt_guidance")
+async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima"] = "flux2",
+                                   task: Literal["generation", "editing", "outpaint"] = "generation"):
+    """Read the applicable local master prompt and its Photoshop tool adaptation.
+
+    No ComfyUI startup or GPU use. Returns the current full master with path and hash.
+    Qwen generation selects the t2i master; editing/outpaint select the edit master.
+    Standalone code-block/JSON output instructions become raw MCP prompt arguments;
+    size metadata maps to supported tool arguments, not text sent to the image model.
+    Read when needed; the essential rules are already included in the image tools.
+    """
+    return [TextContent(text=json.dumps(get_prompt_guidance(model, task), ensure_ascii=False, indent=2))]
+
+
 @app.tool("generate_image")
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
 async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"] = "flux2", width: int = 1024, height: int = 1024,
                          steps: Optional[int] = None, cfg: Optional[float] = None, seed: Optional[int] = None, negative_prompt: str = "",
                          session_id: str = "default", timeout: Optional[int] = None):
@@ -268,6 +286,7 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
         profile = model_profiles(await comfy.get_object_info(), "generation")[model]
         if not profile["available"]:
             raise ValueError(f"{model} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
+        prompt, negative_prompt, adjustments = prepare_prompts(model, profile["model"], prompt, negative_prompt)
         workflow = build_generation_workflow(model, profile, prompt, negative_prompt,
                                              width, height, steps, cfg, seed)
         result = await run_workflow(workflow, timeout=timeout or (1800 if model == "qwen21" else None))
@@ -278,7 +297,11 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
         if canvas is None or canvas.width != img.width or canvas.height != img.height:
             canvas = sessions.create(session_id, img.width, img.height, (0, 0, 0, 0))
         idx = canvas.add_layer(name=f"Generated: {prompt[:30]}", image=img)
-        return [TextContent(text=f"Generated image ({img.width}x{img.height}) as layer {idx}. Model: {model}")]
+        content = [TextContent(text=f"Generated image ({img.width}x{img.height}) as layer {idx}. Model: {model}")]
+        if adjustments:
+            content.append(TextContent(text=json.dumps({"prompt_adjustments": adjustments,
+                           "effective_prompt": prompt, "negative_prompt": negative_prompt}, ensure_ascii=False)))
+        return content
     except Exception as e:
         return [TextContent(text=f"Generation error: {str(e)}")]
 
@@ -448,7 +471,9 @@ async def apply_filter(name: str, session_id: str = "default", **params):
 async def add_text(text: str, x: int = 50, y: int = 50, font_size: int = 48, color: str = "white",
                    font: Optional[str] = None, stroke_width: int = 0, stroke_color: str = "black",
                    session_id: str = "default"):
-    """Add text overlay to the active layer."""
+    """Add text overlay to the active layer. Preserve the user's lettering exactly,
+    including case, punctuation and language; do not paraphrase or add prompt tags.
+    """
     try:
         canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
@@ -661,6 +686,7 @@ async def clear_vram_tool():
 
 
 @app.tool("outpaint")
+@with_prompt_rules("outpaint", ("flux2", "qwen21"))
 async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256,
                         steps: Optional[int] = None, seed: Optional[int] = None,
                         session_id: str = "default", backend: Literal["flux2", "qwen21"] = "flux2", timeout: Optional[int] = None):
@@ -673,6 +699,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
     Qwen works at about 1 megapixel internally, then returns the requested canvas size.
     """
     try:
+        prompt = unwrap_prompt(prompt)
         if backend not in ("flux2", "qwen21"):
             raise ValueError("backend must be flux2 or qwen21; Anima supports generation only")
         if amount <= 0:
@@ -707,7 +734,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
         working = prepare_image(padded, max(padded.size), 32 if backend == "qwen21" else 16)
         filename = await comfy.upload_image(png_bytes(working), pad_name)
         if backend == "qwen21":
-            instruction = (f"Remove the white strip on the {direction} of <image1> and replace it with "
+            instruction = (f"Outpaint the image: replace the white strip on the {direction} with "
                            f"a seamless continuation of the scene: {prompt}. "
                            "Preserve the original image's placement, scale, content and style.")
         else:
@@ -964,6 +991,7 @@ DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_ou
 
 
 @app.tool("batch_generate")
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
 async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
                               export_format: str = "PNG", timeout: Optional[int] = None):
     """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass and export each result.
@@ -1004,12 +1032,17 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
             cfg = profile["default_cfg"] if job.get("cfg") is None else float(job["cfg"])
             seed = job.get("seed")
             seed = int(seed) if seed is not None else secrets.randbits(63)
+            prompt, negative_prompt, adjustments = prepare_prompts(
+                model, profile["model"], str(job["prompt"]), str(job.get("negative_prompt", "")))
             workflows.append(build_generation_workflow(model, profile,
-                prompt=str(job["prompt"]), negative_prompt=str(job.get("negative_prompt", "")),
+                prompt=prompt, negative_prompt=negative_prompt,
                 width=int(job.get("width", DEFAULT_WIDTH)), height=int(job.get("height", DEFAULT_HEIGHT)),
                 steps=steps, cfg=cfg, seed=seed))
             seeds.append(seed)
-            settings.append({"steps": steps, "cfg": cfg, "checkpoint": profile["model"]})
+            setting = {"steps": steps, "cfg": cfg, "checkpoint": profile["model"]}
+            if adjustments:
+                setting.update(prompt_adjustments=adjustments, effective_prompt=prompt, negative_prompt=negative_prompt)
+            settings.append(setting)
         if timeout is None:
             timeout = sum(1800 if job.get("model") == "qwen21" else WEBSOCKET_TIMEOUT for job in jobs)
         batch = await comfy.batch_run_workflows(workflows, timeout=timeout)

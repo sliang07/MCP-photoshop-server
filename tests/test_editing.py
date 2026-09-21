@@ -248,6 +248,13 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mask.getpixel((32, 32)), (255, 255, 255, 255))
         self.assertIn("<image3> is an edit mask", json.loads(result[0].text)["effective_prompt"])
 
+    async def test_qwen_mask_without_references_still_uses_multi_image_tags(self):
+        result = await self.registry.tools["edit_image"]("recolor the selected object", region=[16, 16, 32, 32])
+        instruction = json.loads(result[0].text)["effective_prompt"]
+        self.assertTrue(instruction.startswith("Edit <image1>."))
+        self.assertIn("<image2> is an edit mask for <image1>", instruction)
+        self.assertNotIn("\n", instruction)
+
     async def test_transparent_result_replaces_source_and_undo_restores_it(self):
         before = self.canvas.composite().tobytes()
         output = Image.new("RGBA", (64, 64), (0, 0, 255, 0))

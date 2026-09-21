@@ -113,6 +113,8 @@ class OutpaintTests(unittest.IsolatedAsyncioTestCase):
         nodes = {n["class_type"]: n["inputs"] for n in run.await_args.args[0].values()}
         self.assertEqual(nodes["TextEncodeQwenImage21"]["resolution"], 1024)
         self.assertNotIn("images.image_2", nodes["TextEncodeQwenImage21"])
+        self.assertTrue(nodes["TextEncodeQwenImage21"]["prompt"].startswith("Outpaint the image:"))
+        self.assertNotIn("<image1>", nodes["TextEncodeQwenImage21"]["prompt"])
         self.assertEqual(nodes["KSampler"]["steps"], 30)
         self.assertEqual(nodes["KSampler"]["cfg"], 3.0)
 

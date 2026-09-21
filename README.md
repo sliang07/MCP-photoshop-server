@@ -47,8 +47,30 @@ Qwen outpaint uses an opaque white margin and the guide's approximately 1-megapi
 
 References: [Qwen 2.1 guide](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1), [Flux Klein guide](https://docs.comfy.org/tutorials/flux/flux-2-klein#flux-2-klein-9b-workflows), [Anima guide](https://docs.comfy.org/tutorials/image/anima/anima), [Anima model settings](https://huggingface.co/circlestone-labs/Anima#generation-settings).
 
+### Master prompt integration
+
+The image tools apply the relevant rules from the master files in `MASTER_PROMPT_DIR` (default: the repository-local `masters/` folder; set the variable in `.env` to point elsewhere):
+
+| Tool/model | Source and application |
+|---|---|
+| Flux generation, edits and outpaint | `flux2prompt.txt`: connected prose, preserve explicit details/lighting, exact lettering, no unnecessary interview or tag suffix |
+| Anima generation and batch jobs | `anima_prompt.txt`: hybrid tags/prose, explicit character-to-attribute binding, separate compatible negatives, no score tags for Aesthetic |
+| Qwen generation and batch jobs | `qwen_image_2.1_system_prompt_t2i.txt`: detailed English observer prose (roughly 400–500 words), spatial layout, lighting, exact lettering in its original script |
+| Qwen edits and outpaint | `qwen_image_2.1_system_prompt_edit.txt`: clear requested changes with untargeted content preserved, separate prose/lettering language rules, correct reference roles |
+| `add_text` | Preserve exact supplied lettering; do not paraphrase or add image-prompt tags |
+
+`get_prompt_guidance(model="anima", task="generation")` reads the applicable full master on demand, with its source path and SHA-256. It works through both MCP transports without accessing ComfyUI or the GPU. Essential rules are also included directly in `generate_image`, `edit_image`, `outpaint` and `batch_generate` descriptions, because some clients ignore initialize instructions. Reading the full guide is optional, not an extra prerequisite for every image.
+
+For Qwen, use `get_prompt_guidance(model="qwen21", task="generation")` for the t2i master, or `task="editing"` / `"outpaint"` for the edit master. Pass the master's `rewritten_prompt` text as `prompt`, not its JSON wrapper. Map `wh_ratio` to generation `width`/`height`; `ratio_follow` identifies which image to open as the editing canvas. `edit_image` returns the canvas's dimensions, and `max_side` controls working detail, not aspect ratio. Use outpaint `direction`/`amount` or an explicit canvas operation for framing changes. The guides do not silently change the 1024 defaults, outpaint's internal resolution, or active sampling presets; `max_side=2048` remains available for detailed edits.
+
+Qwen generation descriptions are English; edit descriptions are Chinese for Chinese instructions and English otherwise. Exact rendered text keeps the requested spelling/language. For edits without a specified text language, use the input's dominant text language, then the user's instruction language if the input has no text. Single-image edits/outpaint use natural image references; edits with references or an appended mask use numbered `<imageN>` tags.
+
+The server removes a single surrounding prompt code fence. For Anima Aesthetic/unknown checkpoints, it removes standalone comma-separated `score_*` tags from both positive and negative prompts, while preserving quoted text verbatim; known Anima base checkpoints retain scores. Generation/batch results disclose any normalization. It does not truncate prompts to editorial word targets or automatically append negative tags that could conflict with the request.
+
+Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the masters reviewed September 21, including the two newly supplied Qwen guides; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. The H3 video, audio/music, historical review and backup files do not supply still-image syntax or override active MCP sampling presets. Original master files are unchanged.
+
 ### Instruction Editing
-- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3) or FLUX.2 (`flux2`, fast, 4 steps/CFG 1). Qwen 2511 and the original Qwen backend are retired. The canvas is `<image1>`; references follow in order. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. The Qwen timeout defaults to 1800 seconds.
+- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3) or FLUX.2 (`flux2`, fast, 4 steps/CFG 1). Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. The Qwen timeout defaults to 1800 seconds.
 - `get_editing_capabilities` — Live ComfyUI model/node availability per task (generation, editing, outpaint; notes also carry the GPU batching rule)
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
 
@@ -176,7 +198,7 @@ The server can also serve Open WebUI over MCP **streamable-HTTP** — it registe
 Known limitations (details in `MEMORY.md`):
 
 - Open WebUI discards the MCP `initialize` instructions, so the GPU batching rule never reaches the OWUI model. Compensate in the OWUI model's system prompt: use a distinct `session_id` per chat and include a summary of the GPU batching rule. Cline receives the instructions natively.
-- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Qwen edits (up to 1800 s server-side) fail unless the container is run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`. The current container already has it; if you ever recreate the container (e.g. via the Desktop Docker manager script), include that env var in `docker run`.
+- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Qwen edits (up to 1800 s server-side) fail unless the container is run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`. The current container already has it; if you ever recreate the container (e.g. via a local Docker manager script), include that env var in `docker run`.
 - OWUI chat uploads land in OWUI storage, not Windows paths — `open_image` cannot see them directly. Use `export` to a shared folder, then `open_image` with that path.
 
 ### Environment Variables
@@ -185,6 +207,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served on `127.0.0.1:8000` at `/mcp`) |
+| `MASTER_PROMPT_DIR` | `masters/` (repository-local, next to `server.py`) | Directory containing the current Flux, Anima and Qwen master files; read by `get_prompt_guidance` |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
@@ -202,16 +225,18 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 ```
 mcp-photoshop-server/
-├── server.py           # MCP server + 38 tool registrations (canvas tools accept session_id; FastMCP initialize instructions carry the GPU batching rule)
+├── server.py           # MCP server; 39 tools including editing registrations (canvas tools accept session_id)
 ├── editing.py          # Instruction editing backends (qwen21 / flux2) + semantic selection + live capabilities
+├── prompt_rules.py     # Tool-level master guidance, source reader and conservative prompt normalization
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
 ├── canvas.py           # Layered document with blend modes + undo/redo
 ├── session.py          # Per-session document management
 ├── requirements.txt    # Python dependencies
+├── masters/            # Master prompt files (Flux/Anima/Qwen) read by get_prompt_guidance
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (92 tests)
+├── tests/              # Regression suite (106 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md

@@ -12,6 +12,7 @@ from mcp.types import ImageContent, TextContent
 
 from config import (MODEL_ANIMA, MODEL_ANIMA_TEXT_ENCODER, MODEL_ANIMA_VAE,
                     MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE)
+from prompt_rules import unwrap_prompt, with_prompt_rules
 
 
 def model_options(info, loader, field):
@@ -347,6 +348,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             "outpaint": model_profiles(info, "outpaint"),
             "default_edit_backend": "qwen21",
             "default_generation_model": "flux2", "default_outpaint_backend": "flux2",
+            "prompt_guidance": {"tool": "get_prompt_guidance", "models": ["flux2", "qwen21", "anima"],
+                                "note": "Essential master rules are in tool descriptions; full applicable sources are available without GPU startup."},
             "models": {"diffusion_models": model_options(info, "UNETLoader", "unet_name"),
                        "text_encoders": model_options(info, "CLIPLoader", "clip_name"),
                        "vae": model_options(info, "VAELoader", "vae_name"),
@@ -364,6 +367,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
     @app.tool("edit_image")
+    @with_prompt_rules("editing", ("qwen21", "flux2"))
     async def edit_image(prompt: str, backend: Literal["qwen21", "flux2"] = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
@@ -378,7 +382,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Choose qwen21 for typography/alpha or flux2 for speed. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
         Image 1 is the canvas; images 2 onward are reference_paths, in order. For Qwen use
-        <image1>, <image2>, etc. Describe the change and the identity/features to preserve.
+        <image1>, <image2>, etc. with multiple inputs (including a mask); for a lone canvas
+        use 'the image' without tags. Describe the change and the identity/features to preserve.
         Qwen recommends at most 10 total images; this ComfyUI node accepts 16 including the mask.
         max_side limits working resolution (1024 default; use 2048 for fine detail), rounded to the model grid.
         Optional mask_path is grayscale, white=edit, black=preserve; or region=[x,y,width,height].
@@ -388,6 +393,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
         timeout defaults to 1800 seconds for Qwen. Identity preservation is model-dependent.
         """
+        prompt = unwrap_prompt(prompt)
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
         if backend not in ("flux2", "qwen21"):
@@ -415,13 +421,16 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         for path in references:
             with Image.open(Path(path)) as reference:
                 images.append(prepare_image(ImageOps.exif_transpose(reference), max_side, multiple))
-        image_name = (lambda i: f"<image{i}>") if backend == "qwen21" else (lambda i: f"image {i}")
-        instruction = f"Edit {image_name(1)}. {prompt.strip()}\nPreserve content and identity not affected by the requested change."
+        if backend == "qwen21":
+            image_name = (lambda i: f"<image{i}>") if references or mask is not None else (lambda i: "the image")
+        else:
+            image_name = lambda i: f"image {i}"
+        instruction = f"Edit {image_name(1)}. {prompt.strip()} Preserve content and identity not affected by the requested change."
         if references:
             instruction += " Use the reference images only for the features requested; keep the canvas as the base image."
         if mask is not None:
             images.append(mask.resize(images[0].size, Image.Resampling.NEAREST).convert("RGBA"))
-            instruction += (f"\n{image_name(len(images))} is an edit mask for {image_name(1)}: "
+            instruction += (f" {image_name(len(images))} is an edit mask for {image_name(1)}: "
                             "white marks the area to change, black marks the area to preserve. "
                             "Apply the requested change only in the white area. Do not render the mask in the result.")
         # Readiness checks happen before uploads and expensive inference.

@@ -1,8 +1,20 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-09-20
+> Last updated: 2026-09-21
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. FLUX.2 remains an explicit fast option. Earlier sampling values below are historical unless they match the active presets immediately below.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-09-21 Master prompt integration
+
+- Reviewed the active image masters and collection guide (the folder is now referenced by `MASTER_PROMPT_DIR`, defaulting to the repository-local `masters/`). `flux2prompt.txt` applies to Flux; `anima_prompt.txt` applies to Anima. The newly supplied `qwen_image_2.1_system_prompt_t2i.txt` applies to Qwen generation/batches; `qwen_image_2.1_system_prompt_edit.txt` applies to Qwen editing/outpaint. Production/numbered H3 and music/audio files are different tasks; do not inject their schemas into Photoshop image prompts. Original master files were not edited.
+- `prompt_rules.py` adds compact master rules to the actual `generate_image`, `batch_generate`, `edit_image` and `outpaint` descriptions, covering clients that discard initialize instructions. `get_prompt_guidance(model, task)` exposes the current full applicable Flux/Anima/Qwen master, fixed source path and SHA-256, without GPU startup. Tool count is 39. `MASTER_PROMPT_DIR` overrides the source folder. Full guide reads are fresh; compact rules must be reviewed when the masters change. Missing Qwen files report an error rather than falling back to unrelated masters.
+- Preserve explicit subjects, count, identity, outfits, setting, light, composition and exact visible text; bind attributes to each character. Flux uses connected prose (usually 30–80 words, never a hard limit). Anima uses hybrid tags/prose with checkpoint-aware score rules and compatible separate negatives. A sufficient brief/YOLO proceeds directly; ask one question only for material ambiguity or requested guidance. MCP arguments contain raw prompt text, not the standalone masters' code-block wrappers or H3 fields.
+- Mechanical enforcement strips a single surrounding prompt fence and removes standalone comma-separated score tags from BOTH prompts for Anima Aesthetic/unknown checkpoints. Quoted lettering and known base scores are preserved. Generation/batch results disclose normalized prompts. No length truncation, semantic rewriting, or automatic negative-tag injection. Artistic/semantic compliance still depends on the calling LLM; these rules are not a guaranteed visual validator.
+- `add_text` explicitly instructs exact lettering. Existing sampling presets stay Qwen 30/3, Flux 4/1, Anima 30/4. Tests verify quoted text, character prose, separate negatives, mixed batches, source refresh and tool descriptions. Save canvases before restarting/reconnecting the persistent MCP processes to load these changes.
+- Qwen generation uses detailed English observer prose (roughly 400–500 words), spatial inventory, explicit light/materials and exact lettering in its original script. Qwen editing uses decisive requested changes, preservation without weakening the effect, and separate prose/text language decisions. Single-image edits/outpaint no longer add `<image1>`; multi-input edits retain numbered canvas/reference/mask roles, including mask-only cases. The wrapper adds no paragraph breaks. Language and artistic rules remain LLM responsibilities.
+- Adapt Qwen `rewritten_prompt` to raw `prompt`; do not send master JSON to the image model. `wh_ratio` maps to generation dimensions; `ratio_follow` maps to the intended canvas. Edit output size remains the canvas size; `max_side` is working resolution. Outpaint uses `direction`/`amount`. No unsupported size fields, automatic JSON parsing, 2K default change or sampling changes. Both task-specific guides are available through `get_prompt_guidance(model="qwen21", task=...)`.
+- Verification: all 103 regression tests passed. A fresh real MCP stdio connection listed 39 tools, confirmed master rules in all four image-tool descriptions, and successfully read Flux, Anima and Qwen guidance without starting ComfyUI. Evidence: `verification/master_prompt_mcp_status.json`. The persistent HTTP server was not restarted.
+- After adding the Qwen files: all 106 tests passed, including task-based source selection, missing-file errors, single-image wording and mask-only numbering. Real MCP stdio calls returned exact full text and matching SHA-256 for Qwen generation/editing/outpaint and unchanged Flux/Anima sources; all four tool descriptions selected the correct Qwen master. Evidence: `verification/qwen_master_prompt_mcp_status.json`. No GPU inference or persistent-server restart was needed.
 
 ## 2026-09-20 Active sampling presets
 
@@ -104,15 +116,16 @@
 | `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `batch_run_workflows()`, `_listen_for_many()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
 | `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes (all non-normal modes alpha-aware via `_blend_with_alpha` since 2026-09-18), masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
 | `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()`, `list_sessions()` |
-| `server.py` | MCP server + all tool registrations + workflow builders | 34 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, txt2img/anima/outpaint/upscale workflow builders, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `server.py` | MCP server + all tool registrations + workflow builders | 35 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, txt2img/anima/outpaint/upscale workflow builders, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
 | `editing.py` | Instruction editing backends + live capabilities | 4 `@app.tool()` registrations: `edit_image` (qwen21 default / flux2 fast; reference + white-to-edit mask routing), `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `build_edit_workflow` / `build_semantic_select_workflow`, backend profiles |
+| `prompt_rules.py` | Master prompt integration | Tool description rules, current master-file reader, outer-fence and Anima score-tag normalization |
 | `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0`, `python-dotenv>=1.0.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
 | `MEMORY.md` | This file — project memory bank |
 
 ---
 
-## 3. Tool Inventory (38 Tools)
+## 3. Tool Inventory (39 Tools)
 
 ### Canvas Management (4)
 | Tool | Signature | Description |
@@ -126,6 +139,11 @@
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Flux2, Qwen 2.1, or Anima; model-specific sampling defaults |
+
+### Prompt Guidance (1)
+| Tool | Signature | Description |
+|------|-----------|-------------|
+| `get_prompt_guidance` | `(model="flux2", task="generation")` | Current applicable master and tool-specific rules; no ComfyUI or GPU required |
 
 ### AI Editing + Instruction Editing (4)
 | Tool | Signature | Description |
@@ -358,7 +376,8 @@ python server.py
 
 ## 9. Testing Status
 
-### Verified Working (38 tools)
+### Verified Working (39 tools)
+- Prompt Guidance: `get_prompt_guidance` (full Flux/Anima masters and task-specific Qwen generation/edit masters; real MCP stdio verified 2026-09-21) ✅
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
 - Color Adjustments: `adjust`, `levels`, `curves` ✅
@@ -426,10 +445,16 @@ python server.py
 
 ## 12. Changelog
 
+### 2026-09-21 — Master prompt integration; local machine paths removed from tracked files
+- New `prompt_rules.py` + `tests/test_prompt_rules.py`: compact master rules injected into `generate_image`, `batch_generate`, `edit_image` and `outpaint` tool descriptions (covers clients that discard initialize instructions); new `get_prompt_guidance(model, task)` tool — tool count 39 — returns the applicable Flux/Anima/Qwen master with source path and SHA-256 without starting ComfyUI; conservative normalization strips one surrounding prompt fence and, for Anima Aesthetic/unknown checkpoints, standalone `score_*` tags from both prompts (quoted lettering preserved); generation/batch results disclose `prompt_adjustments`/`effective_prompt`.
+- `config.py`: `MASTER_PROMPT_DIR` now defaults to the repository-local `masters/` folder (tracked via `.gitkeep`); the personal-machine default was removed, overridable via env / `.env`.
+- Public-repo hygiene (2026-09-18 precedent): local machine paths removed from the README (master-prompt section + `MASTER_PROMPT_DIR` env row) and from this file (2026-09-21 entry, historical changelog); the live local value now lives only in the gitignored `.env`.
+- Verification: 106 regression tests passed; fresh MCP stdio listed 39 tools with master rules in all four image-tool descriptions; full masters read with matching SHA-256 (evidence JSONs in gitignored `verification/`).
+
 ### 2026-09-20 — Docs Resync: MEMORY §2/§3 to 38 tools; README + Open WebUI docs corrected
 - `MEMORY.md` §2/§3 resynced to the current 38-tool server. The earlier 2026-09-20 "Tool Cleanup" entry claimed docs were synced, but §3 still listed 43 tools (the 5 removed tools were still present) and §2 said "43 @app.tool() … 12 workflow builder functions". Current: 34 `@app.tool()` in `server.py` + 4 in `editing.py`; builders are txt2img/anima/outpaint/upscale (`server.py`) + `build_edit_workflow`/`build_semantic_select_workflow` (`editing.py`).
 - README corrections: `export` is file-only (auto-named when `path` is omitted) — no base64 output; `semantic_select` added to the feature list; `get_comfyui_status` notes auto-start; SAM 3 (`sam3.pt`) + SAM 3.1 (`sam3.1_multiplex_fp16.safetensors`) checkpoints added to Prerequisites (both in `models/checkpoints`); architecture tree — garbled `◜───` glyphs fixed, dead `verification/` line removed (gitignored local artifacts, no longer on disk; `verification/…` references in older changelog entries are historical).
-- README "Using with Open WebUI" rewritten against the live system: the server registers as a chat **tool** ("Mcp Photoshop"; per-chat Tools panel; "Direct Tool Servers" permission), the real UI path (Admin → Integrations → External Tool Servers → Manage Direct Connections → Add Connection → OpenAPI→MCP toggle), the direct-DB upsert actually used on v0.11.3 (exact `tool_server.connections` JSON), and the timeout note (live container verified to run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`; the Desktop `start-qwen-openwebui-.ps1` recreation path lacks it).
+- README "Using with Open WebUI" rewritten against the live system: the server registers as a chat **tool** ("Mcp Photoshop"; per-chat Tools panel; "Direct Tool Servers" permission), the real UI path (Admin → Integrations → External Tool Servers → Manage Direct Connections → Add Connection → OpenAPI→MCP toggle), the direct-DB upsert actually used on v0.11.3 (exact `tool_server.connections` JSON), and the timeout note (live container verified to run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`; a local `start-qwen-openwebui-.ps1` recreation script lacks it).
 - `comfyui_nodes.json` (2 MB, tracked) is referenced by no code — left as-is.
 
 ### 2026-09-18 — Public Repo Hygiene: Local Machine Paths Removed from Docs & History

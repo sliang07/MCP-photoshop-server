@@ -22,7 +22,7 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 ### Canvas Management
 - `new_canvas` — Create a blank canvas with custom dimensions and background color
 - `open_image` — Load an existing image file
-- `export` — Save to PNG/JPG/WEBP or return base64 data
+- `export` — Save to file (PNG/JPG/WEBP); auto-named when `path` is omitted
 - `get_info` — View canvas dimensions, layers, undo/redo state
 
 ### AI Image Generation & Editing
@@ -60,13 +60,14 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 - `select_rect` — Rectangular mask
 - `select_ellipse` — Elliptical mask
 - `select_object` — Heuristic color/region selection (red, blue, sky, dark, etc.)
+- `semantic_select` — SAM 3 semantic object selection (text prompt via SAM 3.1, or point/box) — sets the active layer's mask
 - `clear_mask` — Remove layer mask
 
 ### History
 - `undo` / `redo` — Full operation history (up to 20 steps)
 
 ### System
-- `get_comfyui_status` — Check ComfyUI connection
+- `get_comfyui_status` — Check ComfyUI connection (starts it by default; `start_if_needed=False` for a passive check)
 - `clear_vram` — Free GPU memory
 
 > **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. For multiple or long ComfyUI generations, queue the whole batch to run in the background, then ask the user for explicit approval to stop the `qwen38` container (stopping it ends the LLM session; the batch keeps running on the host). `searxng` is CPU-only and never needs stopping. `batch_generate` implements the queue side server-side: it submits the whole job list up front on one WebSocket connection and exports each result as it completes; the `docker stop qwen38` approval step remains a conversation-level decision. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
@@ -95,9 +96,13 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
   - `qwen_image_2.1_vae_bf16.safetensors` (vae)
   - Requires native `TextEncodeQwenImage21`, `QwenImage21Cache`, and `JoinImageWithAlpha` nodes. The old Qwen VAE remains necessary for ANIMA; Qwen 2511 models and Lightning adapters are not used by the editor.
 
-   **Upscaling:**
-   - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
-   - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
+  **Upscaling:**
+  - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
+  - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
+
+  **Semantic Selection (`semantic_select`):**
+  - `sam3.pt` (checkpoints) — SAM 3 point/box prompts via `ImageOnlyCheckpointLoader`
+  - `sam3.1_multiplex_fp16.safetensors` (checkpoints) — SAM 3.1 text prompts via `CheckpointLoaderSimple` + `CLIPTextEncode`
 
 ### Install Dependencies
 ```bash
@@ -180,7 +185,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 ```
 mcp-photoshop-server/
 ├── server.py           # MCP server + 38 tool registrations (canvas tools accept session_id; FastMCP initialize instructions carry the GPU batching rule)
-◜─── editing.py          # Instruction editing backends (qwen21 / flux2) + live capabilities
+├── editing.py          # Instruction editing backends (qwen21 / flux2) + semantic selection + live capabilities
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
 ├── canvas.py           # Layered document with blend modes + undo/redo
@@ -188,8 +193,7 @@ mcp-photoshop-server/
 ├── requirements.txt    # Python dependencies
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-◜─── tests/              # Regression suite (81 tests)
-◜─── verification/       # Live GPU verification scripts + artifacts
+├── tests/              # Regression suite (81 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md

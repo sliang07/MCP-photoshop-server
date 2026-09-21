@@ -81,45 +81,36 @@
 | `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `batch_run_workflows()`, `_listen_for_many()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
 | `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes (all non-normal modes alpha-aware via `_blend_with_alpha` since 2026-09-18), masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
 | `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()`, `list_sessions()` |
-| `server.py` | MCP server + all tool registrations + workflow builders | 43 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, 12 workflow builder functions, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
-| `editing.py` | Instruction editing backends + live capabilities | `edit_image` (flux2 / qwen / qwen2511 workflows, reference + white-to-edit mask routing), `get_editing_capabilities`, `preview_canvas`, backend profiles |
-| `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0` |
+| `server.py` | MCP server + all tool registrations + workflow builders | 34 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, txt2img/anima/outpaint/upscale workflow builders, `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `editing.py` | Instruction editing backends + live capabilities | 4 `@app.tool()` registrations: `edit_image` (qwen21 default / flux2 fast; reference + white-to-edit mask routing), `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `build_edit_workflow` / `build_semantic_select_workflow`, backend profiles |
+| `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0`, `python-dotenv>=1.0.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
 | `MEMORY.md` | This file — project memory bank |
 
 ---
 
-## 3. Tool Inventory (43 Tools)
+## 3. Tool Inventory (38 Tools)
 
 ### Canvas Management (4)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `new_canvas` | `(width=1024, height=1024, bg_color="white")` | Create blank canvas |
 | `open_image` | `(path: str)` | Load existing image file as active document |
-| `export` | `(path=None, format="PNG", quality=95)` | Save to file or return base64 data |
+| `export` | `(path=None, format="PNG", quality=95)` | Save to file (PNG/JPG/WEBP); auto-named when `path` is omitted |
 | `get_info` | `()` | Canvas dimensions, layers, undo/redo state |
 
-### AI Image Generation (3)
+### AI Image Generation (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=6, cfg=1.5, seed=None, negative_prompt="")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
-| `img2img` | `(prompt, strength=0.7, guidance=4.0, seed=None)` | Legacy FLUX.2 denoising transform; prefer `edit_image` for instruction/reference editing |
-| `character_transform` | `(prompt, guidance=4.0, seed=None)` | Character pose/expression/action transforms |
+| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=6, cfg=1.5, seed=None, negative_prompt="", session_id="default")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
 
-### AI Editing + Instruction Editing (5)
+### AI Editing + Instruction Editing (4)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `inpaint` | `(prompt, guidance=4.0, steps=30, seed=None)` | AI fill masked region (requires mask from select_rect/select_ellipse) |
-| `outpaint` | `(prompt, direction="right", amount=256, guidance=4.0, steps=30, seed=None)` | Extend canvas + AI fill (direction: left/right/top/bottom) |
-| `edit_image` | (prompt, backend="flux2", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024) | Instruction + reference-guided editing: FLUX.2 (fast) or Qwen Image Edit 2511 FP8 (up to 2 references, ~40 steps); white-to-edit mask; new undoable layer |
-| `get_editing_capabilities` | () | Live model/node availability for all editing backends; notes carry the GPU batching rule |
-| `preview_canvas` | (max_size=1024) | Render current canvas as an image for assistant inspection |
-
-### AI-Guided Generation (2)
-| Tool | Signature | Description |
-|------|-----------|-------------|
-| `controlnet_generate` | `(prompt, controlnet="depth", strength=0.8, width=1024, height=1024, steps=20, cfg=1.5, seed=None, session_id="default")` | Depth/canny/pose guided generation; live model pre-check fails fast (no ControlNet models installed as of 2026-09-18) |
-| `style_transfer` | `(prompt, style_path, strength=0.8, width=1024, height=1024, steps=20, seed=None, style_model="flux1-redux-dev.safetensors", session_id="default")` | Style transfer via Redux StyleModel + CLIPVision; live model pre-check fails fast |
+| `outpaint` | `(prompt, direction="right", amount=256, steps=6, seed=None, session_id="default")` | Extend canvas + Flux2 masked fill (direction: left/right/top/bottom); extends every layer and mask; Flux2 steps capped at 6 |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None)` | Instruction + reference-guided editing: Qwen Image 2.1 (default, 25 steps, up to 16 total images, timeout defaults to 1800 s) or FLUX.2 (fast, 4 steps); white-to-edit mask; new undoable layer; `qwen`/`qwen2511` retired |
+| `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability for all editing backends; notes carry the GPU batching rule |
+| `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
 ### Transforms (4)
 | Tool | Signature | Description |
@@ -168,7 +159,7 @@
 | `select_rect` | `(x, y, width, height)` | Rectangular mask |
 | `select_ellipse` | `(x, y, rx, ry)` | Elliptical mask centered at (x,y) |
 | `select_object` | `(description, threshold=128)` | Heuristic color/region selection |
-| `semantic_select` | (prompt=None, point=None, box=None, threshold=0.5, refine=2, timeout=None) | SAM 3 semantic object mask; text prompts run `sam3.1_multiplex_fp16.safetensors` (via `CheckpointLoaderSimple` + `CLIPTextEncode`), point/box run `sam3.pt` (via `ImageOnlyCheckpointLoader`) — both in `models/checkpoints/`; applies the union mask to the active layer |
+| `semantic_select` | (prompt=None, point=None, box=None, threshold=0.5, refine=2, timeout=None, session_id="default") | SAM 3 semantic object mask; text prompts run `sam3.1_multiplex_fp16.safetensors` (via `CheckpointLoaderSimple` + `CLIPTextEncode`), point/box run `sam3.pt` (via `ImageOnlyCheckpointLoader`) — both in `models/checkpoints/`; applies the union mask to the active layer |
 | `clear_mask` | `(index=None)` | Remove layer mask |
 
 **select_object supported descriptions:** `red, blue, green, sky, dark, shadow, light, white, black, yellow, purple, orange, cyan, pink, brown`
@@ -182,7 +173,7 @@
 ### System (2)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `get_comfyui_status` | `()` | Check ComfyUI connection and system info |
+| `get_comfyui_status` | `(start_if_needed=True)` | Check ComfyUI connection and system info; starts ComfyUI by default |
 | `clear_vram` | `()` | Free GPU VRAM by unloading cached models |
 
 ### Sessions & Batch (3)
@@ -332,7 +323,7 @@ python server.py
         "COMFYUI_PYTHON": "<path-to-comfyui>/python_embeded/python.exe",
         "COMFYUI_MAIN": "<path-to-comfyui>/ComfyUI/main.py",
         "COMFYUI_AUTO_KILL": "1",
-        "COMFYUI_IDLE_TIMEOUT": "60",
+        "COMFYUI_IDLE_TIMEOUT": "5",
         "VRAM_PRESSURE_THRESHOLD_MB": "8192"
       }
     }
@@ -363,7 +354,7 @@ python server.py
 - Sessions & Batch: `list_sessions`, `close_session`, `batch_generate` + `session_id` on all canvas tools (unit-verified 2026-09-18, 23 new tests; live batch run in `verification/_live_sessions_batch_nodes_test.py`) ✅
 
 ### Idle Timeout Chaining (tested 2026-08-12)
-- `generate_image` → `img2img` chained successfully without ComfyUI restart
+- `generate_image` → `img2img` chained successfully without ComfyUI restart (`img2img` removed 2026-09-20; chaining works between any two ComfyUI tools)
 - Idle timer reset on second call, no restart needed
 
 ---
@@ -396,7 +387,7 @@ python server.py
 
 **Procedure (any LLM client):**
 1. Single short generation (e.g. `flux2`, ~4 steps): just run it.
-2. Multiple generations or any long job (e.g. `qwen2511`, ~8 min each):
+2. Multiple generations or any long job (e.g. `qwen21` edits, full batches):
    a. Plan the complete job list with the user first.
    b. Queue the whole batch so it runs unattended — back-to-back MCP tool calls in one turn, or (better) a detached host script that posts every prompt to `http://127.0.0.1:8188/prompt` and waits for history. The batch must not depend on the LLM staying alive.
    c. `export` each result to disk as it completes.
@@ -411,6 +402,12 @@ python server.py
 ---
 
 ## 12. Changelog
+
+### 2026-09-20 — Docs Resync: MEMORY §2/§3 to 38 tools; README + Open WebUI docs corrected
+- `MEMORY.md` §2/§3 resynced to the current 38-tool server. The earlier 2026-09-20 "Tool Cleanup" entry claimed docs were synced, but §3 still listed 43 tools (the 5 removed tools were still present) and §2 said "43 @app.tool() … 12 workflow builder functions". Current: 34 `@app.tool()` in `server.py` + 4 in `editing.py`; builders are txt2img/anima/outpaint/upscale (`server.py`) + `build_edit_workflow`/`build_semantic_select_workflow` (`editing.py`).
+- README corrections: `export` is file-only (auto-named when `path` is omitted) — no base64 output; `semantic_select` added to the feature list; `get_comfyui_status` notes auto-start; SAM 3 (`sam3.pt`) + SAM 3.1 (`sam3.1_multiplex_fp16.safetensors`) checkpoints added to Prerequisites (both in `models/checkpoints`); architecture tree — garbled `◜───` glyphs fixed, dead `verification/` line removed (gitignored local artifacts, no longer on disk; `verification/…` references in older changelog entries are historical).
+- README "Using with Open WebUI" rewritten against the live system: the server registers as a chat **tool** ("Mcp Photoshop"; per-chat Tools panel; "Direct Tool Servers" permission), the real UI path (Admin → Integrations → External Tool Servers → Manage Direct Connections → Add Connection → OpenAPI→MCP toggle), the direct-DB upsert actually used on v0.11.3 (exact `tool_server.connections` JSON), and the timeout note (live container verified to run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`; the Desktop `start-qwen-openwebui-.ps1` recreation path lacks it).
+- `comfyui_nodes.json` (2 MB, tracked) is referenced by no code — left as-is.
 
 ### 2026-09-18 — Public Repo Hygiene: Local Machine Paths Removed from Docs & History
 - `MEMORY.md` no longer carries absolute local paths (the "Location" header and the 2026-09-17 editing-upgrade changelog entries were rewritten path-free); the README's dead `EDITING_UPGRADE.md` references (intro line + architecture-tree line) were removed — that file was never committed and no longer exists.

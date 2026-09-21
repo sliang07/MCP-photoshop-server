@@ -2,7 +2,7 @@
 
 A local MCP (Model Context Protocol) server that combines **Photoshop-style image editing** with **AI image generation** powered by ComfyUI.
 
-> **Designed for use with [Cline](https://github.com/cline/cline)** — an AI-powered coding assistant. This server integrates as an MCP tool provider to enable image generation and editing directly from your Cline workflow.
+> **Designed for use with [Cline](https://github.com/cline/cline)** — an AI-powered coding assistant (stdio transport) — **and Open WebUI** (MCP streamable-HTTP transport). This server integrates as an MCP tool provider to enable image generation and editing directly from your Cline workflow or Open WebUI chat.
 
 ## Instruction editing upgrade
 
@@ -127,11 +127,25 @@ Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_confi
 }
 ```
 
+### Using with Open WebUI
+
+The server can also serve Open WebUI over MCP **streamable-HTTP** — each client gets its own server process, so Cline's stdio connection is unaffected:
+
+1. Double-click `run_openwebui.bat` in this folder. It sets `MCP_TRANSPORT=streamable-http` and serves `127.0.0.1:8000` (endpoint `/mcp`); logs append to `mcp_http.log`.
+2. In Open WebUI (admin only — the personal Integrations page accepts OpenAPI servers only): Settings → **Admin** → Integrations → External Tool Servers → **Add New** → Type **MCP (Streamable HTTP)**, URL `http://host.docker.internal:8000/mcp`, Auth: None.
+
+Known limitations (details in `MEMORY.md`):
+
+- Open WebUI discards the MCP `initialize` instructions, so the GPU batching rule never reaches the OWUI model. Compensate in the OWUI model's system prompt: use a distinct `session_id` per chat and include a summary of the GPU batching rule. Cline receives the instructions natively.
+- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Qwen edits (up to 1800 s server-side) fail unless the container is recreated with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800` (see `verification/recreate_open_webui.bat`).
+- OWUI chat uploads land in OWUI storage, not Windows paths — `open_image` cannot see them directly. Use `export` to a shared folder, then `open_image` with that path.
+
 ### Environment Variables
 See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served on `127.0.0.1:8000` at `/mcp`) |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
@@ -156,6 +170,7 @@ mcp-photoshop-server/
 ├── canvas.py           # Layered document with blend modes + undo/redo
 ├── session.py          # Per-session document management
 ├── requirements.txt    # Python dependencies
+├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
 ◜─── tests/              # Regression suite (81 tests)
 ◜─── verification/       # Live GPU verification scripts + artifacts

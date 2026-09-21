@@ -194,7 +194,7 @@ class Layer:
     def to_dict(self) -> dict:
         """Serialize layer for undo history (compact form)."""
         buffer = io.BytesIO()
-        self._get_effective_image().save(buffer, format="PNG")
+        self.image.save(buffer, format="PNG")
         return {
             "name": self.name,
             "image_data": buffer.getvalue(),
@@ -215,17 +215,6 @@ class Layer:
         if data.get("mask_data"):
             layer.mask = Image.open(io.BytesIO(data["mask_data"]))
         return layer
-
-    def _get_effective_image(self) -> Image.Image:
-        """Get image with opacity applied."""
-        img = self.image.copy()
-        if self.opacity < 1.0:
-            if img.mode != "RGBA":
-                img = img.convert("RGBA")
-            r, g, b, a = img.split()
-            a = a.point(lambda x: int(x * self.opacity))
-            img = Image.merge("RGBA", (r, g, b, a))
-        return img
 
     def _save_mask(self) -> bytes:
         buffer = io.BytesIO()
@@ -428,11 +417,8 @@ class Canvas:
         if not self.layers:
             return Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
 
-        result = self.layers[0].image.copy()
-        if result.mode != "RGBA":
-            result = result.convert("RGBA")
-
-        for layer in self.layers[1:]:
+        result = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        for layer in self.layers:
             if not layer.visible:
                 continue
             img = layer.image.copy()

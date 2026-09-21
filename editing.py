@@ -36,11 +36,9 @@ def edit_profiles(info):
     for name, model_names, clip_names, vae_name, refs, steps in (
         ("flux2", ("flux-2-klein-9b.safetensors", "flux-2-klein-9b-fp8.safetensors"),
          ("qwen_3_8b_fp8mixed.safetensors", "qwen_3_8b.safetensors"), "flux2-vae.safetensors", 2, 4),
-        ("qwen", ("qwen_image_edit_fp8_e4m3fn.safetensors",),
-         ("qwen_2.5_vl_7b_fp8_scaled.safetensors",), "qwen_image_vae.safetensors", 0, 20),
-        ("qwen2511", ("qwen_image_edit_2511_fp8mixed.safetensors", "qwen_image_edit_2511_bf16.safetensors",
-                      "Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors"),
-         ("qwen_2.5_vl_7b_fp8_scaled.safetensors",), "qwen_image_vae.safetensors", 2, 40),
+        ("qwen21", ("qwen_image_2.1_int8_convrot.safetensors", "qwen_image_2.1_bf16.safetensors"),
+          ("qwen3vl_8b_int8_convrot.safetensors", "qwen3vl_8b_w4a8.safetensors", "qwen3vl_8b_bf16.safetensors"),
+          "qwen_image_2.1_vae_bf16.safetensors", 15, 25),
     ):
         profile = {
             "model": resolve_model(unets, *model_names),
@@ -70,7 +68,12 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
     model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
     clip = node("CLIPLoader", clip_name=profile["clip"], type="flux2" if backend == "flux2" else "qwen_image")
     vae = node("VAELoader", vae_name=profile["vae"])
-    loaded = [node("LoadImage", image=filename) for filename in images]
+    loaded = []
+    for filename in images:
+        image = node("LoadImage", image=filename)
+        if backend == "qwen21":
+            image = node("JoinImageWithAlpha", image=image, alpha=[image[0], 1])
+        loaded.append(image)
     if backend == "flux2":
         positive = node("CLIPTextEncode", clip=clip, text=prompt)
         for image in loaded:
@@ -84,24 +87,13 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
                        sigmas=sigmas, latent_image=empty)
     else:
-        if backend == "qwen":
-            encoder = "TextEncodeQwenImageEdit"
-            image_inputs = {"image": loaded[0]}
-        else:
-            encoder = "TextEncodeQwenImageEditPlus"
-            image_inputs = {f"image{i + 1}": image for i, image in enumerate(loaded)}
-        positive = node(encoder, clip=clip, vae=vae, prompt=prompt, **image_inputs)
-        negative = node(encoder, clip=clip, vae=vae, prompt="", **image_inputs)
-        if backend == "qwen2511":
-            positive = node("FluxKontextMultiReferenceLatentMethod", conditioning=positive,
-                            reference_latents_method="index_timestep_zero")
-            negative = node("FluxKontextMultiReferenceLatentMethod", conditioning=negative,
-                            reference_latents_method="index_timestep_zero")
-        model = node("ModelSamplingAuraFlow", model=model, shift=3.0 if backend == "qwen" else 3.1)
-        model = node("CFGNorm", model=model, strength=1.0)
-        latent = node("VAEEncode", pixels=loaded[0], vae=vae)
+        model = node("QwenImage21Cache", model=model, device="auto", dtype="default")
+        encoder = node("TextEncodeQwenImage21", clip=clip, vae=vae, prompt=prompt,
+                       negative_prompt="", resolution=0,
+                       **{f"images.image_{i + 1}": image for i, image in enumerate(loaded)})
+        positive, negative, latent = encoder, [encoder[0], 1], [encoder[0], 2]
         sampled = node("KSampler", model=model, positive=positive, negative=negative,
-                       latent_image=latent, seed=seed, steps=steps, cfg=2.5 if backend == "qwen" else 4.0,
+                       latent_image=latent, seed=seed, steps=steps, cfg=1.0,
                        sampler_name="euler", scheduler="simple", denoise=1.0)
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix="mcp_instruction_edit")
@@ -154,10 +146,10 @@ def make_edit_mask(size, mask_path=None, region=None, feather=0):
     return mask
 
 
-def prepare_image(image, max_side):
-    image = image.convert("RGB")
+def prepare_image(image, max_side, multiple=32):
+    image = image.convert("RGBA")
     scale = min(1.0, max_side / max(image.size))
-    size = tuple(max(16, round(v * scale / 16) * 16) for v in image.size)
+    size = tuple(max(multiple, round(v * scale / multiple) * multiple) for v in image.size)
     return image.resize(size, Image.Resampling.LANCZOS)
 
 
@@ -176,26 +168,6 @@ def sam3_capabilities(info):
         "sam3_1": ckpt_1,
         "text_prompt_available": bool(ckpt_1) and node_present,
         "node_present": node_present,
-    }
-
-
-def controlnet_capabilities(info):
-    """Report ControlNet readiness from live node info without starting it or loading GPU models."""
-    models = model_options(info, "ControlNetLoader", "control_net_name")
-    return {
-        "available": bool(models),
-        "models": models,
-    }
-
-
-def style_transfer_capabilities(info):
-    """Report Redux style-transfer readiness (StyleModel + CLIPVision) from live node info."""
-    style_models = model_options(info, "StyleModelLoader", "style_model_name")
-    clip_vision = model_options(info, "CLIPVisionLoader", "clip_name")
-    return {
-        "available": bool(style_models) and bool(clip_vision),
-        "style_models": style_models,
-        "clip_vision_models": clip_vision,
     }
 
 
@@ -276,71 +248,101 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                 preview_content(canvas.composite(), max_size)]
 
     @app.tool("get_editing_capabilities")
-    async def get_editing_capabilities():
-        """Read live ComfyUI models and edit readiness without starting it or loading GPU models."""
+    async def get_editing_capabilities(start_if_needed: bool = True):
+        """Check installed models and edit readiness. Automatically starts ComfyUI when needed.
+
+        No manual startup is required. This check does not load generation models.
+        Set start_if_needed=False only for a passive check; offline does not mean editing is unavailable.
+        """
         try:
+            if start_if_needed:
+                await comfy.start_comfyui()
             info = await comfy.get_object_info()
             stats = await comfy.get_system_stats()
         except Exception as error:
-            return [TextContent(type="text", text=json.dumps({"connected": False, "error": str(error)}))]
+            message = ("Automatic startup or capability check failed; inspect the error and ComfyUI startup configuration."
+                       if start_if_needed else
+                       "ComfyUI is stopped or unreachable. Call this tool with start_if_needed=True, or call the requested editing tool; it automatically starts ComfyUI.")
+            return [TextContent(type="text", text=json.dumps({"connected": False,
+                    "auto_start_attempted": start_if_needed, "error": str(error), "message": message}))]
         report = {
             "connected": True, "comfyui_version": stats.get("system", {}).get("comfyui_version"),
             "devices": stats.get("devices", []), "editing": edit_profiles(info),
+            "default_edit_backend": "qwen21",
             "models": {"diffusion_models": model_options(info, "UNETLoader", "unet_name"),
                        "text_encoders": model_options(info, "CLIPLoader", "clip_name"),
                        "vae": model_options(info, "VAELoader", "vae_name"),
                        "upscalers": model_options(info, "UpscaleModelLoader", "model_name")},
             "sam3": sam3_capabilities(info),
-            "controlnet": controlnet_capabilities(info),
-            "style_transfer": style_transfer_capabilities(info),
             "notes": ["Availability checks files and nodes; it does not benchmark generation or guarantee VRAM fit.",
                       "semantic_select runs SAM 3 text/point/box prompts on the canvas (point/box use sam3.pt; text prompts use sam3.1_multiplex_fp16.safetensors, both in models/checkpoints). select_object stays the fast color-heuristic fallback.",
                       "edit_image supports independent white-to-edit masks and returns a new undoable layer.",
                       "Legacy select_object uses color heuristics, not semantic object segmentation.",
-                      "controlnet_generate and style_transfer pre-validate live model availability before uploading or generating (see their sections in this report). SD1.5 controlnets do not fit the Flux2 UNET; the Redux model is Flux.1-based, so for style/identity guidance edit_image references remain the primary path.",
+                      "outpaint runs on the Flux2 chain (SetLatentNoiseMask protects existing content). ControlNet and Redux style-transfer tools were removed 2026-09-20 with their deleted models; style/identity guidance uses edit_image reference_paths.",
                       "batch_generate queues a whole job list on one WebSocket connection and exports each result to disk as it completes (see the GPU batching rule).",
-                      "GPU batching rule: the host GPU is shared with the qwen38 LLM docker; for multiple or long generations (qwen2511 ~8 min), queue the whole batch to run unattended, then ask the user for explicit approval to `docker stop qwen38` (it ends the LLM session; the batch keeps running on the host). searxng is CPU-only - never stop it for GPU speed.",
+                      "The GPU may be shared with qwen38. Never stop that LLM container without explicit approval.",
                       "Full GPU batching procedure: MEMORY.md, section 'GPU Contention & Batching Rule'."],
         }
         return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
     @app.tool("edit_image")
-    async def edit_image(prompt: str, backend: str = "flux2", reference_paths: list[str] | None = None,
+    async def edit_image(prompt: str, backend: str = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
-                         max_side: int = 1024, session_id: str = "default"):
+                         max_side: int = 1024, session_id: str = "default", timeout: int | None = None):
         """Instruction-edit the canvas: remove objects, replace backgrounds, restyle, or use identity references.
 
-        backend: flux2 (fast, up to two extra references), qwen (original single-image editor),
-        qwen2511 (requires its model download, up to two extra references).
-        Image 1 is the canvas; images 2/3 are reference_paths, in order. Describe which features to preserve.
+        Automatically starts ComfyUI when needed; no manual startup is required.
+
+        backend: qwen21 (default, Qwen Image 2.1, 25 steps, RGBA) or flux2 (fast, 4 steps).
+        Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
+        Image 1 is the canvas; images 2 onward are reference_paths, in order. For Qwen use
+        <image1>, <image2>, etc. Describe the change and the identity/features to preserve.
+        Qwen recommends at most 10 total images; this ComfyUI node accepts 16 including the mask.
+        max_side limits working resolution (1024 default; use 2048 for fine detail), rounded to the model grid.
         Optional mask_path is grayscale, white=edit, black=preserve; or region=[x,y,width,height].
-        These are independent of layer visibility masks. Masked edits generate with full image context
-        and composite only inside the mask; they are not dedicated inpainting-model inference.
-        Returns a new layer, reproducible seed, and preview. Identity preservation is model-dependent.
+        The mask is sent to the model as the last image and also enforces exact preservation outside it.
+        Layer visibility masks/selections are not edit masks: pass mask_path or region explicitly.
+        Returns one undoable replacement layer and a preview; original layers remain hidden.
+        Inspect the returned preview before retrying; undo a failed attempt before another edit.
+        timeout defaults to 1800 seconds for Qwen. Identity preservation is model-dependent.
         """
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
-        if backend not in ("flux2", "qwen", "qwen2511"):
-            raise ValueError("backend must be flux2, qwen, or qwen2511")
-        if not 256 <= max_side <= 1536:
-            raise ValueError("max_side must be between 256 and 1536")
+        if backend not in ("flux2", "qwen21"):
+            raise ValueError("backend must be qwen21 or flux2; qwen and qwen2511 have been retired")
+        if max_side < 32:
+            raise ValueError("max_side must be at least 32")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
         if seed is None:
             seed = secrets.randbits(63)
         if not 0 <= seed < 2**64:
             raise ValueError("seed must be an unsigned 64-bit integer")
-        canvas = sessions.get_or_create(session_id)
+        canvas = sessions.get(session_id)
+        if canvas is None:
+            raise ValueError("Open an image or create a canvas in this session before calling edit_image")
         original_state = canvas.undo_stack[-1]
         source = canvas.composite()
         mask = make_edit_mask(source.size, mask_path, region, feather)
         references = reference_paths or []
-        limit = 0 if backend == "qwen" else 2
+        limit = (15 - int(mask is not None)) if backend == "qwen21" else 2
         if len(references) > limit:
             raise ValueError(f"{backend} supports at most {limit} additional references")
-        images = [prepare_image(source, max_side)]
+        multiple = 32 if backend == "qwen21" else 16
+        images = [prepare_image(source, max_side, multiple)]
         for path in references:
             with Image.open(Path(path)) as reference:
-                images.append(prepare_image(ImageOps.exif_transpose(reference), max_side))
+                images.append(prepare_image(ImageOps.exif_transpose(reference), max_side, multiple))
+        image_name = (lambda i: f"<image{i}>") if backend == "qwen21" else (lambda i: f"image {i}")
+        instruction = f"Edit {image_name(1)}. {prompt.strip()}\nPreserve content and identity not affected by the requested change."
+        if references:
+            instruction += " Use the reference images only for the features requested; keep the canvas as the base image."
+        if mask is not None:
+            images.append(mask.resize(images[0].size, Image.Resampling.NEAREST).convert("RGBA"))
+            instruction += (f"\n{image_name(len(images))} is an edit mask for {image_name(1)}: "
+                            "white marks the area to change, black marks the area to preserve. "
+                            "Apply the requested change only in the white area. Do not render the mask in the result.")
         # Readiness checks happen before uploads and expensive inference.
         await comfy.start_comfyui()
         info = await comfy.get_object_info()
@@ -348,15 +350,15 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         if not profile["available"]:
             raise ValueError(f"{backend} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
         steps = profile["default_steps"] if steps is None else steps
-        if not 1 <= steps <= (6 if backend == "flux2" else 60):
-            raise ValueError("steps must be 1-6 for distilled flux2, or 1-60 for qwen backends")
+        if not 1 <= steps <= (6 if backend == "flux2" else 10000):
+            raise ValueError("steps must be 1-6 for distilled flux2, or 1-10000 for qwen21")
         files = []
         for image in images:
             name = f"mcp_edit_{secrets.token_hex(12)}.png"
             files.append(await comfy.upload_image(png_bytes(image), name))
         width, height = images[0].size
-        workflow = build_edit_workflow(backend, profile, prompt, files, width, height, steps, seed)
-        result = await run_workflow(workflow)
+        workflow = build_edit_workflow(backend, profile, instruction, files, width, height, steps, seed)
+        result = await run_workflow(workflow, timeout=timeout or (1800 if backend == "qwen21" else None))
         if not result:
             raise RuntimeError("ComfyUI returned no image; the canvas was not modified")
         with Image.open(io.BytesIO(result)) as opened:
@@ -366,11 +368,14 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         if sessions.get_or_create(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
             raise RuntimeError("Canvas changed during generation; result was not applied. It remains in ComfyUI output.")
         if mask is not None:
-            edited.putalpha(ImageChops.multiply(edited.getchannel("A"), mask))
+            edited = Image.composite(edited, source, mask)
+        for layer in canvas.layers:
+            layer.visible = False
         index = canvas.add_layer(name=f"Edit ({backend}, seed {seed}): {prompt[:40]}", image=edited)
         report = {"layer": index, "backend": backend, "model": profile["model"], "seed": seed,
                   "steps": steps, "reference_count": len(references), "masked": mask is not None,
-                  "generation_size": [width, height], "canvas_size": list(source.size)}
+                  "generation_size": [width, height], "canvas_size": list(source.size),
+                  "effective_prompt": instruction}
         return [TextContent(type="text", text=json.dumps(report)), preview_content(canvas.composite())]
 
     @app.tool("semantic_select")
@@ -378,6 +383,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                               threshold: float = 0.5, refine: int = 2, timeout: int | None = None,
                               session_id: str = "default"):
         """Select a semantic object on the active layer using SAM 3 (text, point, and/or box prompts).
+
+        Automatically starts ComfyUI when needed; no manual startup is required.
 
         prompt: text description of the object (e.g. "red circle") - runs the SAM 3.1
         checkpoint's text encoder (needs sam3.1_multiplex_fp16.safetensors in

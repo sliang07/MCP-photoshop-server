@@ -54,7 +54,6 @@ DEFAULT_CFG = 1.5  # Flux2 Klein default
 MODEL_FLUX2 = "flux-2-klein-9b.safetensors"
 MODEL_FLUX2_TEXT_ENCODER = "qwen_3_8b_fp8mixed.safetensors"
 MODEL_FLUX2_VAE = "flux2-vae.safetensors"
-MODEL_KONTEXT = "flux1-dev-kontext_fp8_scaled.safetensors"
 
 # ANIMA model (anime-style generation)
 MODEL_ANIMA = "anima-aesthetic-v1.1.safetensors"

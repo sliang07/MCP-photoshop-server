@@ -17,6 +17,7 @@ from typing import Optional
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageChops
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent as _TextContent
 
 def TextContent(text="", **kwargs):
@@ -25,7 +26,7 @@ def TextContent(text="", **kwargs):
 
 from config import (
     COMFYUI_URL, DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_CFG,
-    MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE, MODEL_KONTEXT,
+    MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE,
     MODEL_ANIMA, MODEL_ANIMA_TEXT_ENCODER, MODEL_ANIMA_VAE,
     MODEL_UPSCALE_FACE, MODEL_UPSCALE_ANIME,
     COMFYUI_AUTO_KILL, VRAM_PRESSURE_THRESHOLD_MB,
@@ -33,10 +34,7 @@ from config import (
 from comfy_client import ComfyUIClient
 from canvas import Canvas, BLEND_MODES
 from session import SessionManager
-from editing import (
-    register_editing_tools, controlnet_capabilities, resolve_model,
-    style_transfer_capabilities,
-)
+from editing import register_editing_tools
 
 # ----------------------------------------------------------------------- #
 #  Globals
@@ -44,18 +42,32 @@ from editing import (
 
 logger = logging.getLogger(__name__)
 
-# Delivered to every LLM client in the MCP initialize response (the `instructions`
-# field). Spec-conformant clients fold this text into the model context, so the
-# GPU batching rule applies no matter which LLM is driving this server.
-GPU_BATCH_RULE = """GPU batching rule: this host's single 32GB GPU is shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). ComfyUI generation running alongside `qwen38` slows exponentially.
+# Some clients ignore initialize instructions, so tool descriptions also state
+# the automatic-startup behavior.
+GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order (<image1> is the canvas). For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 remains an explicit fast option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
+
+ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
+
+GPU batching rule: this host's single 32GB GPU may be shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
 - Single short generation (e.g. flux2, ~4 steps): just run it.
-- Multiple generations or any long job (e.g. qwen2511, ~8 min): first plan the complete job list, then queue the whole batch so it runs unattended (back-to-back tool calls, or a detached host script posting every prompt to http://127.0.0.1:8188/prompt), exporting each result to disk as it completes.
+- For batches that need GPU memory currently occupied by qwen38: first queue the complete batch in a detached host process and export each result as it completes. Sequential awaited edit_image calls are not a detached batch.
 - Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval, and only once the batch is fully queued in the background.
 - Warning: `qwen38` serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to run `docker start qwen38 open-webui` afterwards.
 - `searxng` is CPU-only; never stop it for GPU speed.
 Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
 
-app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE)
+# Transport security (DNS-rebinding protection): FastMCP auto-enables it when
+# bound to loopback, but only allows 127.0.0.1 / localhost / ::1. Open WebUI
+# (Docker) reaches this server via host.docker.internal, so allow that host
+# explicitly. Protection stays enabled for all other hosts. (Harmless in
+# stdio mode - the checks only apply to the HTTP endpoints.)
+_TRANSPORT_SECURITY = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "host.docker.internal:*"],
+    allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", "http://host.docker.internal:*"],
+)
+
+app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE, transport_security=_TRANSPORT_SECURITY)
 comfy = ComfyUIClient(COMFYUI_URL)
 sessions = SessionManager()
 
@@ -139,7 +151,7 @@ def build_txt2img_workflow(
     # Flux2 uses Flux2KleinSectionedEncoder for text encoding.
     # NOTE: Flux2KleinKSamplerExperimental has architecture mismatches - use SamplerCustomAdvanced instead.
     #
-    # Flux2KleinSectionedEncoder inputs (matching img2img workflow):
+    # Flux2KleinSectionedEncoder inputs (Flux2 text encoding):
     #   clip, front_text, mid_text, end_text, separator
     n1  = nid()  # UNETLoader (outputs MODEL:0)
     n2  = nid()  # CLIPLoader (outputs CLIP:0) - type: "flux2"
@@ -235,34 +247,35 @@ def build_anima_workflow(
     }
 
 
-def build_img2img_kontext_workflow(
-    prompt: str, image_filename: str, strength: float = 0.7,
-    seed: Optional[int] = None, guidance: float = 4.0,
+def build_outpaint_workflow(
+    prompt: str, image_filename: str, target_width: int, target_height: int,
+    seed: Optional[int] = None, steps: int = 6,
 ) -> dict:
-    """Build img2img workflow using Flux2 Klein CLIP pattern (CLIPLoader + Flux2KleinSectionedEncoder).
+    """Build an outpaint workflow on the installed Flux2 Klein chain.
 
-    Uses the same text encoder pipeline as build_txt2img_workflow since both use the
-    same Flux2 Klein UNET. The img2img path encodes the source image to latent,
-    then uses BasicGuider + RandomNoise + BasicScheduler + KSamplerSelect + SamplerCustomAdvanced
-    for the denoising step (instead of Flux2KleinKSamplerExperimental which only
-    supports full denoise).
+    The uploaded image is already padded with transparent edges by the tool;
+    SetLatentNoiseMask (fed from LoadImage's native MASK output, where white =
+    transparent) protects the original content exactly and only denoises the
+    new region. Uses the same UNET/CLIP/VAE pattern as build_txt2img_workflow
+    (Flux2KleinSectionedEncoder; Flux2 needs no FluxGuidance).
     """
     nid = _make_node_id
-    n1  = nid()  # LoadImage
-    n2  = nid()  # UNETLoader
-    n3  = nid()  # CLIPLoader (single, type: "flux2")
-    n4  = nid()  # VAELoader
-    n5  = nid()  # VAEEncode
+    n1  = nid()  # LoadImage (outputs IMAGE:0, MASK:1)
+    n2  = nid()  # ImageScale (pad to target size)
+    n3  = nid()  # UNETLoader (Flux2 Klein)
+    n4  = nid()  # CLIPLoader (type: "flux2")
+    n5  = nid()  # VAELoader
     n6  = nid()  # Flux2KleinSectionedEncoder
-    n7  = nid()  # BasicGuider
-    n8  = nid()  # RandomNoise
-    n9  = nid()  # BasicScheduler
-    n10 = nid()  # KSamplerSelect (provides sampler object to SamplerCustomAdvanced)
-    n11 = nid()  # SamplerCustomAdvanced
-    n12 = nid()  # VAEDecode
-    n13 = nid()  # SaveImage
+    n7  = nid()  # VAEEncode
+    n8  = nid()  # BasicGuider
+    n9  = nid()  # RandomNoise
+    n10 = nid()  # BasicScheduler
+    n11 = nid()  # KSamplerSelect
+    n12 = nid()  # SetLatentNoiseMask
+    n13 = nid()  # SamplerCustomAdvanced
+    n14 = nid()  # VAEDecode
+    n15 = nid()  # SaveImage
 
-    # Split prompt into sections for Flux2KleinSectionedEncoder
     parts = [p.strip() for p in prompt.split(",")]
     front_text = parts[0] if parts else prompt
     mid_text = ", ".join(parts[1:]) if len(parts) > 1 else ""
@@ -270,133 +283,27 @@ def build_img2img_kontext_workflow(
 
     return {
         n1:  {"class_type": "LoadImage", "inputs": {"image": image_filename}},
-        n2:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
-        n3:  {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
-        n4:  {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n5:  {"class_type": "VAEEncode", "inputs": {"pixels": [n1, 0], "vae": [n4, 0]}},
+        n2:  {"class_type": "ImageScale", "inputs": {"image": [n1, 0], "width": target_width, "height": target_height, "upscale_method": "lanczos", "crop": "disabled"}},
+        n3:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
+        n4:  {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
+        n5:  {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
         n6:  {"class_type": "Flux2KleinSectionedEncoder", "inputs": {
-            "clip": [n3, 0],
+            "clip": [n4, 0],
             "front_text": front_text,
             "mid_text": mid_text,
             "end_text": end_text,
             "separator": "comma",
         }},
-        n7:  {"class_type": "BasicGuider", "inputs": {"model": [n2, 0], "conditioning": [n6, 0]}},
-        n8:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n9:  {"class_type": "BasicScheduler", "inputs": {"model": [n2, 0], "scheduler": "simple", "steps": 30, "denoise": strength}},
-        n10: {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        n11: {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n8, 0], "guider": [n7, 0], "sampler": [n10, 0], "sigmas": [n9, 0], "latent_image": [n5, 0]}},
-        n12: {"class_type": "VAEDecode", "inputs": {"samples": [n11, 0], "vae": [n4, 0]}},
-        n13: {"class_type": "SaveImage", "inputs": {"images": [n12, 0], "filename_prefix": "mcp_img2img"}},
-    }
-
-
-def build_inpaint_workflow(
-    prompt: str, image_filename: str, mask_filename: str,
-    seed: Optional[int] = None, guidance: float = 4.0, steps: int = 30,
-) -> dict:
-    """Build inpaint workflow using Kontext (Flux.1) loader chain.
-
-    Uses DualCLIPLoader (clip_l + t5xxl) + ae.safetensors VAE to match
-    the flux1-dev-kontext UNET architecture — NOT the Flux2 Klein loaders.
-    """
-    nid = _make_node_id
-    n1  = nid()  # LoadImage (base)
-    n2  = nid()  # LoadImage (mask)
-    n3  = nid()  # ImageToMask (red channel = mask)
-    n4  = nid()  # UNETLoader (Kontext - Flux.1 architecture)
-    n5  = nid()  # DualCLIPLoader (clip_l + t5xxl, type="flux")
-    n6  = nid()  # VAELoader (ae.safetensors - Flux.1 VAE)
-    n7  = nid()  # VAEEncode
-    n8  = nid()  # CLIPTextEncode
-    n9  = nid()  # FluxGuidance
-    n10 = nid()  # BasicGuider
-    n11 = nid()  # RandomNoise
-    n12 = nid()  # BasicScheduler
-    n13 = nid()  # KSamplerSelect
-    n14 = nid()  # SetLatentNoiseMask
-    n15 = nid()  # SamplerCustomAdvanced
-    n16 = nid()  # VAEDecode
-    n17 = nid()  # SaveImage
-
-    return {
-        n1:  {"class_type": "LoadImage", "inputs": {"image": image_filename}},
-        n2:  {"class_type": "LoadImage", "inputs": {"image": mask_filename}},
-        n3:  {"class_type": "ImageToMask", "inputs": {"image": [n2, 0], "channel": "red"}},
-        n4:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_KONTEXT, "weight_dtype": "default"}},
-        n5:  {"class_type": "DualCLIPLoader", "inputs": {
-            "clip_name1": "clip_l.safetensors",
-            "clip_name2": "t5\\t5xxl_fp8_e4m3fn_scaled.safetensors",
-            "type": "flux",
-        }},
-        n6:  {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-        n7:  {"class_type": "VAEEncode", "inputs": {"pixels": [n1, 0], "vae": [n6, 0]}},
-        n8:  {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n5, 0]}},
-        n9:  {"class_type": "FluxGuidance", "inputs": {"conditioning": [n8, 0], "guidance": guidance}},
-        n10: {"class_type": "BasicGuider", "inputs": {"model": [n4, 0], "conditioning": [n9, 0]}},
-        n11: {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n12: {"class_type": "BasicScheduler", "inputs": {"model": [n4, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n13: {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        n14: {"class_type": "SetLatentNoiseMask", "inputs": {"samples": [n7, 0], "mask": [n3, 0]}},
-        n15: {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n11, 0], "guider": [n10, 0], "sampler": [n13, 0], "sigmas": [n12, 0], "latent_image": [n14, 0]}},
-        n16: {"class_type": "VAEDecode", "inputs": {"samples": [n15, 0], "vae": [n6, 0]}},
-        n17: {"class_type": "SaveImage", "inputs": {"images": [n16, 0], "filename_prefix": "mcp_inpaint"}},
-    }
-
-
-def build_outpaint_workflow(
-    prompt: str, image_filename: str, target_width: int, target_height: int,
-    seed: Optional[int] = None, guidance: float = 4.0, steps: int = 30,
-) -> dict:
-    """Build outpaint workflow using Kontext (Flux.1) loader chain.
-
-    Uses DualCLIPLoader (clip_l + t5xxl) + ae.safetensors VAE to match
-    the flux1-dev-kontext UNET architecture — NOT the Flux2 Klein loaders.
-
-    Alpha mask: uses LoadImage's native MASK output (index 1) instead of
-    ImageToMask with channel="alpha" because ComfyUI's IMAGE output is
-    always 3-channel RGB (no alpha channel).
-    """
-    nid = _make_node_id
-    n1  = nid()  # LoadImage (outputs IMAGE:0, MASK:1)
-    n2  = nid()  # ImageScale (pad to target size)
-    n3  = nid()  # UNETLoader (Kontext - Flux.1 architecture)
-    n4  = nid()  # DualCLIPLoader (clip_l + t5xxl, type="flux")
-    n5  = nid()  # VAELoader (ae.safetensors - Flux.1 VAE)
-    n6  = nid()  # VAEEncode
-    n7  = nid()  # CLIPTextEncode
-    n8  = nid()  # FluxGuidance
-    n9  = nid()  # BasicGuider
-    n10 = nid()  # RandomNoise
-    n11 = nid()  # BasicScheduler
-    n12 = nid()  # KSamplerSelect
-    n13 = nid()  # SetLatentNoiseMask
-    n14 = nid()  # SamplerCustomAdvanced
-    n15 = nid()  # VAEDecode
-    n16 = nid()  # SaveImage
-
-    return {
-        n1:  {"class_type": "LoadImage", "inputs": {"image": image_filename}},
-        n2:  {"class_type": "ImageScale", "inputs": {"image": [n1, 0], "width": target_width, "height": target_height, "upscale_method": "lanczos", "crop": "disabled"}},
-        n3:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_KONTEXT, "weight_dtype": "default"}},
-        n4:  {"class_type": "DualCLIPLoader", "inputs": {
-            "clip_name1": "clip_l.safetensors",
-            "clip_name2": "t5\\t5xxl_fp8_e4m3fn_scaled.safetensors",
-            "type": "flux",
-        }},
-        n5:  {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-        n6:  {"class_type": "VAEEncode", "inputs": {"pixels": [n2, 0], "vae": [n5, 0]}},
-        n7:  {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n4, 0]}},
-        n8:  {"class_type": "FluxGuidance", "inputs": {"conditioning": [n7, 0], "guidance": guidance}},
-        n9:  {"class_type": "BasicGuider", "inputs": {"model": [n3, 0], "conditioning": [n8, 0]}},
-        n10: {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n11: {"class_type": "BasicScheduler", "inputs": {"model": [n3, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n12: {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        # Use LoadImage's native MASK output (index 1) instead of ImageToMask channel="alpha"
-        n13: {"class_type": "SetLatentNoiseMask", "inputs": {"samples": [n6, 0], "mask": [n1, 1]}},
-        n14: {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n10, 0], "guider": [n9, 0], "sampler": [n12, 0], "sigmas": [n11, 0], "latent_image": [n13, 0]}},
-        n15: {"class_type": "VAEDecode", "inputs": {"samples": [n14, 0], "vae": [n5, 0]}},
-        n16: {"class_type": "SaveImage", "inputs": {"images": [n15, 0], "filename_prefix": "mcp_outpaint"}},
+        n7:  {"class_type": "VAEEncode", "inputs": {"pixels": [n2, 0], "vae": [n5, 0]}},
+        n8:  {"class_type": "BasicGuider", "inputs": {"model": [n3, 0], "conditioning": [n6, 0]}},
+        n9:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
+        n10: {"class_type": "BasicScheduler", "inputs": {"model": [n3, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
+        n11: {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        # LoadImage's native MASK output (index 1): white = transparent padding = region to generate
+        n12: {"class_type": "SetLatentNoiseMask", "inputs": {"samples": [n7, 0], "mask": [n1, 1]}},
+        n13: {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n9, 0], "guider": [n8, 0], "sampler": [n11, 0], "sigmas": [n10, 0], "latent_image": [n12, 0]}},
+        n14: {"class_type": "VAEDecode", "inputs": {"samples": [n13, 0], "vae": [n5, 0]}},
+        n15: {"class_type": "SaveImage", "inputs": {"images": [n14, 0], "filename_prefix": "mcp_outpaint"}},
     }
 
 
@@ -415,110 +322,6 @@ def build_upscale_workflow(
         n2: {"class_type": "UpscaleModelLoader", "inputs": {"model_name": upscale_model}},
         n3: {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": [n2, 0], "image": [n1, 0]}},
         n4: {"class_type": "SaveImage", "inputs": {"images": [n3, 0], "filename_prefix": "mcp_upscale"}},
-    }
-
-
-def build_controlnet_workflow(
-    prompt: str, image_filename: str, controlnet_name: str = "control_v11f1p_sd15_depth_fp16.safetensors",
-    control_strength: float = 0.8, width: int = 1024, height: int = 1024,
-    steps: int = 20, cfg: float = 1.5, seed: Optional[int] = None,
-) -> dict:
-    """Build a ControlNet-guided generation workflow using built-in ComfyUI nodes.
-    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple).
-    Latent follows the Flux2 convention: EmptyFlux2LatentImage with pixel dimensions.
-    ControlNetApply takes the Flux-era `conditioning` input (current ComfyUI schema)."""
-    nid = _make_node_id
-    n1   = nid()  # LoadImage (control image)
-    n2   = nid()  # ImageScale (resize control image to match target dimensions)
-    n_un = nid()  # UNETLoader
-    n_cl = nid()  # CLIPLoader
-    n_va = nid()  # VAELoader
-    n3   = nid()  # ControlNetLoader
-    n4   = nid()  # CLIPTextEncode
-    n5   = nid()  # FluxGuidance
-    n6   = nid()  # BasicGuider
-    n7   = nid()  # ControlNetApply (apply control to conditioning)
-    n8   = nid()  # EmptyFlux2LatentImage
-    n9   = nid()  # RandomNoise
-    n10  = nid()  # BasicScheduler
-    n11  = nid()  # KSamplerSelect
-    n12  = nid()  # SamplerCustomAdvanced
-    n13  = nid()  # VAEDecode
-    n14  = nid()  # SaveImage
-
-    return {
-        n1:   {"class_type": "LoadImage", "inputs": {"image": image_filename}},
-        n2:   {"class_type": "ImageScale", "inputs": {"image": [n1, 0], "width": width, "height": height, "upscale_method": "lanczos", "crop": "disabled"}},
-        n_un: {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
-        n_cl: {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
-        n_va: {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n3:   {"class_type": "ControlNetLoader", "inputs": {"control_net_name": controlnet_name}},
-        n4:   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_cl, 0]}},
-        n5:   {"class_type": "FluxGuidance", "inputs": {"conditioning": [n4, 0], "guidance": cfg}},
-        n6:   {"class_type": "BasicGuider", "inputs": {"model": [n_un, 0], "conditioning": [n5, 0]}},
-        n7:   {"class_type": "ControlNetApply", "inputs": {"conditioning": [n5, 0], "control_net": [n3, 0], "image": [n2, 0], "strength": control_strength}},
-        n8:   {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        n9:   {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n10:  {"class_type": "BasicScheduler", "inputs": {"model": [n_un, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n11:  {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        n12:  {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n9, 0], "guider": [n6, 0], "sampler": [n11, 0], "sigmas": [n10, 0], "latent_image": [n8, 0]}},
-        n13:  {"class_type": "VAEDecode", "inputs": {"samples": [n12, 0], "vae": [n_va, 0]}},
-        n14:  {"class_type": "SaveImage", "inputs": {"images": [n13, 0], "filename_prefix": "mcp_controlnet"}},
-    }
-
-
-def build_style_transfer_workflow(
-    prompt: str, content_filename: str, style_filename: str,
-    style_strength: float = 0.8, width: int = 1024, height: int = 1024,
-    steps: int = 20, seed: Optional[int] = None,
-    style_model_name: str = "flux1-redux-dev.safetensors",
-    clip_vision_name: str = "sigclip_vision_patch14_384.safetensors",
-) -> dict:
-    """Build a style transfer workflow using CLIPVision + StyleModel (Redux) with built-in nodes.
-    Flux2 uses separate UNETLoader + CLIPLoader + VAELoader (not CheckpointLoaderSimple).
-    CLIPVisionEncode requires a CLIPVisionLoader upstream and a `crop` input; StyleModelApply
-    requires `strength_type`. Latent follows the Flux2 convention (pixel dimensions)."""
-    nid = _make_node_id
-    n1   = nid()  # LoadImage (content)
-    n2   = nid()  # LoadImage (style reference)
-    n_cv = nid()  # CLIPVisionLoader
-    n_un = nid()  # UNETLoader
-    n_cl = nid()  # CLIPLoader
-    n_va = nid()  # VAELoader
-    n4   = nid()  # CLIPVisionEncode (style image)
-    n5   = nid()  # StyleModelLoader
-    n6   = nid()  # CLIPTextEncode
-    n7   = nid()  # FluxGuidance
-    n8   = nid()  # BasicGuider
-    n9   = nid()  # StyleModelApply
-    n10  = nid()  # EmptyFlux2LatentImage
-    n11  = nid()  # RandomNoise
-    n12  = nid()  # BasicScheduler
-    n13  = nid()  # KSamplerSelect
-    n14  = nid()  # SamplerCustomAdvanced
-    n15  = nid()  # VAEDecode
-    n16  = nid()  # SaveImage
-
-    return {
-        n1:   {"class_type": "LoadImage", "inputs": {"image": content_filename}},
-        n2:   {"class_type": "LoadImage", "inputs": {"image": style_filename}},
-        n_un: {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
-        n_cl: {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
-        n_va: {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n_cv: {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": clip_vision_name}},
-        n4:   {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": [n_cv, 0], "image": [n2, 0], "crop": "center"}},
-        n5:   {"class_type": "StyleModelLoader", "inputs": {"style_model_name": style_model_name}},
-        n6:   {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_cl, 0]}},
-        n7:   {"class_type": "FluxGuidance", "inputs": {"conditioning": [n6, 0], "guidance": 1.5}},
-        n8:   {"class_type": "BasicGuider", "inputs": {"model": [n_un, 0], "conditioning": [n7, 0]}},
-        n9:   {"class_type": "StyleModelApply", "inputs": {"conditioning": [n7, 0], "style_model": [n5, 0], "clip_vision_output": [n4, 0], "strength": style_strength, "strength_type": "multiply"}},
-        n10:  {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        n11:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n12:  {"class_type": "BasicScheduler", "inputs": {"model": [n_un, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n13:  {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        n14:  {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n11, 0], "guider": [n8, 0], "sampler": [n13, 0], "sigmas": [n12, 0], "latent_image": [n10, 0]}},
-        n15:  {"class_type": "VAEDecode", "inputs": {"samples": [n14, 0], "vae": [n_va, 0]}},
-        n16:  {"class_type": "SaveImage", "inputs": {"images": [n15, 0], "filename_prefix": "mcp_style_transfer"}},
     }
 
 
@@ -629,7 +432,10 @@ async def get_info(session_id: str = "default"):
 async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, height: int = 1024,
                          steps: int = 6, cfg: float = 1.5, seed: Optional[int] = None, negative_prompt: str = "",
                          session_id: str = "default"):
-    """Generate an image from text. model: 'flux2' (photorealistic) or 'anima' (anime). Flux2 Klein requires 4-6 steps max."""
+    """Generate an image from text. Automatically starts ComfyUI; no manual startup is required.
+
+    model: 'flux2' (photorealistic) or 'anima' (anime). Flux2 Klein requires 4-6 steps max.
+    """
     try:
         # FLUX2 Klein 9B requires 4-6 steps max — cap to prevent failures
         if model == "flux2" and steps > 6:
@@ -647,35 +453,6 @@ async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, h
         return [TextContent(text=f"Generated image ({img.width}x{img.height}) as layer {idx}. Model: {model}")]
     except Exception as e:
         return [TextContent(text=f"Generation error: {str(e)}")]
-
-
-@app.tool("img2img")
-async def img2img_tool(prompt: str, strength: float = 0.7, guidance: float = 4.0, seed: Optional[int] = None, session_id: str = "default"):
-    """Legacy Flux2 denoising transform. Prefer edit_image for instruction/reference editing. guidance is unused."""
-    try:
-        canvas = sessions.get_or_create(session_id)
-        composite = canvas.composite()
-        temp_name = f"img2img_{uuid.uuid4().hex[:8]}.png"
-        buffer = io.BytesIO()
-        composite.save(buffer, format="PNG")
-        await comfy.upload_image(buffer.getvalue(), temp_name)
-        workflow = build_img2img_kontext_workflow(prompt=prompt, image_filename=temp_name,
-                                                  strength=strength, seed=seed, guidance=guidance)
-        result = await run_workflow(workflow)
-        if not result:
-            return [TextContent(text="img2img failed.")]
-        img = Image.open(io.BytesIO(result)).convert("RGBA")
-        idx = canvas.add_layer(name=f"img2img: {prompt[:30]}", image=img)
-        return [TextContent(text=f"img2img complete. Layer {idx}.")]
-    except Exception as e:
-        return [TextContent(text=f"img2img error: {str(e)}")]
-
-
-@app.tool("character_transform")
-async def character_transform(prompt: str, guidance: float = 4.0, seed: Optional[int] = None, session_id: str = "default"):
-    """Legacy denoising transform. Prefer edit_image with reference_paths for identity guidance."""
-    return await img2img_tool(prompt=prompt, strength=0.7, guidance=guidance, seed=seed,
-                              session_id=session_id)
 
 
 @app.tool("crop")
@@ -1023,13 +800,23 @@ async def redo_tool(session_id: str = "default"):
 
 
 @app.tool("get_comfyui_status")
-async def get_comfyui_status_tool():
-    """Check ComfyUI connection and system info."""
+async def get_comfyui_status_tool(start_if_needed: bool = True):
+    """Check ComfyUI connection and system info. Automatically starts ComfyUI when needed.
+
+    No manual startup is required. Set start_if_needed=False for a passive check.
+    A stopped ComfyUI is normal between operations; dependent tools start it automatically.
+    """
     try:
+        if start_if_needed:
+            await comfy.start_comfyui()
         stats = await comfy.get_system_stats()
         return [TextContent(text=json.dumps(stats, indent=2))]
     except Exception as e:
-        return [TextContent(text=f"ComfyUI not reachable: {str(e)}")]
+        message = ("Automatic startup or status check failed; inspect the error and ComfyUI startup configuration."
+                   if start_if_needed else
+                   "ComfyUI is stopped or unreachable. Call this tool with start_if_needed=True, or call the requested editing/generation tool; it automatically starts ComfyUI.")
+        return [TextContent(text=json.dumps({"connected": False, "auto_start_attempted": start_if_needed,
+                                           "error": str(e), "message": message}))]
 
 
 @app.tool("clear_vram")
@@ -1042,46 +829,20 @@ async def clear_vram_tool():
         return [TextContent(text=f"Clear VRAM error: {str(e)}")]
 
 
-# ---- Inpaint / Outpaint ----
-
-@app.tool("inpaint")
-async def inpaint_tool(prompt: str, guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None, session_id: str = "default"):
-    """AI inpaint the masked region of the active layer. Requires a mask set via select_rect/select_ellipse first."""
-    try:
-        canvas = sessions.get_or_create(session_id)
-        layer = canvas.layers[canvas.active_layer_index]
-        if layer.mask is None:
-            return [TextContent(text="No mask set. Use select_rect or select_ellipse first.")]
-        # Upload base image
-        img_name = f"inpaint_img_{uuid.uuid4().hex[:8]}.png"
-        buf = io.BytesIO()
-        layer.image.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), img_name)
-        # Upload mask image
-        mask_name = f"inpaint_mask_{uuid.uuid4().hex[:8]}.png"
-        mask_buf = io.BytesIO()
-        layer.mask.save(mask_buf, format="PNG")
-        await comfy.upload_image(mask_buf.getvalue(), mask_name)
-        workflow = build_inpaint_workflow(prompt=prompt, image_filename=img_name, mask_filename=mask_name,
-                                          seed=seed, guidance=guidance, steps=steps)
-        result = await run_workflow(workflow)
-        if not result:
-            return [TextContent(text="Inpaint failed.")]
-        img = Image.open(io.BytesIO(result)).convert("RGBA")
-        layer.image = img
-        layer.mask = None
-        canvas._save_state()
-        return [TextContent(text=f"Inpaint complete ({img.width}x{img.height}).")]
-    except Exception as e:
-        return [TextContent(text=f"Inpaint error: {str(e)}")]
+# ---- Outpaint ----
 
 
 @app.tool("outpaint")
 async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256,
-                        guidance: float = 4.0, steps: int = 30, seed: Optional[int] = None,
+                        steps: int = 6, seed: Optional[int] = None,
                         session_id: str = "default"):
-    """AI outpaint: extend the canvas in a direction and fill the new area. direction: left, right, top, bottom."""
+    """AI outpaint: extend the canvas in a direction and fill the new area. Automatically starts ComfyUI; no manual startup is required.
+
+    direction: left, right, top, bottom. Runs on the Flux2 chain; steps are capped at 6 (distilled model).
+    """
     try:
+        if steps > 6:
+            steps = 6
         canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         w, h = layer.image.size
@@ -1111,11 +872,34 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
         await comfy.upload_image(buf.getvalue(), pad_name)
         workflow = build_outpaint_workflow(prompt=prompt, image_filename=pad_name,
                                            target_width=target_w, target_height=target_h,
-                                           seed=seed, guidance=guidance, steps=steps)
+                                           seed=seed, steps=steps)
         result = await run_workflow(workflow)
         if not result:
             return [TextContent(text="Outpaint failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
+        # Extend every other layer (and its mask) to the new canvas size so the
+        # composite stays consistent; their new area is transparent.
+        if direction == "left":
+            offset = (amount, 0)
+        elif direction == "top":
+            offset = (0, amount)
+        else:
+            offset = (0, 0)
+        for existing in canvas.layers:
+            if existing is layer:
+                continue
+            if existing.image.size != (target_w, target_h):
+                extended = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+                extended.paste(existing.image, offset)
+                existing.image = extended
+            if existing.mask is not None and existing.mask.size != (target_w, target_h):
+                extended_mask = Image.new("L", (target_w, target_h), 0)
+                extended_mask.paste(existing.mask, offset)
+                existing.mask = extended_mask
+        if layer.mask is not None and layer.mask.size != (target_w, target_h):
+            extended_mask = Image.new("L", (target_w, target_h), 0)
+            extended_mask.paste(layer.mask, offset)
+            layer.mask = extended_mask
         layer.image = img
         canvas.width = target_w
         canvas.height = target_h
@@ -1188,7 +972,10 @@ async def curves_tool(red: str = "", green: str = "", blue: str = "", session_id
 
 @app.tool("upscale")
 async def upscale_tool(factor: int = 2, model: str = "anime", session_id: str = "default"):
-    """Upscale by factor (1-4), preserving layer alignment. model: anime, face, or an installed model filename."""
+    """Upscale by factor (1-4), preserving layer alignment. Automatically starts ComfyUI; no manual startup is required.
+
+    model: anime, face, or an installed model filename.
+    """
     try:
         if factor not in (1, 2, 3, 4):
             raise ValueError("factor must be 1, 2, 3, or 4")
@@ -1294,108 +1081,6 @@ async def select_object_tool(description: str, threshold: int = 128, session_id:
         return [TextContent(text=f"Select object error: {str(e)}")]
 
 
-# ---- ControlNet ----
-
-@app.tool("controlnet_generate")
-async def controlnet_generate(prompt: str, controlnet: str = "depth", strength: float = 0.8,
-                               width: int = 1024, height: int = 1024, steps: int = 20,
-                               cfg: float = 1.5, seed: Optional[int] = None,
-                               session_id: str = "default"):
-    """Generate an image guided by the current canvas via ControlNet. controlnet: 'depth', 'canny', or 'pose' (or an installed model name)."""
-    try:
-        canvas = sessions.get_or_create(session_id)
-        controlnet_map = {
-            "depth": "control_v11f1p_sd15_depth_fp16.safetensors",
-            "canny": "control_v11p_sd15_canny_fp16.safetensors",
-            "pose": "control_v11p_sd15_openpose_fp16.safetensors",
-        }
-        model_name = controlnet_map.get(controlnet, controlnet)
-        # Readiness check before upload: report exactly what is missing.
-        await comfy.start_comfyui()
-        info = await comfy.get_object_info()
-        caps = controlnet_capabilities(info)
-        if not caps["models"]:
-            return [TextContent(text="ControlNet unavailable: no models in models/controlnet. Install a "
-                                      "ControlNet that matches the Flux2 UNET (SD1.5 controlnets do not work with "
-                                      "Flux2). Call get_editing_capabilities to see what is installed; for guided "
-                                      "edits, edit_image with reference_paths is the supported path.")]
-        resolved = resolve_model(caps["models"], model_name)
-        if resolved is None:
-            return [TextContent(text=f"ControlNet model '{model_name}' is not installed. "
-                                     f"Available: {', '.join(caps['models'])}")]
-        composite = canvas.composite()
-        ctrl_name = f"ctrlnet_{uuid.uuid4().hex[:8]}.png"
-        buf = io.BytesIO()
-        composite.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), ctrl_name)
-        workflow = build_controlnet_workflow(prompt=prompt, image_filename=ctrl_name,
-                                             controlnet_name=resolved, control_strength=strength,
-                                             width=width, height=height, steps=steps, cfg=cfg, seed=seed)
-        result = await run_workflow(workflow)
-        if not result:
-            return [TextContent(text="ControlNet generation failed.")]
-        img = Image.open(io.BytesIO(result)).convert("RGBA")
-        idx = canvas.add_layer(name=f"ControlNet: {prompt[:30]}", image=img)
-        return [TextContent(text=f"ControlNet generation complete. Layer {idx}.")]
-    except Exception as e:
-        return [TextContent(text=f"ControlNet error: {str(e)}")]
-
-
-# ---- Style Transfer ----
-
-@app.tool("style_transfer")
-async def style_transfer_tool(prompt: str, style_path: str, strength: float = 0.8,
-                               width: int = 1024, height: int = 1024, steps: int = 20,
-                               seed: Optional[int] = None,
-                               style_model: str = "flux1-redux-dev.safetensors",
-                               session_id: str = "default"):
-    """Generate an image with the style of a reference image. Uses Redux StyleModel for style transfer.
-    Pre-validates live model availability; style_model selects an installed model from models/style_models."""
-    try:
-        canvas = sessions.get_or_create(session_id)
-        # Readiness check before upload: report exactly what is missing.
-        await comfy.start_comfyui()
-        info = await comfy.get_object_info()
-        caps = style_transfer_capabilities(info)
-        if not caps["style_models"]:
-            return [TextContent(text="Style transfer unavailable: no models in models/style_models "
-                                     "(expected flux1-redux-dev.safetensors). Note the Redux model is "
-                                     "Flux.1-based, so on the Flux2 UNET results are best-effort; for style "
-                                     "guidance prefer edit_image with reference_paths.")]
-        if not caps["clip_vision_models"]:
-            return [TextContent(text="Style transfer unavailable: no CLIPVision model in models/clip_vision "
-                                     "(expected clip_vision.safetensors or sigclip_vision_patch14_384.safetensors).")]
-        resolved_style = resolve_model(caps["style_models"], style_model)
-        if resolved_style is None:
-            return [TextContent(text=f"Style model '{style_model}' is not installed. "
-                                     f"Available: {', '.join(caps['style_models'])}")]
-        clip_vision = caps["clip_vision_models"][0]
-        # Upload content (current canvas)
-        content_name = f"style_content_{uuid.uuid4().hex[:8]}.png"
-        composite = canvas.composite()
-        buf = io.BytesIO()
-        composite.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), content_name)
-        # Upload style reference
-        style_name = f"style_ref_{uuid.uuid4().hex[:8]}.png"
-        style_img = Image.open(style_path).convert("RGB")
-        buf2 = io.BytesIO()
-        style_img.save(buf2, format="PNG")
-        await comfy.upload_image(buf2.getvalue(), style_name)
-        workflow = build_style_transfer_workflow(prompt=prompt, content_filename=content_name,
-                                                  style_filename=style_name, style_strength=strength,
-                                                  width=width, height=height, steps=steps, seed=seed,
-                                                  style_model_name=resolved_style, clip_vision_name=clip_vision)
-        result = await run_workflow(workflow)
-        if not result:
-            return [TextContent(text="Style transfer failed.")]
-        img = Image.open(io.BytesIO(result)).convert("RGBA")
-        idx = canvas.add_layer(name=f"Style: {prompt[:30]}", image=img)
-        return [TextContent(text=f"Style transfer complete. Layer {idx}.")]
-    except Exception as e:
-        return [TextContent(text=f"Style transfer error: {str(e)}")]
-
-
 # ---- Sessions (multi-document) ----
 
 @app.tool("list_sessions")
@@ -1433,6 +1118,8 @@ DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_ou
 async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
                               export_format: str = "PNG", timeout: Optional[int] = None):
     """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass and export each result.
+
+    Automatically starts ComfyUI when needed; no manual startup is required.
 
     jobs: list of job objects, each with 'prompt' (required) and optional
     'model' ('flux2' photorealistic / 'anima' anime), 'width', 'height', 'steps', 'cfg',
@@ -1516,4 +1203,10 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
 register_editing_tools(app, comfy, sessions, run_workflow)
 
 if __name__ == "__main__":
-    app.run()
+    # Make app logging visible: in streamable-HTTP mode (run_openwebui.bat)
+    # output lands in mcp_http.log; in stdio mode logs go to stderr, which
+    # Cline's MCP transport safely ignores (protocol uses stdin/stdout).
+    logging.basicConfig(level=os.getenv("MCP_LOG_LEVEL", "INFO"))
+    # stdio (default - e.g. Cline) or streamable-http (Open WebUI):
+    # run_openwebui.bat sets MCP_TRANSPORT=streamable-http.
+    app.run(transport=os.getenv("MCP_TRANSPORT", "stdio"))

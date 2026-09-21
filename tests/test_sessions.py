@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import AsyncMock
 
 from session import SessionManager
 
@@ -78,8 +79,8 @@ class SessionToolTests(unittest.IsolatedAsyncioTestCase):
                 return register
 
         registry = Registry()
-        run = unittest.mock.AsyncMock(return_value=None)
-        register_editing_tools(registry, unittest.mock.AsyncMock(), self.server.sessions, run)
+        run = AsyncMock(return_value=None)
+        register_editing_tools(registry, AsyncMock(), self.server.sessions, run)
         await self.server.new_canvas(width=48, height=48, session_id="edit")
         out = await registry.tools["preview_canvas"](session_id="edit")
         self.assertEqual(json.loads(out[0].text)["width"], 48)

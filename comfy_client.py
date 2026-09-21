@@ -77,18 +77,52 @@ class ComfyUIClient:
         logger.info("Idle kill scheduled in %ds.", COMFYUI_IDLE_TIMEOUT)
 
     def _do_idle_kill(self):
-        """Called by the idle timer to kill ComfyUI after timeout."""
+        """Called by the idle timer to kill ComfyUI after timeout.
+
+        The kill is guarded: if another workflow is active in ComfyUI's queue -
+        possibly submitted by ANOTHER server instance (Cline stdio vs Open
+        WebUI HTTP) sharing the same ComfyUI process - the kill is deferred
+        instead of interrupting that job.
+        """
         self._idle_kill_timer = None
-        logger.info("Idle timeout reached (%ds), killing ComfyUI...", COMFYUI_IDLE_TIMEOUT)
+        logger.info("Idle timeout reached (%ds), checking queue before killing ComfyUI...", COMFYUI_IDLE_TIMEOUT)
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            task = asyncio.create_task(self.kill_comfyui())
+            task = asyncio.create_task(self._idle_kill_guarded())
             task.add_done_callback(self._on_idle_kill_done)
         else:
-            loop.run_until_complete(self.kill_comfyui())
+            loop.run_until_complete(self._idle_kill_guarded())
+
+    async def _idle_kill_guarded(self):
+        """Kill ComfyUI only when no job is running or queued.
+
+        Multiple server instances (e.g. a stdio instance for Cline and a
+        streamable-HTTP instance for Open WebUI) share one ComfyUI process on
+        port 8188. An idle timer from one instance must not kill ComfyUI while
+        the other's workflow is in progress - doing so fails that job.
+        While the queue is busy the kill re-checks every COMFYUI_IDLE_TIMEOUT.
+        """
+        try:
+            queue = await self.get_queue_status()
+            running = queue.get("queue_running", [])
+            pending = queue.get("queue_pending", [])
+        except Exception as e:
+            # ComfyUI unreachable: nothing can be running via it; proceed
+            # with the kill (kill_comfyui handles "not running" gracefully).
+            logger.warning("Queue check before idle kill failed: %s", e)
+            running, pending = [], []
+        if running or pending:
+            logger.info("ComfyUI queue not empty (%d running, %d pending); deferring idle kill by %ds.",
+                        len(running), len(pending), COMFYUI_IDLE_TIMEOUT)
+            self._idle_kill_timer = asyncio.get_event_loop().call_later(
+                COMFYUI_IDLE_TIMEOUT, self._do_idle_kill)
+            return
+        await self.kill_comfyui()
 
     def _on_idle_kill_done(self, task):
         """Callback to log errors from idle kill task."""
+        if task.cancelled():
+            return
         try:
             task.result()
         except Exception as e:
@@ -138,25 +172,19 @@ class ComfyUIClient:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        # Redirect stdin from nul - embedded Python on Windows crashes
-        # with DETACHED_PROCESS if stdin is not redirected (tries to read
-        # from a console that doesn't exist).
-        stdin = open(os.devnull, "r")
-
         # Prefer direct Python launch over .bat for reliability
         if os.path.exists(COMFYUI_PYTHON) and os.path.exists(COMFYUI_MAIN):
             args = [COMFYUI_PYTHON, "-s", COMFYUI_MAIN] + COMFYUI_ARGS.split()
             cwd = str(Path(COMFYUI_MAIN).parent.parent)  # ComfyUI_windows_portable root
             logger.info("Starting ComfyUI via Python: %s ...", ' '.join(args[:3]))
             logger.info("Working directory: %s", cwd)
-            # Use DETACHED_PROCESS so ComfyUI runs independently as a separate process.
-            # Do NOT redirect stdout/stderr - embedded Python on Windows crashes
-            # when stdout is redirected to a file (OSError on flush).
-            # ComfyUI writes its own log to comfyui.log anyway.
+            # Child process output must not enter the MCP stdio protocol.
             self._comfyui_process = subprocess.Popen(
                 args,
                 cwd=cwd,
-                stdin=stdin,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 env=env,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
             )
@@ -168,9 +196,11 @@ class ComfyUIClient:
                 COMFYUI_START_CMD,
                 shell=True,
                 cwd=cwd,
-                stdin=stdin,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 env=env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             )
         pid = self._comfyui_process.pid
         logger.info("ComfyUI launched with PID %d", pid)
@@ -299,6 +329,7 @@ class ComfyUIClient:
     async def start_comfyui(self):
         """Start ComfyUI if not already running, then wait until it is reachable.
         Ensures port 8188 is free before starting (kills stale processes if needed)."""
+        self._cancel_idle_kill()
         if await self.is_running():
             logger.info("ComfyUI is already running.")
             return

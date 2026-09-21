@@ -5,9 +5,13 @@ import io
 import json
 import secrets
 from pathlib import Path
+from typing import Literal
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from mcp.types import ImageContent, TextContent
+
+from config import (MODEL_ANIMA, MODEL_ANIMA_TEXT_ENCODER, MODEL_ANIMA_VAE,
+                    MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE)
 
 
 def model_options(info, loader, field):
@@ -29,26 +33,48 @@ def resolve_model(options, *basenames):
 
 
 def edit_profiles(info):
+    return model_profiles(info, "editing")
+
+
+def model_profiles(info, task):
+    """Resolve installed weights and check the nodes needed for this task."""
+    if task not in ("generation", "editing", "outpaint"):
+        raise ValueError(f"Unknown model task: {task}")
     unets = model_options(info, "UNETLoader", "unet_name")
     clips = model_options(info, "CLIPLoader", "clip_name")
     vaes = model_options(info, "VAELoader", "vae_name")
     profiles = {}
-    for name, model_names, clip_names, vae_name, refs, steps in (
-        ("flux2", ("flux-2-klein-9b.safetensors", "flux-2-klein-9b-fp8.safetensors"),
-         ("qwen_3_8b_fp8mixed.safetensors", "qwen_3_8b.safetensors"), "flux2-vae.safetensors", 2, 4),
+    for name, model_names, clip_names, vae_name, refs, steps, cfg, use_for in (
+        ("flux2", (MODEL_FLUX2, "flux-2-klein-9b-fp8.safetensors"),
+         (MODEL_FLUX2_TEXT_ENCODER, "qwen_3_8b.safetensors"), MODEL_FLUX2_VAE, None, 4, 1.0,
+         "Fast generation, instruction edits and reference-guided edits (Klein 9B distilled)."),
         ("qwen21", ("qwen_image_2.1_int8_convrot.safetensors", "qwen_image_2.1_bf16.safetensors"),
           ("qwen3vl_8b_int8_convrot.safetensors", "qwen3vl_8b_w4a8.safetensors", "qwen3vl_8b_bf16.safetensors"),
-          "qwen_image_2.1_vae_bf16.safetensors", 15, 25),
+          "qwen_image_2.1_vae_bf16.safetensors", 15, 30, 3.0,
+          "Detailed generation, typography, transparent output, instruction and reference-guided edits."),
+        ("anima", (MODEL_ANIMA, "anima-base-v1.0.safetensors"),
+         (MODEL_ANIMA_TEXT_ENCODER,), MODEL_ANIMA_VAE, 0, 30, 4.0,
+         "Anime and illustration text-to-image only; not instruction editing or typography."),
     ):
+        if name == "anima" and task != "generation":
+            continue
         profile = {
             "model": resolve_model(unets, *model_names),
             "clip": resolve_model(clips, *clip_names),
             "vae": resolve_model(vaes, vae_name),
-            "max_additional_references": refs, "default_steps": steps,
+            "default_steps": steps, "default_cfg": cfg, "use_for": use_for,
+            "sampler": "er_sde" if name == "anima" else "euler",
+            "scheduler": "Flux2Scheduler" if name == "flux2" else "simple",
+            "denoise": 1.0,
         }
+        if task != "generation":
+            profile["max_additional_references"] = refs
         missing = [key for key in ("model", "clip", "vae") if not profile[key]]
         if not missing:
-            graph = build_edit_workflow(name, profile, "check", ["check.png"], 512, 512, steps, 1)
+            if task == "generation":
+                graph = build_generation_workflow(name, profile, "check", width=512, height=512, seed=1)
+            else:
+                graph = build_edit_workflow(name, profile, "check", ["check.png"], 512, 512, steps, 1)
             missing = sorted({n["class_type"] for n in graph.values()} - info.keys())
         profile["missing"] = missing
         profile["available"] = not missing
@@ -56,8 +82,55 @@ def edit_profiles(info):
     return profiles
 
 
-def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed):
+def build_generation_workflow(backend, profile, prompt, negative_prompt="", width=1024, height=1024,
+                              steps=None, cfg=None, seed=None):
+    """Native ComfyUI text-to-image graphs, with per-model sampling defaults."""
+    if backend not in ("flux2", "qwen21", "anima"):
+        raise ValueError("model must be flux2, qwen21 or anima")
+    steps = profile["default_steps"] if steps is None else steps
+    cfg = profile["default_cfg"] if cfg is None else cfg
+    seed = secrets.randbits(63) if seed is None else seed
+    graph = {}
+
+    def node(kind, **inputs):
+        key = str(len(graph) + 1)
+        graph[key] = {"class_type": kind, "inputs": inputs}
+        return [key, 0]
+
+    model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
+    clip_type = {"flux2": "flux2", "qwen21": "qwen_image", "anima": "stable_diffusion"}[backend]
+    clip = node("CLIPLoader", clip_name=profile["clip"], type=clip_type)
+    vae = node("VAELoader", vae_name=profile["vae"])
+    if backend == "qwen21":
+        encoded = node("TextEncodeQwenImage21", clip=clip, prompt=prompt,
+                       negative_prompt=negative_prompt, resolution=1024)
+        positive, negative = encoded, [encoded[0], 1]
+    else:
+        positive = node("CLIPTextEncode", clip=clip, text=prompt)
+        negative = node("CLIPTextEncode", clip=clip, text=negative_prompt)
+    latent = node("EmptyFlux2LatentImage" if backend == "flux2" else "EmptyLatentImage",
+                  width=width, height=height, batch_size=1)
+    if backend == "flux2":
+        guider = node("CFGGuider", model=model, positive=positive, negative=negative, cfg=cfg)
+        noise = node("RandomNoise", noise_seed=seed)
+        sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
+        sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
+        sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
+                       sigmas=sigmas, latent_image=latent)
+    else:
+        sampled = node("KSampler", model=model, positive=positive, negative=negative,
+                       latent_image=latent, seed=seed, steps=steps, cfg=cfg,
+                       sampler_name=profile["sampler"],
+                       scheduler=profile["scheduler"], denoise=profile["denoise"])
+    decoded = node("VAEDecode", samples=sampled, vae=vae)
+    node("SaveImage", images=decoded, filename_prefix=f"mcp_{backend}")
+    return graph
+
+
+def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed, resolution=0):
     """Use reference conditioning, separate from the sampled output latent."""
+    if backend not in ("flux2", "qwen21"):
+        raise ValueError("Instruction editing requires qwen21 or flux2; Anima supports generation only")
     graph = {}
 
     def node(kind, **inputs):
@@ -82,19 +155,19 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         guider = node("BasicGuider", model=model, conditioning=positive)
         noise = node("RandomNoise", noise_seed=seed)
         sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
-        sampler = node("KSamplerSelect", sampler_name="euler")
+        sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
         empty = node("EmptyFlux2LatentImage", width=width, height=height, batch_size=1)
         sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
                        sigmas=sigmas, latent_image=empty)
     else:
         model = node("QwenImage21Cache", model=model, device="auto", dtype="default")
         encoder = node("TextEncodeQwenImage21", clip=clip, vae=vae, prompt=prompt,
-                       negative_prompt="", resolution=0,
+                       negative_prompt="", resolution=resolution,
                        **{f"images.image_{i + 1}": image for i, image in enumerate(loaded)})
         positive, negative, latent = encoder, [encoder[0], 1], [encoder[0], 2]
         sampled = node("KSampler", model=model, positive=positive, negative=negative,
-                       latent_image=latent, seed=seed, steps=steps, cfg=1.0,
-                       sampler_name="euler", scheduler="simple", denoise=1.0)
+                       latent_image=latent, seed=seed, steps=steps, cfg=profile["default_cfg"],
+                       sampler_name=profile["sampler"], scheduler=profile["scheduler"], denoise=profile["denoise"])
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix="mcp_instruction_edit")
     return graph
@@ -249,10 +322,12 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
     @app.tool("get_editing_capabilities")
     async def get_editing_capabilities(start_if_needed: bool = True):
-        """Check installed models and edit readiness. Automatically starts ComfyUI when needed.
+        """Check installed models for generation, editing and outpainting. Automatically starts ComfyUI when needed.
 
         No manual startup is required. This check does not load generation models.
         Set start_if_needed=False only for a passive check; offline does not mean editing is unavailable.
+        Choose qwen21 for detail/text/alpha, flux2 for speed, anima for anime generation.
+        Anima is generation-only; upscaling and semantic selection use their dedicated models.
         """
         try:
             if start_if_needed:
@@ -268,7 +343,10 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         report = {
             "connected": True, "comfyui_version": stats.get("system", {}).get("comfyui_version"),
             "devices": stats.get("devices", []), "editing": edit_profiles(info),
+            "generation": model_profiles(info, "generation"),
+            "outpaint": model_profiles(info, "outpaint"),
             "default_edit_backend": "qwen21",
+            "default_generation_model": "flux2", "default_outpaint_backend": "flux2",
             "models": {"diffusion_models": model_options(info, "UNETLoader", "unet_name"),
                        "text_encoders": model_options(info, "CLIPLoader", "clip_name"),
                        "vae": model_options(info, "VAELoader", "vae_name"),
@@ -278,7 +356,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                       "semantic_select runs SAM 3 text/point/box prompts on the canvas (point/box use sam3.pt; text prompts use sam3.1_multiplex_fp16.safetensors, both in models/checkpoints). select_object stays the fast color-heuristic fallback.",
                       "edit_image supports independent white-to-edit masks and returns a new undoable layer.",
                       "Legacy select_object uses color heuristics, not semantic object segmentation.",
-                      "outpaint runs on the Flux2 chain (SetLatentNoiseMask protects existing content). ControlNet and Redux style-transfer tools were removed 2026-09-20 with their deleted models; style/identity guidance uses edit_image reference_paths.",
+                      "outpaint supports flux2 or qwen21 reference conditioning; original pixels are restored after generation. Style/identity guidance uses edit_image reference_paths.",
                       "batch_generate queues a whole job list on one WebSocket connection and exports each result to disk as it completes (see the GPU batching rule).",
                       "The GPU may be shared with qwen38. Never stop that LLM container without explicit approval.",
                       "Full GPU batching procedure: MEMORY.md, section 'GPU Contention & Batching Rule'."],
@@ -286,7 +364,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
     @app.tool("edit_image")
-    async def edit_image(prompt: str, backend: str = "qwen21", reference_paths: list[str] | None = None,
+    async def edit_image(prompt: str, backend: Literal["qwen21", "flux2"] = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
                          max_side: int = 1024, session_id: str = "default", timeout: int | None = None):
@@ -294,7 +372,10 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
         Automatically starts ComfyUI when needed; no manual startup is required.
 
-        backend: qwen21 (default, Qwen Image 2.1, 25 steps, RGBA) or flux2 (fast, 4 steps).
+        backend: qwen21 (default, Qwen Image 2.1, custom 30 steps/CFG 3, RGBA)
+        or flux2 (Klein 9B distilled, 4 steps/CFG 1). Both use Euler.
+        Both support object removal, background replacement, restyling and references.
+        Choose qwen21 for typography/alpha or flux2 for speed. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
         Image 1 is the canvas; images 2 onward are reference_paths, in order. For Qwen use
         <image1>, <image2>, etc. Describe the change and the identity/features to preserve.
@@ -326,8 +407,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         source = canvas.composite()
         mask = make_edit_mask(source.size, mask_path, region, feather)
         references = reference_paths or []
-        limit = (15 - int(mask is not None)) if backend == "qwen21" else 2
-        if len(references) > limit:
+        limit = (15 - int(mask is not None)) if backend == "qwen21" else None
+        if limit is not None and len(references) > limit:
             raise ValueError(f"{backend} supports at most {limit} additional references")
         multiple = 32 if backend == "qwen21" else 16
         images = [prepare_image(source, max_side, multiple)]
@@ -350,8 +431,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         if not profile["available"]:
             raise ValueError(f"{backend} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
         steps = profile["default_steps"] if steps is None else steps
-        if not 1 <= steps <= (6 if backend == "flux2" else 10000):
-            raise ValueError("steps must be 1-6 for distilled flux2, or 1-10000 for qwen21")
+        if steps < 1:
+            raise ValueError("steps must be positive")
         files = []
         for image in images:
             name = f"mcp_edit_{secrets.token_hex(12)}.png"
@@ -373,7 +454,9 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             layer.visible = False
         index = canvas.add_layer(name=f"Edit ({backend}, seed {seed}): {prompt[:40]}", image=edited)
         report = {"layer": index, "backend": backend, "model": profile["model"], "seed": seed,
-                  "steps": steps, "reference_count": len(references), "masked": mask is not None,
+                  "steps": steps, "cfg": profile["default_cfg"],
+                  "sampler": profile["sampler"], "scheduler": profile["scheduler"],
+                  "reference_count": len(references), "masked": mask is not None,
                   "generation_size": [width, height], "canvas_size": list(source.size),
                   "effective_prompt": instruction}
         return [TextContent(type="text", text=json.dumps(report)), preview_content(canvas.composite())]

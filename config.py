@@ -44,11 +44,9 @@ DEFAULT_CANVAS_WIDTH = 1024
 DEFAULT_CANVAS_HEIGHT = 1024
 DEFAULT_BG_COLOR = (255, 255, 255)
 
-# Image generation defaults
+# Default generation size; sampling defaults live in editing.model_profiles.
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
-DEFAULT_STEPS = 20
-DEFAULT_CFG = 1.5  # Flux2 Klein default
 
 # Model names (match installed models)
 MODEL_FLUX2 = "flux-2-klein-9b.safetensors"

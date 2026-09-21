@@ -26,12 +26,30 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 - `get_info` — View canvas dimensions, layers, undo/redo state
 
 ### AI Image Generation & Editing
-- `generate_image` — Text-to-image via Flux2 (photorealistic) or ANIMA (anime)
-- `outpaint` — AI extend canvas in a direction (left, right, top, bottom), Flux2 chain
+- `generate_image` — Text-to-image with `model="flux2"`, `"qwen21"`, or `"anima"`
+- `outpaint` — Extend left/right/top/bottom with `backend="flux2"` or `"qwen21"`; restores the original pixels exactly after generating the new margin
+
+| Model | Generate / batch | Edit / masked edit / references | Outpaint | Default steps / CFG | Sampler | Scheduler |
+|---|---|---|---|---|---|---|
+| `flux2` (Klein 9B distilled) | Yes; fast | Yes | Yes | 4 / 1 | Euler | Native `Flux2Scheduler` |
+| `qwen21` (Qwen Image 2.1; custom preset) | Yes; detail, typography, alpha | Yes | Yes | 30 / 3 | Euler | Simple |
+| `anima` (installed Aesthetic v1.1) | Yes; anime/illustration | No | No | 30 / 4 | `er_sde` | Simple |
+
+These are the active MCP presets for the installed models. Qwen generation, editing and outpainting all use the requested **30 steps / CFG 3** preset. This is a user preference, not the official Qwen 2.1 recommendation: ComfyUI's current 2.1 templates use **25 steps / CFG 1 / Euler / Simple**. Older Qwen base and Lightning/Flash recipes do not define the 2.1 defaults; no Lightning LoRA or AuraFlow shift is applied.
+
+All generation paths use a full denoising schedule (`denoise=1.0` on KSampler). Text-to-image defaults to 1024x1024; Anima also suits approximately 1MP portrait/landscape sizes such as 896x1152 and 1152x896. Anima Aesthetic's documented tuning range is 30–50 steps and CFG 4–5; the preset uses the lower end. Klein uses `flux2-vae.safetensors` and the Qwen3 8B encoder. Its installed checkpoint is distilled, so the base-model 20–30-step recipe does not apply. Anima Turbo and Qwen Lightning/Flash are not active backends.
+
+Model selection is per call; batch jobs can each choose a different model. Omit `steps`/`cfg` to use the selected model's defaults; explicit values are preserved. `get_editing_capabilities` reports readiness separately for generation, editing and outpainting, including missing files/nodes. Missing or unsupported choices return an error without substituting another model. Defaults remain Flux for generation/outpaint and Qwen for editing. Upscaling and semantic selection retain their dedicated models.
+
+Generation uses native ComfyUI nodes, including `Flux2Scheduler` for Klein and `TextEncodeQwenImage21` for Qwen. Qwen generation defaults to a 1800-second timeout; batch timeouts account for every job. PNG exports preserve generated alpha; existing visible canvas layers still composite normally. Outpainting uses reference-guided editing, with original pixels restored by the server rather than relying on the model to preserve them.
+
+Qwen outpaint uses an opaque white margin and the guide's approximately 1-megapixel editing resolution before returning to the requested canvas size. Low-resolution transparent-margin tests produced blank/noisy borders; ordinary `edit_image` retains its existing resolution handling.
+
+References: [Qwen 2.1 guide](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1), [Flux Klein guide](https://docs.comfy.org/tutorials/flux/flux-2-klein#flux-2-klein-9b-workflows), [Anima guide](https://docs.comfy.org/tutorials/image/anima/anima), [Anima model settings](https://huggingface.co/circlestone-labs/Anima#generation-settings).
 
 ### Instruction Editing
-- `edit_image` — Qwen Image 2.1 (`qwen21`, default, 25 steps) or FLUX.2 (`flux2`, fast, 4 steps). Qwen 2511 and the original Qwen backend are retired. The canvas is `<image1>`; references follow in order. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. The Qwen timeout defaults to 1800 seconds.
-- `get_editing_capabilities` — Live ComfyUI model/node availability for every editing backend (notes also carry the GPU batching rule)
+- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3) or FLUX.2 (`flux2`, fast, 4 steps/CFG 1). Qwen 2511 and the original Qwen backend are retired. The canvas is `<image1>`; references follow in order. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. The Qwen timeout defaults to 1800 seconds.
+- `get_editing_capabilities` — Live ComfyUI model/node availability per task (generation, editing, outpaint; notes also carry the GPU batching rule)
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
 
 ### Sessions & Batch (multi-document)
@@ -81,7 +99,7 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 - Required models installed in ComfyUI:
 
   **Flux2 Klein (photorealistic generation):**
-  - `flux-2-klein-9b.safetensors` (diffusion_models) — **IMPORTANT: use 4-6 steps max**. Image quality actively diminishes after ~6 steps (artifacts, over-smoothing) and latency increases linearly with each additional step.
+  - `flux-2-klein-9b.safetensors` or `flux-2-klein-9b-fp8.safetensors` (diffusion_models) — distilled model; defaults to 4 steps
   - `qwen_3_8b_fp8mixed.safetensors` (text_encoders) — Flux2 Klein text encoder
   - `flux2-vae.safetensors` (vae) — Flux2 Klein VAE
 
@@ -90,7 +108,7 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
   - `qwen_3_06b_base.safetensors` (text_encoders)
   - `qwen_image_vae.safetensors` (vae)
 
-  **Qwen Image 2.1 (default instruction editor):**
+  **Qwen Image 2.1 (generation and default instruction editor):**
   - `qwen_image_2.1_int8_convrot.safetensors` (diffusion_models)
   - `qwen3vl_8b_int8_convrot.safetensors` (text_encoders)
   - `qwen_image_2.1_vae_bf16.safetensors` (vae)
@@ -193,7 +211,7 @@ mcp-photoshop-server/
 ├── requirements.txt    # Python dependencies
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (81 tests)
+├── tests/              # Regression suite (92 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md
@@ -262,8 +280,9 @@ mcp-photoshop-server/
 1. new_canvas(width=1024, height=1024, session_id="doc_a")
 2. open_image(path="photo.jpg", session_id="doc_b")
 3. edit_image(prompt="...", session_id="doc_a")   # doc_b stays untouched
-4. batch_generate(jobs=[{"prompt": "a lighthouse", "steps": 4},
-                         {"prompt": "a paper crane", "steps": 4}],
+4. batch_generate(jobs=[{"prompt": "a lighthouse", "model": "flux2"},
+                         {"prompt": "a poster reading HELLO", "model": "qwen21"},
+                         {"prompt": "an anime paper crane illustration", "model": "anima"}],
                   export_dir="output/batch")
 5. list_sessions()
 6. close_session(session_id="doc_b")

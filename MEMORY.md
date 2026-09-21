@@ -1,14 +1,37 @@
 # Memory Bank — MCP Photoshop Server
 
 > Last updated: 2026-09-20
-> Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, 25 steps, CFG 1, Euler/simple). `qwen` and `qwen2511` are retired. FLUX.2 remains an explicit fast option. Earlier Qwen 2511 entries below are historical, not current setup instructions.
+> Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. FLUX.2 remains an explicit fast option. Earlier sampling values below are historical unless they match the active presets immediately below.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-09-20 Active sampling presets
+
+| Installed backend | Steps | CFG | Sampler | Scheduler |
+|---|---|---|---|---|
+| `qwen21` | 30 | 3 | Euler | Simple |
+| `flux2` (Klein 9B distilled) | 4 | 1 | Euler | Native `Flux2Scheduler` |
+| `anima` (Aesthetic v1.1) | 30 | 4 | `er_sde` | Simple |
+
+- User requested these presets. Qwen's 30/3 is a custom preference; the [official Qwen 2.1 workflow](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1#sampler-settings) still recommends 25/1. Do not describe 30/3 as official or attach older Lightning/Flash/AuraFlow recipes to 2.1.
+- Sampling defaults live in `editing.model_profiles` and are consumed by generation, batch generation, editing and outpainting. Qwen editing/outpaint CFG now reads that profile instead of a hard-coded 1. The capability report includes sampler, scheduler and denoise. Removed unused global 20-step/CFG-1.5 constants from config.py.
+- Denoise is 1.0 (full schedule); generation defaults to 1024x1024. Anima's documented range is 30–50 steps/CFG 4–5 at roughly 1MP, e.g. 1024x1024 or 896x1152. Existing explicit steps/CFG arguments remain honored where exposed; samplers/schedulers use the profile.
+- [Klein 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) is distilled, not base: keep its default at 4/1 with flux2-vae and Qwen3 8B. [Anima Aesthetic](https://huggingface.co/circlestone-labs/Anima#generation-settings) is not Turbo. No new model variants, downloads, or scheduler dependencies were added. README lists the same active values.
+- Verification: all 92 tests passed. Live Qwen 30/3 generation, cabin recolor, and outpaint completed; outpaint preserved original pixels exactly. Samples and settings are in `verification/sampling_presets/`. These are smoke checks, not a quality comparison against the official preset.
+
+## 2026-09-20 Model selection by task
+
+- `generate_image(model=...)` and per-job `batch_generate` support `flux2`, `qwen21`, and `anima`. `edit_image(backend=...)` and `outpaint(backend=...)` support `qwen21` and `flux2`; Anima remains text-to-image only. Upscaling/SAM retain their dedicated models. Defaults remain Flux generation/outpaint and Qwen editing.
+- Shared live model discovery checks the required nodes separately for generation/editing/outpaint. Tool descriptions, model enums and `get_editing_capabilities` expose the choices to Cline and Open WebUI. Unknown/unavailable choices fail before submission without silent substitution.
+- Omitted sampling settings use Flux 4 steps/CFG 1, Qwen custom 30/3, Anima Aesthetic 30/4 (`er_sde`/simple, per the model card). Explicit values are preserved. Removed the Flux step cap and arbitrary two-reference limit. Generation uses native encoders and Flux2Scheduler, replacing the custom sectioned encoder/BasicScheduler path. Qwen text-to-image follows the official TextEncodeQwenImage21 + EmptyLatentImage graph with the user's sampling preset.
+- Outpaint now uses reference conditioning and restores original pixels exactly, including alpha. Qwen uses an opaque white margin and resolution=1024 in its encoder, then resizes back to the requested canvas size. Low-resolution transparent/masked margins failed visual checks; those approaches were removed. Ordinary Qwen instruction editing remains unchanged and was live-tested with a cabin recolor.
+- A live mixed-model batch generated all three images; Flux and corrected Qwen outpaint passed visual and original-pixel checks. 92 regression tests passed. Evidence and samples: `verification/model_selection/`. Sources: the ComfyUI Qwen Image 2.1, Flux Klein 9B and Anima guides, installed official workflow templates, and CircleStone's Anima model card. No model downloads or ComfyUI core changes.
+- Save canvases and restart/reconnect the Photoshop MCP processes to load new schemas; persistent HTTP processes keep old definitions until restarted.
 
 ## 2026-09-20 Automatic startup checks
 
 - ComfyUI-dependent tools start ComfyUI automatically. `get_editing_capabilities` and `get_comfyui_status` now do so by default too; previously they returned offline errors that encouraged clients to require manual startup. Both accept `start_if_needed=False` for a passive probe and explain that dependent tools can start the backend.
 - Automatic startup is stated in individual tool descriptions, because Open WebUI may ignore MCP initialize instructions. Startup cancels a pending idle timer before health checks. Child stdout/stderr no longer inherit the MCP protocol stream.
-- Verified from fully stopped ComfyUI using the real MCP stdio transport: automatic startup in 45.8 seconds, Qwen 2.1 available, status and all 38 tool definitions readable, model-free workflow output retrieved. No LLM container was stopped and no generation model was loaded. Evidence: `verification/autostart_stdio_status.json`; current regression suite: 81 tests passed.
+- Verified from fully stopped ComfyUI using the real MCP stdio transport: automatic startup in 45.8 seconds, Qwen 2.1 available, status and all 38 tool definitions readable, model-free workflow output retrieved. No LLM container was stopped and no generation model was loaded. Evidence: `verification/autostart_stdio_status.json`; regression suite at that point: 81 tests passed (later model-selection work brought it to 92).
 - The already-running HTTP server on port 8000 still has the previous tool definitions. Save open canvases, restart the Photoshop server processes, then refresh/reconnect the client tools to activate the changes.
 
 ## 2026-09-20 Tool Cleanup (dead/legacy removal)
@@ -102,14 +125,14 @@
 ### AI Image Generation (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=6, cfg=1.5, seed=None, negative_prompt="", session_id="default")` | txt2img via Flux2 (photorealistic) or ANIMA (anime) |
+| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Flux2, Qwen 2.1, or Anima; model-specific sampling defaults |
 
 ### AI Editing + Instruction Editing (4)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `outpaint` | `(prompt, direction="right", amount=256, steps=6, seed=None, session_id="default")` | Extend canvas + Flux2 masked fill (direction: left/right/top/bottom); extends every layer and mask; Flux2 steps capped at 6 |
-| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None)` | Instruction + reference-guided editing: Qwen Image 2.1 (default, 25 steps, up to 16 total images, timeout defaults to 1800 s) or FLUX.2 (fast, 4 steps); white-to-edit mask; new undoable layer; `qwen`/`qwen2511` retired |
-| `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability for all editing backends; notes carry the GPU batching rule |
+| `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="flux2", timeout=None)` | Extend canvas via Flux2 or Qwen 2.1 reference conditioning; preserve original pixels and layer/mask alignment |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None)` | Instruction + reference-guided editing: Qwen Image 2.1 (default, custom 30 steps/CFG 3, up to 16 total images, timeout defaults to 1800 s) or FLUX.2 (fast, 4 steps/CFG 1); white-to-edit mask; new undoable layer; `qwen`/`qwen2511` retired |
+| `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability per task: generation, editing, outpaint; notes carry the GPU batching rule |
 | `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
 ### Transforms (4)
@@ -181,7 +204,7 @@
 |------|-----------|-------------|
 | `list_sessions` | `()` | All open document sessions with size/layers/active layer/undo depth |
 | `close_session` | `(session_id="default")` | Close a session, freeing its canvas |
-| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Whole-batch txt2img queue (flux2/anima) on one WebSocket; exports each result to disk as it completes, returns JSON summary |
+| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (flux2/qwen21/anima) on one WebSocket; returns exported paths, model, steps, CFG and seed |
 
 > Every canvas tool takes an optional `session_id` (default `"default"`) so multiple documents can be edited independently in one server process.
 

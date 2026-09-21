@@ -12,7 +12,7 @@ import secrets
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageChops
 
@@ -25,16 +25,15 @@ def TextContent(text="", **kwargs):
     return _TextContent(type="text", text=text, **kwargs)
 
 from config import (
-    COMFYUI_URL, DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_CFG,
-    MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE,
-    MODEL_ANIMA, MODEL_ANIMA_TEXT_ENCODER, MODEL_ANIMA_VAE,
+    COMFYUI_URL, DEFAULT_WIDTH, DEFAULT_HEIGHT, WEBSOCKET_TIMEOUT,
     MODEL_UPSCALE_FACE, MODEL_UPSCALE_ANIME,
     COMFYUI_AUTO_KILL, VRAM_PRESSURE_THRESHOLD_MB,
 )
 from comfy_client import ComfyUIClient
 from canvas import Canvas, BLEND_MODES
 from session import SessionManager
-from editing import register_editing_tools
+from editing import (register_editing_tools, model_profiles, build_generation_workflow,
+                     build_edit_workflow, prepare_image, png_bytes)
 
 # ----------------------------------------------------------------------- #
 #  Globals
@@ -45,6 +44,8 @@ logger = logging.getLogger(__name__)
 # Some clients ignore initialize instructions, so tool descriptions also state
 # the automatic-startup behavior.
 GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order (<image1> is the canvas). For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 remains an explicit fast option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
+
+Model selection: generate_image and batch_generate accept model=flux2 (fast), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
@@ -125,186 +126,6 @@ async def free_or_kill_based_on_pressure(comfy_client: ComfyUIClient) -> None:
 
 def _make_node_id() -> str:
     return str(uuid.uuid4())[:8]
-
-
-def build_txt2img_workflow(
-    prompt: str, negative_prompt: str = "", width: int = 1024, height: int = 1024,
-    steps: int = 20, cfg: float = 1.5, seed: Optional[int] = None, model: str = "flux2",
-) -> dict:
-    """Build a txt2img workflow for Flux2 Klein or ANIMA.
-
-    Flux2 Klein now uses built-in ComfyUI nodes (CLIPTextEncodeFlux + SamplerCustomAdvanced)
-    instead of the custom ComfyUI-Flux2Klein-Enhancer nodes which had architecture mismatches.
-    """
-    nid = _make_node_id
-
-    if model == "anima":
-        return build_anima_workflow(prompt=prompt, negative_prompt=negative_prompt,
-                                    width=width, height=height, steps=steps, cfg=cfg, seed=seed)
-
-    # Flux2 Klein workflow
-    # UNETLoader -> CLIPLoader -> VAELoader -> Flux2KleinSectionedEncoder -> EmptyFlux2LatentImage ->
-    # BasicGuider -> RandomNoise -> BasicScheduler -> KSamplerSelect -> SamplerCustomAdvanced ->
-    # VAEDecode -> SaveImage
-    #
-    # NOTE: CLIPTextEncodeFlux is for Flux.1 (CLIP-L + T5-XXL), NOT Flux2.
-    # Flux2 uses Flux2KleinSectionedEncoder for text encoding.
-    # NOTE: Flux2KleinKSamplerExperimental has architecture mismatches - use SamplerCustomAdvanced instead.
-    #
-    # Flux2KleinSectionedEncoder inputs (Flux2 text encoding):
-    #   clip, front_text, mid_text, end_text, separator
-    n1  = nid()  # UNETLoader (outputs MODEL:0)
-    n2  = nid()  # CLIPLoader (outputs CLIP:0) - type: "flux2"
-    n3  = nid()  # VAELoader (outputs VAE:0)
-    n4  = nid()  # Flux2KleinSectionedEncoder (outputs CONDITIONING:0)
-    n5  = nid()  # EmptyFlux2LatentImage (outputs LATENT:0)
-    n6  = nid()  # BasicGuider
-    n7  = nid()  # RandomNoise
-    n8  = nid()  # BasicScheduler
-    n9  = nid()  # KSamplerSelect
-    n10 = nid()  # SamplerCustomAdvanced
-    n11 = nid()  # VAEDecode
-    n12 = nid()  # SaveImage
-
-    seed_value = seed if seed is not None else 42
-
-    # Split prompt into sections for Flux2KleinSectionedEncoder
-    parts = [p.strip() for p in prompt.split(",")]
-    front_text = parts[0] if parts else prompt
-    mid_text = ", ".join(parts[1:]) if len(parts) > 1 else ""
-    end_text = ""
-
-    return {
-        n1:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
-        n2:  {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
-        n3:  {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n4:  {"class_type": "Flux2KleinSectionedEncoder", "inputs": {
-            "clip": [n2, 0],
-            "front_text": front_text,
-            "mid_text": mid_text,
-            "end_text": end_text,
-            "separator": "comma",
-        }},
-        n5:  {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        n6:  {"class_type": "BasicGuider", "inputs": {"model": [n1, 0], "conditioning": [n4, 0]}},
-        n7:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed_value}},
-        n8:  {"class_type": "BasicScheduler", "inputs": {"model": [n1, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n9:  {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        n10: {"class_type": "SamplerCustomAdvanced", "inputs": {
-            "noise": [n7, 0],
-            "guider": [n6, 0],
-            "sampler": [n9, 0],
-            "sigmas": [n8, 0],
-            "latent_image": [n5, 0],
-        }},
-        n11: {"class_type": "VAEDecode", "inputs": {"samples": [n10, 0], "vae": [n3, 0]}},
-        n12: {"class_type": "SaveImage", "inputs": {"images": [n11, 0], "filename_prefix": "mcp_flux2"}},
-    }
-
-
-def build_anima_workflow(
-    prompt: str, negative_prompt: str = "", width: int = 1024, height: int = 1024,
-    steps: int = 20, cfg: float = 1.5, seed: Optional[int] = None,
-) -> dict:
-    """Build a txt2img workflow for ANIMA (anime-style generation).
-
-    Uses separate UNETLoader, CLIPLoader, and VAELoader (not CheckpointLoaderSimple).
-    Sampler: er_sde, Scheduler: simple.
-    """
-    nid = _make_node_id
-
-    n1  = nid()  # UNETLoader (diffusion model)
-    n2  = nid()  # CLIPLoader (text encoder)
-    n3  = nid()  # VAELoader
-    n4  = nid()  # CLIPTextEncode (positive)
-    n5  = nid()  # CLIPTextEncode (negative)
-    n6  = nid()  # EmptyLatentImage
-    n7  = nid()  # KSampler
-    n8  = nid()  # VAEDecode
-    n9  = nid()  # SaveImage
-
-    return {
-        n1: {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_ANIMA, "weight_dtype": "default"}},
-        n2: {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_ANIMA_TEXT_ENCODER, "type": "stable_diffusion"}},
-        n3: {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_ANIMA_VAE}},
-        n4: {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n2, 0]}},
-        n5: {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": [n2, 0]}},
-        n6: {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        n7: {"class_type": "KSampler", "inputs": {
-            "model": [n1, 0],
-            "positive": [n4, 0],
-            "negative": [n5, 0],
-            "latent_image": [n6, 0],
-            "seed": seed if seed is not None else 42,
-            "steps": steps,
-            "cfg": cfg,
-            "sampler_name": "er_sde",
-            "scheduler": "simple",
-            "denoise": 1.0,
-        }},
-        n8: {"class_type": "VAEDecode", "inputs": {"samples": [n7, 0], "vae": [n3, 0]}},
-        n9: {"class_type": "SaveImage", "inputs": {"images": [n8, 0], "filename_prefix": "mcp_anima"}},
-    }
-
-
-def build_outpaint_workflow(
-    prompt: str, image_filename: str, target_width: int, target_height: int,
-    seed: Optional[int] = None, steps: int = 6,
-) -> dict:
-    """Build an outpaint workflow on the installed Flux2 Klein chain.
-
-    The uploaded image is already padded with transparent edges by the tool;
-    SetLatentNoiseMask (fed from LoadImage's native MASK output, where white =
-    transparent) protects the original content exactly and only denoises the
-    new region. Uses the same UNET/CLIP/VAE pattern as build_txt2img_workflow
-    (Flux2KleinSectionedEncoder; Flux2 needs no FluxGuidance).
-    """
-    nid = _make_node_id
-    n1  = nid()  # LoadImage (outputs IMAGE:0, MASK:1)
-    n2  = nid()  # ImageScale (pad to target size)
-    n3  = nid()  # UNETLoader (Flux2 Klein)
-    n4  = nid()  # CLIPLoader (type: "flux2")
-    n5  = nid()  # VAELoader
-    n6  = nid()  # Flux2KleinSectionedEncoder
-    n7  = nid()  # VAEEncode
-    n8  = nid()  # BasicGuider
-    n9  = nid()  # RandomNoise
-    n10 = nid()  # BasicScheduler
-    n11 = nid()  # KSamplerSelect
-    n12 = nid()  # SetLatentNoiseMask
-    n13 = nid()  # SamplerCustomAdvanced
-    n14 = nid()  # VAEDecode
-    n15 = nid()  # SaveImage
-
-    parts = [p.strip() for p in prompt.split(",")]
-    front_text = parts[0] if parts else prompt
-    mid_text = ", ".join(parts[1:]) if len(parts) > 1 else ""
-    end_text = ""
-
-    return {
-        n1:  {"class_type": "LoadImage", "inputs": {"image": image_filename}},
-        n2:  {"class_type": "ImageScale", "inputs": {"image": [n1, 0], "width": target_width, "height": target_height, "upscale_method": "lanczos", "crop": "disabled"}},
-        n3:  {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL_FLUX2, "weight_dtype": "default"}},
-        n4:  {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL_FLUX2_TEXT_ENCODER, "type": "flux2"}},
-        n5:  {"class_type": "VAELoader", "inputs": {"vae_name": MODEL_FLUX2_VAE}},
-        n6:  {"class_type": "Flux2KleinSectionedEncoder", "inputs": {
-            "clip": [n4, 0],
-            "front_text": front_text,
-            "mid_text": mid_text,
-            "end_text": end_text,
-            "separator": "comma",
-        }},
-        n7:  {"class_type": "VAEEncode", "inputs": {"pixels": [n2, 0], "vae": [n5, 0]}},
-        n8:  {"class_type": "BasicGuider", "inputs": {"model": [n3, 0], "conditioning": [n6, 0]}},
-        n9:  {"class_type": "RandomNoise", "inputs": {"noise_seed": seed if seed is not None else 42}},
-        n10: {"class_type": "BasicScheduler", "inputs": {"model": [n3, 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
-        n11: {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        # LoadImage's native MASK output (index 1): white = transparent padding = region to generate
-        n12: {"class_type": "SetLatentNoiseMask", "inputs": {"samples": [n7, 0], "mask": [n1, 1]}},
-        n13: {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": [n9, 0], "guider": [n8, 0], "sampler": [n11, 0], "sigmas": [n10, 0], "latent_image": [n12, 0]}},
-        n14: {"class_type": "VAEDecode", "inputs": {"samples": [n13, 0], "vae": [n5, 0]}},
-        n15: {"class_type": "SaveImage", "inputs": {"images": [n14, 0], "filename_prefix": "mcp_outpaint"}},
-    }
 
 
 def build_upscale_workflow(
@@ -429,26 +250,33 @@ async def get_info(session_id: str = "default"):
 
 
 @app.tool("generate_image")
-async def generate_image(prompt: str, model: str = "flux2", width: int = 1024, height: int = 1024,
-                         steps: int = 6, cfg: float = 1.5, seed: Optional[int] = None, negative_prompt: str = "",
-                         session_id: str = "default"):
+async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"] = "flux2", width: int = 1024, height: int = 1024,
+                         steps: Optional[int] = None, cfg: Optional[float] = None, seed: Optional[int] = None, negative_prompt: str = "",
+                         session_id: str = "default", timeout: Optional[int] = None):
     """Generate an image from text. Automatically starts ComfyUI; no manual startup is required.
 
-    model: 'flux2' (photorealistic) or 'anima' (anime). Flux2 Klein requires 4-6 steps max.
+    Choose model='flux2' for fast generation (Klein 9B distilled, 4 steps/CFG 1),
+    'qwen21' for detail, typography or transparent output (custom 30 steps/CFG 3),
+    or 'anima' for anime/illustration (30 steps/CFG 4). Omit steps/cfg for these defaults.
+    get_editing_capabilities reports installed choices. For changes to an existing
+    image use edit_image instead. A missing model is reported, never silently substituted.
     """
     try:
-        # FLUX2 Klein 9B requires 4-6 steps max — cap to prevent failures
-        if model == "flux2" and steps > 6:
-            steps = 6
-        workflow = build_txt2img_workflow(prompt=prompt, negative_prompt=negative_prompt,
-                                          width=width, height=height, steps=steps, cfg=cfg, seed=seed, model=model)
-        result = await run_workflow(workflow)
+        if model not in ("flux2", "qwen21", "anima"):
+            raise ValueError("model must be flux2, qwen21 or anima")
+        await comfy.start_comfyui()
+        profile = model_profiles(await comfy.get_object_info(), "generation")[model]
+        if not profile["available"]:
+            raise ValueError(f"{model} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
+        workflow = build_generation_workflow(model, profile, prompt, negative_prompt,
+                                             width, height, steps, cfg, seed)
+        result = await run_workflow(workflow, timeout=timeout or (1800 if model == "qwen21" else None))
         if not result:
             return [TextContent(text="Generation failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
-        canvas = sessions.get_or_create(session_id)
-        if canvas.width != img.width or canvas.height != img.height:
-            canvas = sessions.create(session_id, img.width, img.height)
+        canvas = sessions.get(session_id)
+        if canvas is None or canvas.width != img.width or canvas.height != img.height:
+            canvas = sessions.create(session_id, img.width, img.height, (0, 0, 0, 0))
         idx = canvas.add_layer(name=f"Generated: {prompt[:30]}", image=img)
         return [TextContent(text=f"Generated image ({img.width}x{img.height}) as layer {idx}. Model: {model}")]
     except Exception as e:
@@ -834,29 +662,38 @@ async def clear_vram_tool():
 
 @app.tool("outpaint")
 async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256,
-                        steps: int = 6, seed: Optional[int] = None,
-                        session_id: str = "default"):
+                        steps: Optional[int] = None, seed: Optional[int] = None,
+                        session_id: str = "default", backend: Literal["flux2", "qwen21"] = "flux2", timeout: Optional[int] = None):
     """AI outpaint: extend the canvas in a direction and fill the new area. Automatically starts ComfyUI; no manual startup is required.
 
-    direction: left, right, top, bottom. Runs on the Flux2 chain; steps are capped at 6 (distilled model).
+    direction: left, right, top, bottom. backend: flux2 (fast Klein 9B, 4 steps)
+    or qwen21 (Qwen Image 2.1, custom 30 steps/CFG 3). Anima does not support instruction editing.
+    Omit steps for the selected model's default. Extends the active layer using
+    reference conditioning, then restores its original pixels exactly.
+    Qwen works at about 1 megapixel internally, then returns the requested canvas size.
     """
     try:
-        if steps > 6:
-            steps = 6
+        if backend not in ("flux2", "qwen21"):
+            raise ValueError("backend must be flux2 or qwen21; Anima supports generation only")
+        if amount <= 0:
+            raise ValueError("amount must be positive")
         canvas = sessions.get_or_create(session_id)
+        original_state = canvas.undo_stack[-1]
         layer = canvas.layers[canvas.active_layer_index]
         w, h = layer.image.size
-        directions = {
-            "left":    (w + amount, h, (-amount, 0)),
-            "right":   (w + amount, h, (0, 0)),
-            "top":     (w, h + amount, (0, 0)),
-            "bottom":  (w, h + amount, (0, 0)),
-        }
+        directions = {"left": (w + amount, h), "right": (w + amount, h),
+                      "top": (w, h + amount), "bottom": (w, h + amount)}
         if direction not in directions:
             return [TextContent(text=f"Invalid direction: {direction}. Use: left, right, top, bottom")]
-        target_w, target_h, paste_pos = directions[direction]
+        target_w, target_h = directions[direction]
+        await comfy.start_comfyui()
+        profile = model_profiles(await comfy.get_object_info(), "outpaint")[backend]
+        if not profile["available"]:
+            raise ValueError(f"{backend} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
+        steps = profile["default_steps"] if steps is None else steps
+        seed = secrets.randbits(63) if seed is None else seed
         # Create padded canvas
-        padded = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+        padded = Image.new("RGBA", (target_w, target_h), "white" if backend == "qwen21" else (0, 0, 0, 0))
         if direction == "left":
             padded.paste(layer.image, (amount, 0))
         elif direction == "right":
@@ -867,16 +704,27 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
             padded.paste(layer.image, (0, 0))
         # Upload padded image
         pad_name = f"outpaint_{uuid.uuid4().hex[:8]}.png"
-        buf = io.BytesIO()
-        padded.save(buf, format="PNG")
-        await comfy.upload_image(buf.getvalue(), pad_name)
-        workflow = build_outpaint_workflow(prompt=prompt, image_filename=pad_name,
-                                           target_width=target_w, target_height=target_h,
-                                           seed=seed, steps=steps)
-        result = await run_workflow(workflow)
+        working = prepare_image(padded, max(padded.size), 32 if backend == "qwen21" else 16)
+        filename = await comfy.upload_image(png_bytes(working), pad_name)
+        if backend == "qwen21":
+            instruction = (f"Remove the white strip on the {direction} of <image1> and replace it with "
+                           f"a seamless continuation of the scene: {prompt}. "
+                           "Preserve the original image's placement, scale, content and style.")
+        else:
+            instruction = (f"Extend the scene in image 1 into the transparent {direction} margin. "
+                           f"Fill that margin with opaque image content: {prompt}. "
+                           "Keep the original image's placement, scale, content and style unchanged. "
+                           "Continue the scene seamlessly across the boundary.")
+        workflow = build_edit_workflow(backend, profile, instruction, [filename],
+                                       *working.size, steps, seed, resolution=1024 if backend == "qwen21" else 0)
+        result = await run_workflow(workflow, timeout=timeout or (1800 if backend == "qwen21" else None))
         if not result:
             return [TextContent(text="Outpaint failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
+        if img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        if sessions.get(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
+            raise RuntimeError("Canvas changed during generation; outpaint result was not applied")
         # Extend every other layer (and its mask) to the new canvas size so the
         # composite stays consistent; their new area is transparent.
         if direction == "left":
@@ -885,6 +733,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
             offset = (0, amount)
         else:
             offset = (0, 0)
+        img.paste(layer.image, offset)
         for existing in canvas.layers:
             if existing is layer:
                 continue
@@ -897,14 +746,14 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
                 extended_mask.paste(existing.mask, offset)
                 existing.mask = extended_mask
         if layer.mask is not None and layer.mask.size != (target_w, target_h):
-            extended_mask = Image.new("L", (target_w, target_h), 0)
+            extended_mask = Image.new("L", (target_w, target_h), 255)
             extended_mask.paste(layer.mask, offset)
             layer.mask = extended_mask
         layer.image = img
         canvas.width = target_w
         canvas.height = target_h
         canvas._save_state()
-        return [TextContent(text=f"Outpaint {direction} complete ({target_w}x{target_h}).")]
+        return [TextContent(text=f"Outpaint {direction} complete ({target_w}x{target_h}). Model: {backend}; steps: {steps}; seed: {seed}.")]
     except Exception as e:
         return [TextContent(text=f"Outpaint error: {str(e)}")]
 
@@ -1122,11 +971,12 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     Automatically starts ComfyUI when needed; no manual startup is required.
 
     jobs: list of job objects, each with 'prompt' (required) and optional
-    'model' ('flux2' photorealistic / 'anima' anime), 'width', 'height', 'steps', 'cfg',
+    'model' ('flux2' fast / 'qwen21' detail, typography, alpha / 'anima' anime), 'width', 'height', 'steps', 'cfg',
     'seed', 'negative_prompt', and 'filename' (output basename without extension).
-    Flux2 jobs are capped at 6 steps (distilled model - quality degrades after ~6).
+    Models may differ per job. Omitted steps/cfg use model defaults:
+    flux2=4/1, qwen21=30/3 (custom preset), anima=30/4. Explicit values are preserved.
     All jobs are submitted up front so the batch runs unattended (GPU batching rule:
-    for long batches, get user approval to stop the qwen38 LLM container first).
+    queue in a detached host process before asking approval to stop the qwen38 LLM container).
     export_dir defaults to <server>/batch_output; export_format: PNG or JPG.
     timeout: seconds for the whole batch wait. Returns a JSON summary with per-job
     status, output file path, and seed.
@@ -1134,34 +984,45 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     try:
         if not jobs:
             return [TextContent(text="jobs must contain at least one job")]
-        workflows = []
-        seeds = []
         for i, job in enumerate(jobs):
             if not isinstance(job, dict) or not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job {i} is invalid: each job needs a non-empty 'prompt' string")]
             model = job.get("model", "flux2")
-            if model not in ("flux2", "anima"):
-                return [TextContent(text=f"Job {i}: 'model' must be 'flux2' or 'anima'")]
-            steps = int(job.get("steps", 6 if model == "flux2" else 20))
-            if model == "flux2" and steps > 6:
-                steps = 6
+            if model not in ("flux2", "qwen21", "anima"):
+                return [TextContent(text=f"Job {i}: 'model' must be 'flux2', 'qwen21' or 'anima'")]
+        await comfy.start_comfyui()
+        profiles = model_profiles(await comfy.get_object_info(), "generation")
+        workflows = []
+        seeds = []
+        settings = []
+        for i, job in enumerate(jobs):
+            model = job.get("model", "flux2")
+            profile = profiles[model]
+            if not profile["available"]:
+                raise ValueError(f"Job {i}: {model} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
+            steps = profile["default_steps"] if job.get("steps") is None else int(job["steps"])
+            cfg = profile["default_cfg"] if job.get("cfg") is None else float(job["cfg"])
             seed = job.get("seed")
             seed = int(seed) if seed is not None else secrets.randbits(63)
-            workflows.append(build_txt2img_workflow(
+            workflows.append(build_generation_workflow(model, profile,
                 prompt=str(job["prompt"]), negative_prompt=str(job.get("negative_prompt", "")),
                 width=int(job.get("width", DEFAULT_WIDTH)), height=int(job.get("height", DEFAULT_HEIGHT)),
-                steps=steps, cfg=float(job.get("cfg", DEFAULT_CFG)), seed=seed, model=model))
+                steps=steps, cfg=cfg, seed=seed))
             seeds.append(seed)
+            settings.append({"steps": steps, "cfg": cfg, "checkpoint": profile["model"]})
+        if timeout is None:
+            timeout = sum(1800 if job.get("model") == "qwen21" else WEBSOCKET_TIMEOUT for job in jobs)
         batch = await comfy.batch_run_workflows(workflows, timeout=timeout)
         batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
         out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         fmt = export_format.upper()
+        ext = "jpg" if fmt in ("JPG", "JPEG") else fmt.lower()
         results = []
         for i, entry in enumerate(batch):
             job = jobs[i]
             record = {"index": i, "prompt": job.get("prompt"), "model": job.get("model", "flux2"),
-                      "seed": seeds[i], "status": "ok", "file": None}
+                      "seed": seeds[i], "status": "ok", "file": None, **settings[i]}
             history = entry.get("history")
             data = history.get("_cached_file_bytes") if history else None
             if data is None and history:
@@ -1178,7 +1039,6 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
                 continue
             base = str(job.get("filename") or f"batch_{i:03d}")
             base = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)[:60]
-            ext = "jpg" if fmt in ("JPG", "JPEG") else fmt.lower()
             path = out_dir / f"{base}.{ext}"
             with Image.open(io.BytesIO(data)) as img:
                 if fmt in ("JPG", "JPEG"):

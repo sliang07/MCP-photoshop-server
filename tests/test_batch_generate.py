@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from PIL import Image
+from test_editing import node_info
 
 
 def png_bytes(size=(16, 16), color=(200, 30, 60)):
@@ -21,6 +22,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.client = AsyncMock()
+        self.client.get_object_info.return_value = node_info()
         self.client.batch_run_workflows = AsyncMock(return_value=[
             {"history": {"_cached_file_bytes": png_bytes()}, "error": None},
             {"history": None, "error": "execution_error: out of VRAM"},
@@ -60,8 +62,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("EmptyFlux2LatentImage", by_type)
         self.assertEqual(by_type["EmptyFlux2LatentImage"]["inputs"]["width"], 16)
         self.assertEqual(by_type["EmptyFlux2LatentImage"]["inputs"]["height"], 16)
-        # Distilled flux2 is capped at 6 steps even when asked for more.
-        self.assertEqual(by_type["BasicScheduler"]["inputs"]["steps"], 6)
+        self.assertEqual(by_type["Flux2Scheduler"]["inputs"]["steps"], 30)
 
     async def test_rejects_invalid_jobs_before_submission(self):
         out = await self.server.batch_generate_tool(jobs=[{"prompt": "  "}], export_dir=self.tmp.name)
@@ -70,7 +71,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_unknown_model(self):
         out = await self.server.batch_generate_tool(jobs=[{"prompt": "x", "model": "sd15"}], export_dir=self.tmp.name)
-        self.assertIn("must be 'flux2' or 'anima'", out[0].text)
+        self.assertIn("must be 'flux2', 'qwen21' or 'anima'", out[0].text)
         self.client.batch_run_workflows.assert_not_awaited()
 
     async def test_empty_job_list_rejected(self):

@@ -31,16 +31,16 @@ class Registry:
 def node_info():
     data = {}
     models = {
-        "UNETLoader": ("unet_name", ["flux-2-klein-9b.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors"]),
-        "CLIPLoader": ("clip_name", ["qwen_3_8b_fp8mixed.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors"]),
-        "VAELoader": ("vae_name", ["flux2-vae.safetensors", "qwen_image_2.1_vae_bf16.safetensors"]),
+        "UNETLoader": ("unet_name", ["flux-2-klein-9b.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors", "anima-aesthetic-v1.1.safetensors"]),
+        "CLIPLoader": ("clip_name", ["qwen_3_8b_fp8mixed.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors", "qwen_3_06b_base.safetensors"]),
+        "VAELoader": ("vae_name", ["flux2-vae.safetensors", "qwen_image_2.1_vae_bf16.safetensors", "qwen_image_vae.safetensors"]),
     }
     for loader, (field, names) in models.items():
         data[loader] = {"input": {"required": {field: [names]}}}
     for name in ["LoadImage", "CLIPTextEncode", "VAEEncode", "ReferenceLatent", "BasicGuider",
                  "RandomNoise", "Flux2Scheduler", "KSamplerSelect", "EmptyFlux2LatentImage",
                  "SamplerCustomAdvanced", "VAEDecode", "SaveImage", "TextEncodeQwenImage21",
-                 "QwenImage21Cache", "JoinImageWithAlpha", "KSampler"]:
+                 "QwenImage21Cache", "JoinImageWithAlpha", "KSampler", "EmptyLatentImage", "CFGGuider"]:
         data[name] = {}
     return data
 
@@ -181,12 +181,12 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         profile = edit_profiles(info)["qwen21"]
         self.assertTrue(profile["available"], profile["missing"])
         self.assertEqual(profile["max_additional_references"], 15)
-        self.assertEqual(profile["default_steps"], 25)
-        graph = build_edit_workflow("qwen21", profile, "edit", ["source.png", "ref.png"], 512, 512, 25, 0)
+        self.assertEqual(profile["default_steps"], 30)
+        graph = build_edit_workflow("qwen21", profile, "edit", ["source.png", "ref.png"], 512, 512, 30, 0)
         classes = [n["class_type"] for n in graph.values()]
         self.assertEqual(classes.count("QwenImage21Cache"), 1)
         # Official 2.1 path: no VAEEncode (the encoder emits the latent),
-        # no ModelSamplingAuraFlow/CFGNorm (cfg 1.0 flow-matching).
+        # no legacy ModelSamplingAuraFlow/CFGNorm nodes.
         self.assertNotIn("VAEEncode", classes)
         self.assertNotIn("ModelSamplingAuraFlow", classes)
         self.assertNotIn("CFGNorm", classes)
@@ -204,7 +204,7 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sampler["inputs"]["positive"], [key, 0])
         self.assertEqual(sampler["inputs"]["negative"], [key, 1])
         self.assertEqual(sampler["inputs"]["latent_image"], [key, 2])
-        self.assertEqual(sampler["inputs"]["cfg"], 1.0)
+        self.assertEqual(sampler["inputs"]["cfg"], 3.0)
         self.assertEqual(sampler["inputs"]["sampler_name"], "euler")
         self.assertEqual(sampler["inputs"]["scheduler"], "simple")
         self.assertEqual(sampler["inputs"]["denoise"], 1.0)
@@ -229,7 +229,8 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         result = await self.registry.tools["edit_image"]("change", max_side=2048)
         report = json.loads(result[0].text)
         self.assertEqual(report["backend"], "qwen21")
-        self.assertEqual(report["steps"], 25)
+        self.assertEqual(report["steps"], 30)
+        self.assertEqual(report["cfg"], 3.0)
         self.assertEqual(self.run.call_args.kwargs["timeout"], 1800)
 
     async def test_mask_is_last_reference_and_user_references_keep_order(self):

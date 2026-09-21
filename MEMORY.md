@@ -1,8 +1,47 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-09-18
-> Status: 43 tools — all confirmed working (image-only, no video); qwen2511 edit backend + semantic_select (SAM 3 text/point/box) deployed & live-verified; **2026-09-18**: alpha-aware blend modes + health-probe validation fixed and live-verified after MCP server restart; multi-session support (`session_id` on all canvas tools + `list_sessions`/`close_session`), `batch_generate` (whole-batch WebSocket queue, per-job disk export), and ControlNet/Redux workflow repair (Flux2 pixel-dim latents, current node schemas, live capability pre-checks) shipped — 69 tests green
+> Last updated: 2026-09-20
+> Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, 25 steps, CFG 1, Euler/simple). `qwen` and `qwen2511` are retired. FLUX.2 remains an explicit fast option. Earlier Qwen 2511 entries below are historical, not current setup instructions.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-09-20 Automatic startup checks
+
+- ComfyUI-dependent tools start ComfyUI automatically. `get_editing_capabilities` and `get_comfyui_status` now do so by default too; previously they returned offline errors that encouraged clients to require manual startup. Both accept `start_if_needed=False` for a passive probe and explain that dependent tools can start the backend.
+- Automatic startup is stated in individual tool descriptions, because Open WebUI may ignore MCP initialize instructions. Startup cancels a pending idle timer before health checks. Child stdout/stderr no longer inherit the MCP protocol stream.
+- Verified from fully stopped ComfyUI using the real MCP stdio transport: automatic startup in 45.8 seconds, Qwen 2.1 available, status and all 38 tool definitions readable, model-free workflow output retrieved. No LLM container was stopped and no generation model was loaded. Evidence: `verification/autostart_stdio_status.json`; current regression suite: 81 tests passed.
+- The already-running HTTP server on port 8000 still has the previous tool definitions. Save open canvases, restart the Photoshop server processes, then refresh/reconnect the client tools to activate the changes.
+
+## 2026-09-20 Tool Cleanup (dead/legacy removal)
+
+- Removed 5 tools: `img2img` + `character_transform` (legacy Flux2 denoise transforms; `edit_image` is the instruction-edit path), `inpaint` (Flux Kontext chain — its UNET/clip_l/t5xxl files are no longer installed; `edit_image` with `mask_path`/`region` is the masked-edit path), `controlnet_generate` (`models/controlnet` empty), `style_transfer` (`models/style_models` + `models/clip_vision` empty — `edit_image` with `reference_paths` is the style/identity path). Tool count 43 → 38.
+- `outpaint` was dead on the same missing Flux.1 chain and was rewritten onto the installed Flux2 Klein chain: `LoadImage` → `ImageScale` → `UNETLoader`/`CLIPLoader`(flux2)/`VAELoader` + `Flux2KleinSectionedEncoder` → `VAEEncode` → `SetLatentNoiseMask` (LoadImage MASK output: transparent padding = generate, original content = protected). `steps` default 30 → 6 (Flux2 distilled cap), `guidance` param dropped.
+- Fixed a latent `outpaint` bug the live test exposed: only the active layer was resized, leaving sibling layers (and masks) at the old size so `composite()` crashed with "images do not match". `outpaint_tool` now extends every layer (and every mask) to the new canvas size, transparent where new. 3 regression tests in `tests/test_outpaint.py`.
+- Live-verified 2026-09-20 end-to-end on ComfyUI 0.33.0 (`verification/_live_outpaint_flux2_test.py` → `verification/outpaint_flux2_live.png`): 512x512 canvas outpainted right by 256px → 768x512, original content preserved exactly, new region filled. Fill content was semantically poor because the `qwen38` LLM container was holding VRAM (GPU contention — see §11); the chain/graph itself is proven.
+- Dead code removed: `build_img2img_kontext_workflow`, `build_inpaint_workflow`, `build_controlnet_workflow`, `build_style_transfer_workflow` (server.py); `controlnet_capabilities`, `style_transfer_capabilities` + their capability-report sections (editing.py); `MODEL_KONTEXT` (config.py); `tests/test_custom_nodes.py` (tested only the removed tools).
+- Docs synced: README (feature list, model list, examples, tool counts) and this file's §5/§7/§9/§10.
+
+## 2026-09-20 Open WebUI integration (streamable-HTTP)
+
+- The server now serves two MCP clients: Cline (stdio, unchanged — `app.run(transport=os.getenv("MCP_TRANSPORT", "stdio"))`) and Open WebUI (streamable-HTTP on `127.0.0.1:8000`, path `/mcp`), launched by `run_openwebui.bat` (sets `MCP_TRANSPORT=streamable-http`, logs to `mcp_http.log`).
+- The `FastMCP` constructor now passes explicit `TransportSecuritySettings` allowing `host.docker.internal:*` — the SDK's auto DNS-rebinding protection only allows 127.0.0.1/localhost/::1 and would answer 421 to the Docker container's Host header.
+- `ComfyUIClient._do_idle_kill` is now guarded by `_idle_kill_guarded()`: it checks ComfyUI `/queue` (queue_running/queue_pending) before killing and defers by `COMFYUI_IDLE_TIMEOUT` while any job is active — one client's idle timer can no longer kill ComfyUI under another client's running job.
+- Open WebUI 0.11.3 connects under Settings → **Admin** → Integrations → External Tool Servers → Type "MCP (Streamable HTTP)", URL `http://host.docker.internal:8000/mcp`, Auth None. The personal (user) Integrations page only accepts OpenAPI servers — MCP is admin-only.
+- OWUI 0.11.3's MCP client calls `initialize()` but DISCARDS the returned instructions — the GPU_BATCH_RULE text does not reach the OWUI model. Compensate in the OWUI model's system prompt: (1) use a distinct `session_id` per chat, (2) a summary of the GPU batching rule. Cline keeps receiving the instructions natively.
+- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (falls back to `AIOHTTP_CLIENT_TIMEOUT` = 300s). Long Qwen edits (server default up to 1800s) fail in OWUI unless the container is recreated with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800` (see `verification/recreate_open_webui.bat`).
+- Verified 2026-09-20: full handshake from inside the container (43 tools + canvas round-trip via `verification/_probe_mcp.py`, run with `docker cp` + `docker exec`), and flux2 generation through the HTTP endpoint (`verification/_probe_gpu.py`).
+- Known gap: OWUI chat uploads land in OWUI storage, not Windows paths — `open_image` cannot see them directly. Use `export` to a shared folder, then `open_image` with that path, until attachment mapping is added.
+- **2026-09-20 (session 3) — Cline stdio + ComfyUI live functional verification.** Confirmed the stdio path is intact after the transport work: canvas round-trip (`new_canvas` 512×512 → `add_text` "Cline stdio OK" → `export` → `verification/clined_stdio_check.png` → `preview_canvas`, text legible in preview). With ComfyUI stopped, `generate_image` (flux2, 512×512, 4 steps) auto-started ComfyUI from the `.env`-configured portable install and completed; `get_comfyui_status` then reported connected (ComfyUI 0.37.0, RTX 5090 32GB, torch 2.13.0+cu130); `img2img` (strength 0.35) exercised the upload→workflow path. No new failure modes; no `MEMORY.md` config changes needed.
+- **2026-09-20 (session 2) — "stuck on OpenAPI" root cause + fix.** OWUI 0.11.3's Edit-Connection dialog renders Type as a read-only label, so a connection created as OpenAPI can never be switched to MCP in the UI. Worse: saving an OpenAPI connection first fetches the OpenAPI spec from the URL; our endpoint answers 406 to `GET /mcp`, so the save is aborted and **no connection is persisted** (the error toast is all the user sees; the dialog just keeps the typed values). In 0.11.3 the config no longer lives in `config.json` — it's in the SQLite DB (`/app/backend/data/webui.db`, table `config`, row `key='tool_server.connections'`, value = JSON list). MCP runtime path: `utils/middleware.py:connect_mcp_server` looks up the connection by `info.id`, connects with the top-level `url` field (no path join for MCP), `auth_type: none` → no headers. Fix applied: stop container → `verification/_fix_owui_mcp_conn.py` (run in a throwaway container with `-v open-webui:/data`) upserts the entry `{url: http://host.docker.internal:8000/mcp, path: "", type: "mcp", auth_type: "none", config: {enable: true}, info: {id: "mcp-photoshop", name: "Mcp Photoshop", ...}}` → start container. Pre-edit DB backup: `verification/webui.db.bak` (+ `-wal`/`-shm`). Verified E2E with OWUI's own `MCPClient` from inside the container (`verification/_owui_mcp_e2e.py`, needs `WEBUI_SECRET_KEY` env just for the `open_webui.env` import): 43 tools listed. UI now shows the connection as Type **MCP** (still edit-locked, but correct).
+
+## 2026-09-20 editing migration
+
+- Installed 2.1 stack: `qwen_image_2.1_int8_convrot.safetensors`, `qwen3vl_8b_int8_convrot.safetensors`, `qwen_image_2.1_vae_bf16.safetensors`. Use the native encoder's positive/negative/latent outputs and cache patch; no old Lightning adapters, AuraFlow shift, or CFGNorm.
+- Masks are now the last reference image with an explicit white-to-edit instruction, followed by exact compositing outside the mask. Reference numbering is stable. RGBA survives preprocessing, ComfyUI loading, and application. Edits create a replacement layer and hide originals in one undo step. The canvas compositor now honors the bottom layer's visibility, opacity, and mask.
+- Open an image first and keep the same session ID. Unknown sessions fail clearly. Inspect the returned preview and undo a bad attempt before retrying. Working dimensions match Qwen's 32-pixel grid. `max_side=2048` is accepted; default remains 1024. Qwen waits up to 1800 seconds by default.
+- Migrated all three saved Qwen 2511 character-sheet workflows in ComfyUI; backups are in `verification/qwen2511_workflows_before_migration.zip`. The shared old VAE stays on the ANIMA branch only.
+- Verification: 79 tests pass; all four UI graphs pass ComfyUI prompt validation. Actual MCP stdio → ComfyUI → GPU tests: a masked/reference circle recolor completed in 28.3 seconds; an elf's silver-to-blue hair edit completed in 9.9 seconds. Both changed zero pixels outside the mask. Evidence: `verification/migration_live_status.json`, `migration_character_status.json`, `workflow_validation.json`.
+- Added `user/default/workflows/qwen_image_2_1_edit.json` as a simple standalone editor. Old model files are retained on disk but no active saved user workflow or MCP editing backend uses Qwen 2511.
+- GPU instructions now require checking actual contention. A normal edit on an available GPU needs no container shutdown. Stopping `qwen38` still requires explicit approval because it may serve the client LLM.
 
 ---
 
@@ -218,12 +257,8 @@
 |---------|-------------|-----------|
 | `build_txt2img_workflow()` | Text-to-image for Flux2 Klein 9B (dispatches to `build_anima_workflow()` when model="anima") | **UNETLoader**, **CLIPLoader** (type: "flux2"), **VAELoader**, **Flux2KleinSectionedEncoder**, **EmptyFlux2LatentImage**, **BasicGuider**, **RandomNoise**, **BasicScheduler**, **KSamplerSelect**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
 | `build_anima_workflow()` | Text-to-image for ANIMA (anime) | **UNETLoader**, **CLIPLoader** (stable_diffusion), **VAELoader**, **CLIPTextEncode** (positive + negative), **EmptyLatentImage** (pixel dims), **KSampler** (er_sde), **VAEDecode**, **SaveImage** |
-| `build_img2img_kontext_workflow()` | AI instructed editing | **LoadImage**, **UNETLoader**, **CLIPLoader**, **VAELoader**, **VAEEncode**, **Flux2KleinSectionedEncoder**, **BasicGuider**, **RandomNoise**, **BasicScheduler**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
-| `build_inpaint_workflow()` | Masked region inpainting | **LoadImage** (base+mask), **ImageToMask**, **UNETLoader** (Kontext), **DualCLIPLoader**, **VAELoader** (ae.safetensors), **VAEEncode**, **CLIPTextEncode**, **FluxGuidance**, **SetLatentNoiseMask**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
-| `build_outpaint_workflow()` | Canvas extension + inpaint | Same Flux.1 chain as inpaint, uses LoadImage native MASK output |
+| `build_outpaint_workflow()` | Canvas extension + masked Flux2 generation | **LoadImage** (IMAGE + MASK), **ImageScale**, **UNETLoader** (Flux2), **CLIPLoader** (flux2), **VAELoader**, **Flux2KleinSectionedEncoder**, **VAEEncode**, **BasicGuider**, **SetLatentNoiseMask**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
 | `build_upscale_workflow()` | AI upscaling | **LoadImage**, **UpscaleModelLoader**, **ImageUpscaleWithModel**, **SaveImage** |
-| `build_controlnet_workflow()` | ControlNet-guided generation | **LoadImage**, **UNETLoader**, **CLIPLoader**, **VAELoader**, **ControlNetLoader**, **ControlNetApply**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
-| `build_style_transfer_workflow()` | Style transfer via Redux | **LoadImage** (content+style), **CLIPVisionEncode**, **StyleModelLoader**, **StyleModelApply**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** |
 
 ---
 
@@ -254,25 +289,19 @@
 | `anima-aesthetic-v1.1.safetensors` | diffusion_models | Text-to-image (anime — ANIMA) |
 | `qwen_3_06b_base.safetensors` | text_encoders | ANIMA text encoder |
 | `qwen_image_vae.safetensors` | vae | ANIMA VAE |
-| `flux1-dev-kontext_fp8_scaled.safetensors` | diffusion_models | img2img, inpaint, outpaint (Flux Kontext) |
 
 ### Instruction Editing ("edit_image" backends)
 | Model | Directory | Purpose |
 |-------|-----------|---------|
-| `Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors` | `diffusion_models/qwen-image-edit/` | `qwen2511` backend — Qwen Image Edit 2511 FP8, community 1038lab e4m3fn build (SHA-256 verified 2026-09-17, ~20.5 GB) |
-| `qwen_2.5_vl_7b_fp8_scaled.safetensors` | text_encoders | Qwen 2511 text encoder |
-| `qwen_image_vae.safetensors` | vae | Qwen 2511 VAE (same file as ANIMA) |
+| `qwen_image_2.1_int8_convrot.safetensors` | diffusion_models | `qwen21` backend UNET (Qwen Image 2.1) |
+| `qwen3vl_8b_int8_convrot.safetensors` | text_encoders | Qwen 2.1 text encoder |
+| `qwen_image_2.1_vae_bf16.safetensors` | vae | Qwen 2.1 VAE |
 
-### Upscaling & ControlNet
+### Upscaling
 | Model | Directory | Purpose |
 |-------|-----------|---------|
 | `RealESRGAN_x4plus_anime_6B.pth` | upscale_models | Anime upscaling |
 | `4xFaceUpDAT.pth` | upscale_models | Face upscaling |
-| `control_v11f1p_sd15_depth_fp16.safetensors` | controlnet | Depth-guided ControlNet |
-| `control_v11p_sd15_canny_fp16.safetensors` | controlnet | Canny-guided ControlNet |
-| `control_v11p_sd15_openpose_fp16.safetensors` | controlnet | Pose-guided ControlNet |
-| `flux1-redux-dev.safetensors` | style_models | Style transfer (Redux) |
-| `sigclip_vision_patch14_384.safetensors` (or `clip_vision.safetensors`) | clip_vision | CLIPVision encoder required by the style-transfer workflow |
 
 ### Detection / Segmentation
 | Model | Directory | Purpose |
@@ -315,7 +344,7 @@ python server.py
 
 ## 9. Testing Status
 
-### Verified Working (43 tools)
+### Verified Working (38 tools)
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
 - Color Adjustments: `adjust`, `levels`, `curves` ✅
@@ -325,10 +354,10 @@ python server.py
 - Selections: `select_rect`, `select_ellipse`, `clear_mask` ✅
 - History: `undo`, `redo` ✅
 - System: `get_comfyui_status`, `clear_vram` ✅
-- AI Generation: `generate_image` (Flux2 + ANIMA), `img2img`, `character_transform` ✅
-- AI Editing: `inpaint`, `outpaint` ✅
-- Instruction Editing: `edit_image` (flux2 + qwen2511 live-verified 2026-09-17), `get_editing_capabilities`, `preview_canvas` ✅
-- AI-Guided: `controlnet_generate`, `style_transfer` — workflows repaired 2026-09-18; live capability pre-checks verified (fail fast with actionable errors); end-to-end generation on this host pending model installs (no ControlNet / Redux / CLIPVision files present — see §10)
+- AI Generation: `generate_image` (Flux2 + ANIMA) ✅
+- AI Editing: `outpaint` (Flux2 chain, rewritten + live-verified 2026-09-20) ✅
+- Instruction Editing: `edit_image` (qwen21 + flux2), `get_editing_capabilities`, `preview_canvas` ✅
+- Removed 2026-09-20 (models deleted from ComfyUI / superseded): `img2img`, `character_transform`, `inpaint`, `controlnet_generate`, `style_transfer` — see "2026-09-20 Tool Cleanup"
 - Upscale: `upscale` (anime + face + x4plus general-photo model, live MCP test 2026-09-17) ✅
 - Semantic Selection: `semantic_select` (SAM 3 text/point/box, live CPU MCP test 2026-09-17) ✅
 - Sessions & Batch: `list_sessions`, `close_session`, `batch_generate` + `session_id` on all canvas tools (unit-verified 2026-09-18, 23 new tests; live batch run in `verification/_live_sessions_batch_nodes_test.py`) ✅
@@ -346,7 +375,7 @@ python server.py
 - Undo stores full snapshots (memory-intensive)
 - No lasso/freehand selection
 - No brush/paint tools
-- `controlnet_generate` / `style_transfer` have no usable models on this host: `models/controlnet`, `models/style_models`, and `models/clip_vision` hold only 0-byte placeholder files (verified 2026-09-18). Both tools now fail fast with actionable pre-check errors (previously opaque ComfyUI input errors); a Flux2-compatible ControlNet plus `flux1-redux-dev.safetensors` + a CLIPVision model would enable end-to-end runs. SD1.5 ControlNets do not fit the Flux2 UNET
+- ControlNet/Redux style tools were removed 2026-09-20 (`models/controlnet`, `models/style_models`, `models/clip_vision` hold only placeholder files). Style/identity/reference guidance is covered by `edit_image` `reference_paths`; a Flux2-compatible ControlNet could re-introduce guided generation if ever needed
 - Running ComfyUI without auto-kill causes major OOM on shared GPU (32GB with vLLM)
 
 ---

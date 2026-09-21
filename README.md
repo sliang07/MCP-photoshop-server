@@ -7,13 +7,15 @@ A local MCP (Model Context Protocol) server that combines **Photoshop-style imag
 ## Instruction editing upgrade
 
 - `preview_canvas` returns an image the assistant can inspect.
-- `get_editing_capabilities` reports live model/node availability.
-- `edit_image` adds instruction and reference-guided edits through native FLUX.2 or Qwen workflows, independent edit masks, protected outside pixels, previews, and undoable layers.
+- `get_editing_capabilities` starts ComfyUI if needed and reports live model/node availability without loading generation models.
+- `edit_image` defaults to Qwen Image 2.1 with reference guidance, model-visible edit masks, protected outside pixels, RGBA previews, and undoable replacement layers. Original layers remain hidden and can be restored with undo.
 - `upscale` now honors its size factor and preserves layer/mask alignment and transparency.
 
-`img2img` is a legacy FLUX.2 denoising transform, despite its old Kontext naming. The ControlNet/Redux style-transfer workflows were repaired 2026-09-18 (Flux2 pixel-dimension latents, current node input schemas, live model pre-checks); `edit_image` references remain the primary path for reference style/identity guidance.
+The legacy Flux.1-era tools (`img2img`, `character_transform`, `inpaint`, `controlnet_generate`, `style_transfer`) were removed 2026-09-20 — their models (Flux Kontext, ControlNet, Redux/CLIPVision) are no longer installed. Masked fills, restyling, and style/identity guidance all go through `edit_image` (`region`/`mask_path` for local edits, `reference_paths` for style/identity).
 
 Reconnect the MCP server after saving any in-memory work to load the new tools.
+
+ComfyUI does not need to be running beforehand. Call the requested generation/editing tool directly; it starts ComfyUI and waits for readiness. `get_comfyui_status` and `get_editing_capabilities` also start it by default. Pass `start_if_needed=False` only for a passive check. A stopped backend is normal with the five-second idle shutdown; it does not mean the tools are unavailable. Startup messages stay out of the MCP protocol stream.
 
 ## Features
 
@@ -25,19 +27,12 @@ Reconnect the MCP server after saving any in-memory work to load the new tools.
 
 ### AI Image Generation & Editing
 - `generate_image` — Text-to-image via Flux2 (photorealistic) or ANIMA (anime)
-- `img2img` — Legacy FLUX.2 denoising transform; prefer `edit_image` for instructions
-- `character_transform` — Legacy pose/expression denoising transform; use `edit_image` references for identity guidance
-- `inpaint` — AI fill masked region (requires mask from select_rect/select_ellipse)
-- `outpaint` — AI extend canvas in a direction (left, right, top, bottom)
+- `outpaint` — AI extend canvas in a direction (left, right, top, bottom), Flux2 chain
 
 ### Instruction Editing
-- `edit_image` — Instruction and reference-guided editing: FLUX.2 (fast, ~4 steps) or Qwen Image Edit 2511 FP8 ("qwen2511", ~40 steps); up to 2 extra references, optional white-to-edit mask, new undoable layer
+- `edit_image` — Qwen Image 2.1 (`qwen21`, default, 25 steps) or FLUX.2 (`flux2`, fast, 4 steps). Qwen 2511 and the original Qwen backend are retired. The canvas is `<image1>`; references follow in order. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. The Qwen timeout defaults to 1800 seconds.
 - `get_editing_capabilities` — Live ComfyUI model/node availability for every editing backend (notes also carry the GPU batching rule)
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
-
-### AI-Guided Generation
-- `controlnet_generate` — Generate image guided by current canvas (depth/canny/pose); live model pre-check fails fast with an actionable error
-- `style_transfer` — Generate image with style of a reference image (Redux StyleModel); live model pre-check fails fast with an actionable error
 
 ### Sessions & Batch (multi-document)
 - Every canvas tool accepts an optional `session_id` (default `"default"`), so multiple documents can be edited independently in one server process
@@ -94,21 +89,15 @@ Reconnect the MCP server after saving any in-memory work to load the new tools.
   - `qwen_3_06b_base.safetensors` (text_encoders)
   - `qwen_image_vae.safetensors` (vae)
 
-   **Flux Kontext (img2img, inpaint, outpaint):**
-   - `flux1-dev-kontext_fp8_scaled.safetensors` (diffusion_models)
+  **Qwen Image 2.1 (default instruction editor):**
+  - `qwen_image_2.1_int8_convrot.safetensors` (diffusion_models)
+  - `qwen3vl_8b_int8_convrot.safetensors` (text_encoders)
+  - `qwen_image_2.1_vae_bf16.safetensors` (vae)
+  - Requires native `TextEncodeQwenImage21`, `QwenImage21Cache`, and `JoinImageWithAlpha` nodes. The old Qwen VAE remains necessary for ANIMA; Qwen 2511 models and Lightning adapters are not used by the editor.
 
    **Upscaling:**
    - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
    - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
-
-   **ControlNet** (legacy — these SD1.5 models do not fit the Flux2 UNET; `controlnet_generate` pre-validates installed models and reports what is missing):
-   - `control_v11f1p_sd15_depth_fp16.safetensors` (controlnet) — Depth guidance
-   - `control_v11p_sd15_canny_fp16.safetensors` (controlnet) — Canny guidance
-   - `control_v11p_sd15_openpose_fp16.safetensors` (controlnet) — Pose guidance
-
-   **Style Transfer:**
-   - `flux1-redux-dev.safetensors` (style_models) — Redux style transfer (Flux.1-based; best-effort on the Flux2 UNET)
-   - `sigclip_vision_patch14_384.safetensors` or `clip_vision.safetensors` (clip_vision) — required by `CLIPVisionEncode`
 
 ### Install Dependencies
 ```bash
@@ -160,15 +149,15 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 ```
 mcp-photoshop-server/
-├── server.py           # MCP server + 43 tool registrations (canvas tools accept session_id; FastMCP initialize instructions carry the GPU batching rule)
-◜─── editing.py          # Instruction editing backends (FLUX.2 / Qwen 2511) + live capabilities
+├── server.py           # MCP server + 38 tool registrations (canvas tools accept session_id; FastMCP initialize instructions carry the GPU batching rule)
+◜─── editing.py          # Instruction editing backends (qwen21 / flux2) + live capabilities
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
 ├── canvas.py           # Layered document with blend modes + undo/redo
 ├── session.py          # Per-session document management
 ├── requirements.txt    # Python dependencies
 ├── MEMORY.md           # Project memory bank
-◜─── tests/              # Regression suite (69 tests)
+◜─── tests/              # Regression suite (81 tests)
 ◜─── verification/       # Live GPU verification scripts + artifacts
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
@@ -176,7 +165,7 @@ mcp-photoshop-server/
 ```
 
 ### Design Philosophy
-- **AI operations** (generation, inpainting, transforms, ControlNet, style) → routed through ComfyUI
+- **AI operations** (generation, outpainting, upscaling, instruction editing) → routed through ComfyUI
 - **Deterministic edits** (crop, resize, adjustments, filters) → executed locally with Pillow (fast, no GPU)
 - **Layered document model** → mirrors Photoshop's mental model with blend modes, masks, and undo history
 
@@ -202,41 +191,34 @@ mcp-photoshop-server/
 ### AI Edit Workflow
 ```
 1. open_image(path="portrait.jpg")
-2. edit_image(prompt="change background to a forest at sunset", backend="flux2")
+2. edit_image(prompt="change background to a forest at sunset; preserve the person")
 3. undo  # if not satisfied
-4. edit_image(prompt="match the jacket color to the reference", backend="qwen2511", reference_paths=["ref.jpg"])
+4. edit_image(prompt="match the jacket color in <image1> to <image2>; preserve the face and pose", reference_paths=["ref.jpg"])
 5. preview_canvas()
 6. adjust(contrast=1.1)
 7. export(path="output/edited.jpg", format="JPG")
-# Several qwen2511 jobs: queue the whole batch first, then follow the GPU batching rule (System section above).
+# Inspect the returned preview. Undo a failed attempt before editing again.
 ```
 
-### Inpainting Workflow
+### Masked Fill (inpaint-style)
 ```
 1. open_image(path="photo.jpg")
-2. select_rect(x=100, y=50, width=200, height=150)
-3. inpaint(prompt="a red rose bouquet")
-4. export(path="output/inpainted.png")
+2. edit_image(prompt="fill with a red rose bouquet", region=[100, 50, 200, 150])
+3. preview_canvas()   # inspect before keeping
+4. export(path="output/filled.png")
 ```
 
 ### Upscaling
 ```
 1. open_image(path="small_photo.jpg")
-2. upscale(model="4x_NMKD-Siax_200k.pth")
+2. upscale(factor=2, model="anime")
 3. export(path="output/upscaled.png")
 ```
 
-### ControlNet Guided Generation
-```
-1. open_image(path="sketch.png")
-2. controlnet_generate(prompt="a detailed cityscape", controlnet="canny", strength=0.8)
-3. export(path="output/cityscape.png")
-```
-
-### Style Transfer
+### Style / Identity Guidance (reference images)
 ```
 1. open_image(path="photo.jpg")
-2. style_transfer(prompt="the same scene", style_path="painting.jpg", strength=0.8)
+2. edit_image(prompt="restyle <image1> in the style of <image2>: watercolor, muted palette", reference_paths=["C:/refs/painting.jpg"])
 3. export(path="output/styled.png")
 ```
 

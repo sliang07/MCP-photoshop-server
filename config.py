@@ -49,8 +49,8 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Model names (match installed models)
-MODEL_FLUX2 = "flux-2-klein-9b.safetensors"
-MODEL_FLUX2_TEXT_ENCODER = "qwen_3_8b_fp8mixed.safetensors"
+MODEL_FLUX2 = "flux2-dev-nvfp4.safetensors"
+MODEL_FLUX2_TEXT_ENCODER = "mistral_3_small_flux2_fp8.safetensors"
 MODEL_FLUX2_VAE = "flux2-vae.safetensors"
 
 # ANIMA model (anime-style generation)

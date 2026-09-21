@@ -31,8 +31,8 @@ class Registry:
 def node_info():
     data = {}
     models = {
-        "UNETLoader": ("unet_name", ["flux-2-klein-9b.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors", "anima-aesthetic-v1.1.safetensors"]),
-        "CLIPLoader": ("clip_name", ["qwen_3_8b_fp8mixed.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors", "qwen_3_06b_base.safetensors"]),
+        "UNETLoader": ("unet_name", ["flux2-dev-nvfp4.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors", "anima-aesthetic-v1.1.safetensors"]),
+        "CLIPLoader": ("clip_name", ["mistral_3_small_flux2_fp8.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors", "qwen_3_06b_base.safetensors"]),
         "VAELoader": ("vae_name", ["flux2-vae.safetensors", "qwen_image_2.1_vae_bf16.safetensors", "qwen_image_vae.safetensors"]),
     }
     for loader, (field, names) in models.items():
@@ -40,7 +40,7 @@ def node_info():
     for name in ["LoadImage", "CLIPTextEncode", "VAEEncode", "ReferenceLatent", "BasicGuider",
                  "RandomNoise", "Flux2Scheduler", "KSamplerSelect", "EmptyFlux2LatentImage",
                  "SamplerCustomAdvanced", "VAEDecode", "SaveImage", "TextEncodeQwenImage21",
-                 "QwenImage21Cache", "JoinImageWithAlpha", "KSampler", "EmptyLatentImage", "CFGGuider"]:
+                 "QwenImage21Cache", "JoinImageWithAlpha", "KSampler", "EmptyLatentImage", "CFGGuider", "FluxGuidance"]:
         data[name] = {}
     return data
 
@@ -142,7 +142,10 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
     def test_reference_images_are_connected_to_guider(self):
         profile = edit_profiles(node_info())["flux2"]
         graph = build_edit_workflow("flux2", profile, "edit", ["source.png", "ref.png"], 512, 512, 4, 0)
+        classes = [n["class_type"] for n in graph.values()]
+        self.assertNotIn("CFGGuider", classes)
         guider = next(n for n in graph.values() if n["class_type"] == "BasicGuider")
+
         conditioning = guider["inputs"]["conditioning"]
         for expected in ("ref.png", "source.png"):
             ref = graph[conditioning[0]]
@@ -151,6 +154,9 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
             loaded = graph[encoded["inputs"]["pixels"][0]]
             self.assertEqual(loaded["inputs"]["image"], expected)
             conditioning = ref["inputs"]["conditioning"]
+        guided = graph[conditioning[0]]
+        self.assertEqual(guided["class_type"], "FluxGuidance")
+        self.assertEqual(guided["inputs"]["guidance"], profile["default_cfg"])
 
     def test_model_detection_handles_new_combo_and_nested_paths(self):
         info = {"Loader": {"input": {"required": {"model": ["COMBO", {"options": ["a.pth"]}]}}}}

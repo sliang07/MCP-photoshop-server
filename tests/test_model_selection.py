@@ -25,7 +25,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generation_switches_weights_encoders_and_defaults(self):
         expected = {
-            "flux2": ("flux-2-klein-9b.safetensors", "flux2", 4, 1.0),
+            "flux2": ("flux2-dev-nvfp4.safetensors", "flux2", 50, 4.0),
             "qwen21": ("qwen/qwen_image_2.1_int8_convrot.safetensors", "qwen_image", 30, 3.0),
             "anima": ("anima-aesthetic-v1.1.safetensors", "stable_diffusion", 30, 4.0),
         }
@@ -39,13 +39,18 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(nodes["CLIPLoader"]["type"], encoder)
                 sampler = nodes["Flux2Scheduler"] if model == "flux2" else nodes["KSampler"]
                 self.assertEqual(sampler["steps"], steps)
-                self.assertEqual(nodes["CFGGuider"]["cfg"] if model == "flux2" else sampler["cfg"], cfg)
+                self.assertEqual(nodes["FluxGuidance"]["guidance"] if model == "flux2" else sampler["cfg"], cfg)
                 self.assertEqual(nodes["RandomNoise"]["noise_seed"] if model == "flux2" else sampler["seed"], 0)
                 self.assertNotIn("Flux2KleinSectionedEncoder", nodes)
                 if model == "qwen21":
                     self.assertNotIn("LoadImage", nodes)
                     self.assertEqual(nodes["EmptyLatentImage"]["width"], 64)
                     self.assertEqual(nodes["EmptyLatentImage"]["height"], 32)
+                    self.assertEqual(self.run.await_args.kwargs["timeout"], 1800)
+                if model == "flux2":
+                    self.assertEqual(nodes["CLIPLoader"]["clip_name"], "mistral_3_small_flux2_fp8.safetensors")
+                    self.assertIn("BasicGuider", nodes)
+                    self.assertNotIn("CFGGuider", nodes)
                     self.assertEqual(self.run.await_args.kwargs["timeout"], 1800)
                 self.assertEqual(self.sessions.get("default").layers[-1].image.getpixel((0, 0))[3], 128)
 
@@ -62,11 +67,14 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.run.await_args.kwargs["timeout"], 42)
                 sampler = nodes["Flux2Scheduler"] if model == "flux2" else nodes["KSampler"]
                 self.assertEqual(sampler["steps"], 9)
-                self.assertEqual(nodes["CFGGuider"]["cfg"] if model == "flux2" else sampler["cfg"], 2.3)
+                self.assertEqual(nodes["FluxGuidance"]["guidance"] if model == "flux2" else sampler["cfg"], 2.3)
                 if model == "qwen21":
                     self.assertEqual(nodes["TextEncodeQwenImage21"]["negative_prompt"], "watermark")
                 else:
-                    self.assertEqual(nodes["CLIPTextEncode"]["text"], "watermark")
+                    if model == "flux2":
+                        self.assertEqual(nodes["CLIPTextEncode"]["text"], "bird")
+                    else:
+                        self.assertEqual(nodes["CLIPTextEncode"]["text"], "watermark")
 
     async def test_unknown_and_unavailable_models_never_fall_back(self):
         out = await server.generate_image("bird", model="typo")
@@ -100,8 +108,8 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
                 export_dir=tmp)
             report = json.loads(out[0].text)
             self.assertEqual(report["summary"]["ok"], 3)
-            self.assertEqual([r["steps"] for r in report["results"]], [4, 30, 30])
-            self.assertEqual([r["cfg"] for r in report["results"]], [1, 3, 4])
+            self.assertEqual([r["steps"] for r in report["results"]], [50, 30, 30])
+            self.assertEqual([r["cfg"] for r in report["results"]], [4.0, 3.0, 4.0])
             for record in report["results"]:
                 with Image.open(record["file"]) as img:
                     self.assertEqual(img.getpixel((0, 0))[3], 128)
@@ -116,6 +124,12 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
             {"prompt": "bird", "model": "flux2"}, {"prompt": "bird", "model": "qwen21"}])
         self.assertIn("Job 1: qwen21 is unavailable", out[0].text)
         self.client.batch_run_workflows.assert_not_awaited()
+
+    async def test_default_flux_batch_uses_dev_timeout(self):
+        self.client.batch_run_workflows.return_value = [{"history": None, "error": "test"}] * 2
+        with tempfile.TemporaryDirectory() as tmp:
+            await server.batch_generate_tool([{"prompt": "one"}, {"prompt": "two", "model": "flux2"}], export_dir=tmp)
+        self.assertEqual(self.client.batch_run_workflows.await_args.kwargs["timeout"], 3600)
 
     async def test_all_failed_batch_returns_errors(self):
         self.client.batch_run_workflows.return_value = [{"history": None, "error": "out of VRAM"}]

@@ -44,16 +44,16 @@ logger = logging.getLogger(__name__)
 
 # Some clients ignore initialize instructions, so tool descriptions also state
 # the automatic-startup behavior.
-GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 remains an explicit fast option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
+GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4) remains an explicit option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
 
-Model selection: generate_image and batch_generate accept model=flux2 (fast), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+Model selection: generate_image and batch_generate accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
 
 Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3/video and audio masters do not define Photoshop image prompts. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
 GPU batching rule: this host's single 32GB GPU may be shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
-- Single short generation (e.g. flux2, ~4 steps): just run it.
+- Single generation with sufficient free GPU memory: run it directly. FLUX.2 Dev defaults to 50 steps, not the retired Klein four-step recipe.
 - For batches that need GPU memory currently occupied by qwen38: first queue the complete batch in a detached host process and export each result as it completes. Sequential awaited edit_image calls are not a detached batch.
 - Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval, and only once the batch is fully queued in the background.
 - Warning: `qwen38` serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to run `docker start qwen38 open-webui` afterwards.
@@ -273,9 +273,11 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
                          session_id: str = "default", timeout: Optional[int] = None):
     """Generate an image from text. Automatically starts ComfyUI; no manual startup is required.
 
-    Choose model='flux2' for fast generation (Klein 9B distilled, 4 steps/CFG 1),
+    Choose model='flux2' for generation (FLUX.2 Dev NVFP4, 50 steps/guidance 4, guidance-distilled),
     'qwen21' for detail, typography or transparent output (custom 30 steps/CFG 3),
     or 'anima' for anime/illustration (30 steps/CFG 4). Omit steps/cfg for these defaults.
+    For flux2, cfg controls embedded FluxGuidance; negative_prompt is unused and reported
+    if supplied. Express desired constraints positively in prompt.
     get_editing_capabilities reports installed choices. For changes to an existing
     image use edit_image instead. A missing model is reported, never silently substituted.
     """
@@ -289,7 +291,7 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
         prompt, negative_prompt, adjustments = prepare_prompts(model, profile["model"], prompt, negative_prompt)
         workflow = build_generation_workflow(model, profile, prompt, negative_prompt,
                                              width, height, steps, cfg, seed)
-        result = await run_workflow(workflow, timeout=timeout or (1800 if model == "qwen21" else None))
+        result = await run_workflow(workflow, timeout=timeout or (1800 if model in ("flux2", "qwen21") else None))
         if not result:
             return [TextContent(text="Generation failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
@@ -692,7 +694,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
                         session_id: str = "default", backend: Literal["flux2", "qwen21"] = "flux2", timeout: Optional[int] = None):
     """AI outpaint: extend the canvas in a direction and fill the new area. Automatically starts ComfyUI; no manual startup is required.
 
-    direction: left, right, top, bottom. backend: flux2 (fast Klein 9B, 4 steps)
+    direction: left, right, top, bottom. backend: flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4)
     or qwen21 (Qwen Image 2.1, custom 30 steps/CFG 3). Anima does not support instruction editing.
     Omit steps for the selected model's default. Extends the active layer using
     reference conditioning, then restores its original pixels exactly.
@@ -744,7 +746,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
                            "Continue the scene seamlessly across the boundary.")
         workflow = build_edit_workflow(backend, profile, instruction, [filename],
                                        *working.size, steps, seed, resolution=1024 if backend == "qwen21" else 0)
-        result = await run_workflow(workflow, timeout=timeout or (1800 if backend == "qwen21" else None))
+        result = await run_workflow(workflow, timeout=timeout or 1800)
         if not result:
             return [TextContent(text="Outpaint failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
@@ -999,10 +1001,11 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     Automatically starts ComfyUI when needed; no manual startup is required.
 
     jobs: list of job objects, each with 'prompt' (required) and optional
-    'model' ('flux2' fast / 'qwen21' detail, typography, alpha / 'anima' anime), 'width', 'height', 'steps', 'cfg',
+    'model' ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime), 'width', 'height', 'steps', 'cfg',
     'seed', 'negative_prompt', and 'filename' (output basename without extension).
     Models may differ per job. Omitted steps/cfg use model defaults:
-    flux2=4/1, qwen21=30/3 (custom preset), anima=30/4. Explicit values are preserved.
+    flux2=50/4, qwen21=30/3 (custom preset), anima=30/4. Explicit values are preserved.
+    For flux2 jobs, cfg is embedded FluxGuidance and negative_prompt is unused/reported.
     All jobs are submitted up front so the batch runs unattended (GPU batching rule:
     queue in a detached host process before asking approval to stop the qwen38 LLM container).
     export_dir defaults to <server>/batch_output; export_format: PNG or JPG.
@@ -1044,7 +1047,7 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
                 setting.update(prompt_adjustments=adjustments, effective_prompt=prompt, negative_prompt=negative_prompt)
             settings.append(setting)
         if timeout is None:
-            timeout = sum(1800 if job.get("model") == "qwen21" else WEBSOCKET_TIMEOUT for job in jobs)
+            timeout = sum(1800 if job.get("model", "flux2") in ("flux2", "qwen21") else WEBSOCKET_TIMEOUT for job in jobs)
         batch = await comfy.batch_run_workflows(workflows, timeout=timeout)
         batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
         out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR

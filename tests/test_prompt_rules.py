@@ -31,10 +31,17 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
 
     def test_base_scores_and_other_models_are_not_rewritten(self):
         for model, checkpoint in (("anima", "folder/anima-base-v1.0.safetensors"),
-                                  ("flux2", "flux.safetensors"), ("qwen21", "qwen.safetensors")):
+                                  ("qwen21", "qwen.safetensors")):
             original = "score_7, blue coat, soft studio lighting"
             positive, negative, changes = prompt_rules.prepare_prompts(model, checkpoint, original, "score_1")
             self.assertEqual((positive, negative, changes), (original, "score_1", []))
+
+    def test_flux_dev_reports_unused_negative_without_rewriting_positive(self):
+        positive = 'A sign reads "score_7" beside a blue bird.'
+        actual, negative, changes = prompt_rules.prepare_prompts("flux2", "flux2-dev-nvfp4.safetensors", positive, "watermark")
+        self.assertEqual(actual, positive)
+        self.assertEqual(negative, "")
+        self.assertIn("does not use negative_prompt", changes[0])
 
     def test_only_single_outer_code_fences_are_removed(self):
         self.assertEqual(prompt_rules.unwrap_prompt('```text\nA sign reads "HELLO!"\n```'), 'A sign reads "HELLO!"')
@@ -136,10 +143,12 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
                  for model in ("anima", "flux2")], export_dir=tmp)
         graphs = client.batch_run_workflows.await_args.args[0]
         texts = [[n["inputs"]["text"] for n in graph.values() if n["class_type"] == "CLIPTextEncode"] for graph in graphs]
-        self.assertEqual(texts, [["a bird", "artifacts"], ["score_7, a bird", "score_1, artifacts"]])
+        # flux2 (dev) is guidance-distilled: no negative conditioning is encoded.
+        self.assertEqual(texts, [["a bird", "artifacts"], ["score_7, a bird"]])
         records = json.loads(result[0].text)["results"]
         self.assertIn("prompt_adjustments", records[0])
-        self.assertNotIn("prompt_adjustments", records[1])
+        self.assertIn("does not use negative_prompt", records[1]["prompt_adjustments"][0])
+        self.assertEqual(records[1]["negative_prompt"], "")
 
     async def test_editor_unwraps_prompt_without_changing_exact_text(self):
         registry = Registry()

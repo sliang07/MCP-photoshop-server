@@ -46,9 +46,9 @@ def model_profiles(info, task):
     vaes = model_options(info, "VAELoader", "vae_name")
     profiles = {}
     for name, model_names, clip_names, vae_name, refs, steps, cfg, use_for in (
-        ("flux2", (MODEL_FLUX2, "flux-2-klein-9b-fp8.safetensors"),
-         (MODEL_FLUX2_TEXT_ENCODER, "qwen_3_8b.safetensors"), MODEL_FLUX2_VAE, None, 4, 1.0,
-         "Fast generation, instruction edits and reference-guided edits (Klein 9B distilled)."),
+        ("flux2", (MODEL_FLUX2, "flux2-dev.safetensors"),
+         (MODEL_FLUX2_TEXT_ENCODER, "mistral_3_small_flux2_bf16.safetensors"), MODEL_FLUX2_VAE, None, 50, 4.0,
+         "Generation, instruction edits and reference-guided edits (FLUX.2 Dev NVFP4, 32B guidance-distilled)."),
         ("qwen21", ("qwen_image_2.1_int8_convrot.safetensors", "qwen_image_2.1_bf16.safetensors"),
           ("qwen3vl_8b_int8_convrot.safetensors", "qwen3vl_8b_w4a8.safetensors", "qwen3vl_8b_bf16.safetensors"),
           "qwen_image_2.1_vae_bf16.safetensors", 15, 30, 3.0,
@@ -68,6 +68,9 @@ def model_profiles(info, task):
             "scheduler": "Flux2Scheduler" if name == "flux2" else "simple",
             "denoise": 1.0,
         }
+        if name == "flux2":
+            profile["guidance_type"] = "embedded FluxGuidance (cfg argument)"
+            profile["negative_prompt_supported"] = False
         if task != "generation":
             profile["max_additional_references"] = refs
         missing = [key for key in ("model", "clip", "vae") if not profile[key]]
@@ -106,13 +109,20 @@ def build_generation_workflow(backend, profile, prompt, negative_prompt="", widt
         encoded = node("TextEncodeQwenImage21", clip=clip, prompt=prompt,
                        negative_prompt=negative_prompt, resolution=1024)
         positive, negative = encoded, [encoded[0], 1]
+    elif backend == "flux2":
+        # FLUX.2-dev is guidance-distilled: one forward pass, guidance value
+        # embedded in the model (BFL default 4.0), no negative conditioning.
+        # negative_prompt is accepted for API compatibility but not encoded.
+        positive = node("CLIPTextEncode", clip=clip, text=prompt)
+        positive = node("FluxGuidance", conditioning=positive, guidance=cfg)
+        negative = None
     else:
         positive = node("CLIPTextEncode", clip=clip, text=prompt)
         negative = node("CLIPTextEncode", clip=clip, text=negative_prompt)
     latent = node("EmptyFlux2LatentImage" if backend == "flux2" else "EmptyLatentImage",
                   width=width, height=height, batch_size=1)
     if backend == "flux2":
-        guider = node("CFGGuider", model=model, positive=positive, negative=negative, cfg=cfg)
+        guider = node("BasicGuider", model=model, conditioning=positive)
         noise = node("RandomNoise", noise_seed=seed)
         sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
         sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
@@ -150,10 +160,12 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         loaded.append(image)
     if backend == "flux2":
         positive = node("CLIPTextEncode", clip=clip, text=prompt)
+        positive = node("FluxGuidance", conditioning=positive, guidance=profile["default_cfg"])
         for image in loaded:
             latent = node("VAEEncode", pixels=image, vae=vae)
             positive = node("ReferenceLatent", conditioning=positive, latent=latent)
         guider = node("BasicGuider", model=model, conditioning=positive)
+
         noise = node("RandomNoise", noise_seed=seed)
         sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
         sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
@@ -377,9 +389,9 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Automatically starts ComfyUI when needed; no manual startup is required.
 
         backend: qwen21 (default, Qwen Image 2.1, custom 30 steps/CFG 3, RGBA)
-        or flux2 (Klein 9B distilled, 4 steps/CFG 1). Both use Euler.
+        or flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4). Both use Euler.
         Both support object removal, background replacement, restyling and references.
-        Choose qwen21 for typography/alpha or flux2 for speed. Anima is generation-only.
+        Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
         Image 1 is the canvas; images 2 onward are reference_paths, in order. For Qwen use
         <image1>, <image2>, etc. with multiple inputs (including a mask); for a lone canvas
@@ -391,7 +403,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Layer visibility masks/selections are not edit masks: pass mask_path or region explicitly.
         Returns one undoable replacement layer and a preview; original layers remain hidden.
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
-        timeout defaults to 1800 seconds for Qwen. Identity preservation is model-dependent.
+        timeout defaults to 1800 seconds for either backend. Identity preservation is model-dependent.
         """
         prompt = unwrap_prompt(prompt)
         if not prompt.strip():
@@ -448,7 +460,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             files.append(await comfy.upload_image(png_bytes(image), name))
         width, height = images[0].size
         workflow = build_edit_workflow(backend, profile, instruction, files, width, height, steps, seed)
-        result = await run_workflow(workflow, timeout=timeout or (1800 if backend == "qwen21" else None))
+        result = await run_workflow(workflow, timeout=timeout or 1800)
         if not result:
             raise RuntimeError("ComfyUI returned no image; the canvas was not modified")
         with Image.open(io.BytesIO(result)) as opened:

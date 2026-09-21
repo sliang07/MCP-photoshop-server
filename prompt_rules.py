@@ -22,7 +22,7 @@ Use only references actually supplied and inspected; never invent reference deta
 A sufficient brief or YOLO means proceed with compatible choices. Ask one focused
 question only for material ambiguity or requested guidance, not merely short input.
 Pass only image-prompt text to prompt; keep settings, explanations and Markdown outside
-it. When the tool accepts negative_prompt, keep negatives there; otherwise keep essential
+it. When the selected model supports negative_prompt, keep negatives there; otherwise keep essential
 constraints in the positive text. Negatives must not exclude requested effects.
 Word counts below are editorial targets, never truncation limits. Later explicit user
 instructions take precedence over creative defaults. Inspect returned images or use
@@ -32,7 +32,17 @@ MODEL_RULES = {
     "flux2": """FLUX master (flux2prompt.txt): connected visual prose, usually 30–80 words;
 front-load the main priority, then setting/details, lighting and atmosphere. Expand only
 for meaningful requirements. No keyword dump, redundant quality adjectives or appended
-tag suffix. Preserve requested lighting; 'normal' depends on the actual setting.""",
+tag suffix. Preserve requested lighting; 'normal' depends on the actual setting.
+The installed backend is FLUX.2 Dev NVFP4 (32B), not Klein. Use the subject, action,
+style and context in priority order; name each reference image's role for edits and
+describe the requested change and preserved identity explicitly. Describe desired
+results positively: Dev does not use negative_prompt. Quote lettering and specify its
+placement and typography; bind exact requested colors to their objects. Native sampling
+uses Mistral Small, flux2 VAE, Euler and Flux2Scheduler, 50 steps with embedded guidance
+4 (28 steps is a faster trade-off). The API's cfg means embedded FluxGuidance for this
+backend, not a second negative-conditioning pass. NVFP4 is weight quantization, not a
+four-step distilled recipe. The local master still has a historical Klein heading;
+these Dev-specific task and sampling rules adapt it to the installed model.""",
     "anima": """Anima master (anima_prompt.txt): use a compact mix of lowercase visual tags
 and natural-language sentences; ordinary tags use spaces, not underscores. Keep each
 character's identity/appearance/clothes/action together. Use anime/illustration language
@@ -183,6 +193,9 @@ def prepare_prompts(model, checkpoint, prompt, negative_prompt):
     adjustments = []
     if (positive, negative) != (prompt, negative_prompt):
         adjustments.append("Removed a surrounding prompt code fence")
+    if model == "flux2" and negative:
+        negative = ""
+        adjustments.append("FLUX.2 Dev does not use negative_prompt; express desired constraints in prompt")
     if model == "anima" and not Path(checkpoint.replace("\\", "/")).name.startswith("anima-base-"):
         cleaned = _without_score_tags(positive), _without_score_tags(negative)
         if cleaned != (positive, negative):

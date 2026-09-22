@@ -41,8 +41,9 @@ placement and typography; bind exact requested colors to their objects. Native s
 uses Mistral Small, flux2 VAE, Euler and Flux2Scheduler, 50 steps with embedded guidance
 4 (28 steps is a faster trade-off). The API's cfg means embedded FluxGuidance for this
 backend, not a second negative-conditioning pass. NVFP4 is weight quantization, not a
-four-step distilled recipe. The local master still has a historical Klein heading;
-these Dev-specific task and sampling rules adapt it to the installed model.""",
+four-step distilled recipe. The local master is the 2026-09-19 FLUX.2 [dev]
+revision; these Dev-specific task and sampling rules adapt it to the installed
+NVFP4 backend.""",
     "anima": """Anima master (anima_prompt.txt): use a compact mix of lowercase visual tags
 and natural-language sentences; ordinary tags use spaces, not underscores. Keep each
 character's identity/appearance/clothes/action together. Use anime/illustration language

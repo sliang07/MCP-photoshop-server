@@ -498,10 +498,15 @@ python server.py
 
 ## 12. Changelog
 
+### 2026-09-22 — Master-prompt compliance audit and live Qwen21/Anima proof
+- Re-verified all four local master files through live MCP `get_prompt_guidance` (path + SHA-256 + full text per call): qwen21 t2i/edit and anima hashes matched the previously verified records; `flux2prompt.txt` had drifted to the 2026-09-19 FLUX.2 [dev] revision (SHA `eda66664…870f`) and the served text now reflects it.
+- Dropped the stale "historical Klein heading" sentence from `prompt_rules` `MODEL_RULES["flux2"]` (and resynced the changelog line above); repo-wide Klein scan confirmed all remaining references are correctly historical. 176 tests pass.
+- Live master-compliant proofs through the MCP server (RTX 5090, 30.9 GB VRAM free, qwen3.8 LLM container untouched): one Qwen21 image from a t2i-master observer-style prompt (1152x768, quoted "MEADOW" sign rendered exactly) and one Anima image from an Aesthetic hybrid tag+prose prompt (768x1152, quoted "PLATFORM 3" sign rendered exactly, no `score_*` tags, conflicting "blurry" negative removed). Artifacts: `verification/master_compliance/` (gitignored, on disk).
+
 ### 2026-09-21 — FLUX.2 Dev NVFP4 (32B) replaces the Klein checkpoints
 - `config.py`: `MODEL_FLUX2` → `flux2-dev-nvfp4.safetensors`, text encoder → `mistral_3_small_flux2_fp8.safetensors` (CLIP type `flux2`); VAE unchanged. `model_profiles` flux2 preset 28/4.0 → 50 steps/embedded guidance 4.
 - Flux generation/edit/outpaint graphs: positive-only `CLIPTextEncode` → `FluxGuidance` → `BasicGuider`; `CFGGuider` and the negative branch are retired, and a supplied `negative_prompt` is reported as unused. 1800 s default timeouts; batches budget 1800 s per Flux/Qwen job.
-- `prompt_rules` adapts the historical Klein-headed `flux2prompt.txt` to Dev. Four saved `flux2_klein*.json` ComfyUI workflows migrated to Dev (backup: `verification/flux2_dev/workflows_before_dev.zip`).
+- The local `flux2prompt.txt` is now the 2026-09-19 FLUX.2 [dev] master revision (SHA-256 `eda66664…870f`, replacing the last live-verified copy `75c08d3f…418`); `prompt_rules` adapts it to the installed NVFP4 backend. Four saved `flux2_klein*.json` ComfyUI workflows migrated to Dev (backup: `verification/flux2_dev/workflows_before_dev.zip`).
 - Tests 106 → 108; README model table and MEMORY §2/§3/§5 resynced.
 
 ### 2026-09-21 — FLUX.2 Klein 9B Base (fp8) replaces the distilled Klein 9B

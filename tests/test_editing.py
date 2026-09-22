@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from PIL import Image
@@ -301,6 +301,39 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image.size, (992, 704))
         self.assertEqual(image.getpixel((0, 0))[3], 128)
 
+    async def test_cfg_resolution_and_workflow_nodes(self):
+        cases = [("flux2", None, 4.0, 50), ("flux2", 0.0, 0.0, 50), ("flux2", 1.25, 1.25, 50),
+                 ("qwen21", None, 3.0, 30), ("qwen21", 0.0, 0.0, 30), ("qwen21", 1.25, 1.25, 30)]
+        for backend, cfg, expected_cfg, expected_steps in cases:
+            with self.subTest(backend=backend, cfg=cfg):
+                result = await self.registry.tools["edit_image"]("test", backend=backend, cfg=cfg)
+                report = json.loads(result[0].text)
+                self.assertEqual(report["cfg"], expected_cfg)
+                self.assertEqual(report["steps"], expected_steps)
+                graph = self.run.call_args.args[0]
+                if backend == "flux2":
+                    guidance_node = next(n for n in graph.values() if n["class_type"] == "FluxGuidance")
+                    self.assertEqual(guidance_node["inputs"]["guidance"], expected_cfg)
+                else:
+                    sampler = next(n for n in graph.values() if n["class_type"] == "KSampler")
+                    self.assertEqual(sampler["inputs"]["cfg"], expected_cfg)
+
+    def test_build_edit_workflow_positional_resolution_compatibility(self):
+        info = node_info()
+        profile = edit_profiles(info)["qwen21"]
+        original_profile = dict(profile)
+        graph = build_edit_workflow("qwen21", profile, "edit", ["source.png"], 512, 512, 30, 0, 1024, cfg=0.75)
+        encoder = next(n for n in graph.values() if n["class_type"] == "TextEncodeQwenImage21")
+        self.assertEqual(encoder["inputs"]["resolution"], 1024)
+        sampler = next(n for n in graph.values() if n["class_type"] == "KSampler")
+        self.assertEqual(sampler["inputs"]["cfg"], 0.75)
+        graph_default = build_edit_workflow("qwen21", profile, "edit", ["source.png"], 512, 512, 30, 0)
+        encoder_default = next(n for n in graph_default.values() if n["class_type"] == "TextEncodeQwenImage21")
+        self.assertEqual(encoder_default["inputs"]["resolution"], 0)
+        sampler_default = next(n for n in graph_default.values() if n["class_type"] == "KSampler")
+        self.assertEqual(sampler_default["inputs"]["cfg"], 3.0)
+        self.assertEqual(profile, original_profile)
+
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -447,6 +480,137 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client.session = httpx.AsyncClient(transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={"name": "renamed.png", "subfolder": "edits"})))
         self.assertEqual(await self.client.upload_image(b"test", "source.png"), "edits/renamed.png")
+
+    async def test_no_owned_handle_means_subprocess_run_never_called(self):
+        self.client._comfyui_process = None
+        with patch("comfy_client.subprocess.run") as mock_run:
+            result = self.client._kill_process()
+        self.assertFalse(result)
+        mock_run.assert_not_called()
+
+    async def test_live_owned_handle_causes_exactly_one_taskkill(self):
+        mock_proc = Mock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        mock_proc.wait = Mock()
+        self.client._comfyui_process = mock_proc
+
+        mock_result = Mock()
+        mock_result.returncode = 0
+        mock_result.stderr = b""
+
+        with patch("comfy_client.subprocess.run", return_value=mock_result) as mock_run:
+            result = self.client._kill_process()
+
+        self.assertTrue(result)
+        mock_run.assert_called_once_with(["taskkill", "/F", "/T", "/PID", "12345"], capture_output=True, timeout=15)
+        mock_proc.wait.assert_called_once_with(timeout=5)
+
+    async def test_exited_handle_is_not_targeted(self):
+        mock_proc = Mock()
+        mock_proc.poll.return_value = 0  # Exited
+        self.client._comfyui_process = mock_proc
+
+        with patch("comfy_client.subprocess.run") as mock_run:
+            result = self.client._kill_process()
+
+        self.assertFalse(result)
+        mock_run.assert_not_called()
+
+    async def test_failed_taskkill_retains_ownership(self):
+        mock_proc = Mock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        self.client._comfyui_process = mock_proc
+
+        mock_result = Mock()
+        mock_result.returncode = 1
+        mock_result.stderr = b"error"
+
+        with patch("comfy_client.subprocess.run", return_value=mock_result):
+            result = self.client._kill_process()
+
+        self.assertFalse(result)
+        self.assertIsNotNone(self.client._comfyui_process)
+
+    async def test_timed_out_wait_retains_ownership(self):
+        mock_proc = Mock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="taskkill", timeout=5)
+        self.client._comfyui_process = mock_proc
+
+        mock_result = Mock()
+        mock_result.returncode = 0
+        mock_result.stderr = b""
+
+        with patch("comfy_client.subprocess.run", return_value=mock_result):
+            result = self.client._kill_process()
+
+        self.assertFalse(result)
+        self.assertIsNotNone(self.client._comfyui_process)
+
+    async def test_foreign_occupied_port_blocks_launch_and_doesnt_kill(self):
+        self.client.is_running = AsyncMock(return_value=False)
+        self.client._wait_for_port_free = AsyncMock(return_value=False)
+        self.client._comfyui_process = None
+
+        with patch.object(self.client, "_start_process") as mock_start, \
+             patch.object(self.client, "_kill_process") as mock_kill:
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.client.start_comfyui()
+
+        self.assertIn("foreign process", str(ctx.exception))
+        mock_start.assert_not_called()
+        mock_kill.assert_not_called()
+
+    async def test_failed_owned_cleanup_blocks_start_even_if_port_becomes_free(self):
+        self.client.is_running = AsyncMock(return_value=False)
+        self.client._wait_for_port_free = AsyncMock(side_effect=[False, True])
+        self.client._comfyui_process = Mock()
+        self.client._comfyui_process.poll.return_value = None
+        with patch.object(self.client, "_kill_process", return_value=False), \
+             patch.object(self.client, "_start_process") as launch:
+            with self.assertRaisesRegex(RuntimeError, "Could not stop"):
+                await self.client.start_comfyui()
+        launch.assert_not_called()
+        self.assertIsNotNone(self.client._comfyui_process)
+
+    async def test_queue_error_defers_idle_kill(self):
+        self.client.get_queue_status = AsyncMock(side_effect=Exception("network error"))
+        self.client.kill_comfyui = AsyncMock()
+
+        await self.client._idle_kill_guarded()
+
+        self.client.kill_comfyui.assert_not_awaited()
+        self.assertIsNotNone(self.client._idle_kill_timer)
+
+    async def test_malformed_queue_defers_idle_kill(self):
+        self.client.get_queue_status = AsyncMock(return_value={"queue_running": "invalid"})
+        self.client.kill_comfyui = AsyncMock()
+
+        await self.client._idle_kill_guarded()
+
+        self.client.kill_comfyui.assert_not_awaited()
+        self.assertIsNotNone(self.client._idle_kill_timer)
+
+    async def test_busy_queue_defers_idle_kill(self):
+        self.client.get_queue_status = AsyncMock(return_value={"queue_running": ["job1"], "queue_pending": []})
+        self.client.kill_comfyui = AsyncMock()
+
+        await self.client._idle_kill_guarded()
+
+        self.client.kill_comfyui.assert_not_awaited()
+        self.assertIsNotNone(self.client._idle_kill_timer)
+
+    async def test_known_empty_queue_permits_kill(self):
+        self.client.get_queue_status = AsyncMock(return_value={"queue_running": [], "queue_pending": []})
+        self.client.kill_comfyui = AsyncMock()
+
+        await self.client._idle_kill_guarded()
+
+        self.client.kill_comfyui.assert_awaited_once()
+        self.assertIsNone(self.client._idle_kill_timer)
 
 
 if __name__ == "__main__":

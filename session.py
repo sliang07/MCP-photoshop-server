@@ -30,6 +30,11 @@ class SessionManager:
         self._sessions[session_id] = Canvas(width, height, bg_color)
         return self._sessions[session_id]
 
+    def replace(self, session_id: str, canvas: Canvas) -> Canvas:
+        """Replace the session's canvas with the supplied one."""
+        self._sessions[session_id] = canvas
+        return canvas
+
     def delete(self, session_id: str) -> bool:
         """Delete a session's canvas."""
         if session_id in self._sessions:

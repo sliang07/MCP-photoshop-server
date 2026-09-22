@@ -129,6 +129,176 @@ class BlendModeCanvasTests(unittest.TestCase):
         self.assertEqual(canvas.composite().tobytes(), expected.tobytes())
         self.assertEqual(canvas.composite().getpixel((0, 0)), (10, 20, 30, 255))
 
+    def test_merge_down_opaque_top_over_semi_transparent_bottom(self):
+        canvas = Canvas(4, 2, (0, 0, 0))
+        bottom_img = Image.new("RGBA", (4, 2), (255, 0, 0, 255))
+        top_img = Image.new("RGBA", (4, 2), (0, 0, 255, 255))
+        canvas.add_layer("lower", bottom_img)
+        canvas.layers[1].opacity = 0.5
+        canvas.add_layer("top", top_img)
+        before_composite = canvas.composite()
+        before_snapshot = [l.to_dict() for l in canvas.layers]
+        before_undo_len = len(canvas.undo_stack)
+        canvas.merge_down()
+        after_composite = canvas.composite()
+        self.assertEqual(after_composite.tobytes(), before_composite.tobytes())
+        self.assertEqual(len(canvas.layers), 2)
+        self.assertEqual(canvas.active_layer_index, 1)
+        self.assertEqual(len(canvas.undo_stack), before_undo_len + 1)
+        self.assertEqual(canvas.layers[0].to_dict(), before_snapshot[0])
+        merged = canvas.layers[1]
+        self.assertEqual(merged.name, "lower")
+        self.assertEqual(merged.opacity, 1.0)
+        self.assertIsNone(merged.mask)
+        self.assertEqual(merged.blend_mode, "normal")
+        self.assertTrue(merged.visible)
+        for y in range(2):
+            for x in range(4):
+                self.assertEqual(after_composite.getpixel((x, y))[3], 255)
+
+    def test_merge_down_nonuniform_masks_and_opacity_history(self):
+        canvas = Canvas(4, 2, (0, 0, 0))
+        bottom_img = Image.new("RGBA", (4, 2), (255, 0, 0, 255))
+        bottom_mask = Image.new("L", (4, 2), 128)
+        bottom_mask.putdata([255, 0, 128, 64, 32, 96, 16, 240])
+        top_img = Image.new("RGBA", (4, 2), (0, 255, 0, 255))
+        top_mask = Image.new("L", (4, 2), 255)
+        top_mask.putdata([0, 255, 128, 64, 32, 96, 16, 240])
+        canvas.layers[0].image = bottom_img
+        canvas.layers[0].mask = bottom_mask
+        canvas.layers[0].opacity = 0.7
+        canvas.add_layer("top", top_img)
+        canvas.layers[1].mask = top_mask
+        canvas.layers[1].opacity = 0.8
+        canvas._save_state()
+        before_composite = canvas.composite()
+        before_layers = [l.to_dict() for l in canvas.layers]
+        before_undo_len = len(canvas.undo_stack)
+        canvas.merge_down()
+        after_composite = canvas.composite()
+        self.assertEqual(after_composite.tobytes(), before_composite.tobytes())
+        self.assertEqual(len(canvas.layers), 1)
+        self.assertEqual(canvas.active_layer_index, 0)
+        self.assertEqual(len(canvas.undo_stack), before_undo_len + 1)
+        self.assertTrue(canvas.undo())
+        restored_composite = canvas.composite()
+        self.assertEqual(restored_composite.tobytes(), before_composite.tobytes())
+        self.assertEqual(len(canvas.layers), 2)
+        self.assertEqual(canvas.active_layer_index, 1)
+        self.assertEqual([l.to_dict() for l in canvas.layers], before_layers)
+        self.assertTrue(canvas.redo())
+        redo_composite = canvas.composite()
+        self.assertEqual(redo_composite.tobytes(), before_composite.tobytes())
+        self.assertEqual(len(canvas.layers), 1)
+        self.assertEqual(canvas.active_layer_index, 0)
+
+    def test_merge_down_hidden_layers(self):
+        backdrop_color = (100, 100, 100)
+        cases = [
+            ("top-hidden", True, False, "normal"),
+            ("bottom-hidden", False, True, "multiply"),
+            ("both-hidden", False, False, "multiply"),
+        ]
+        for name, bottom_visible, top_visible, top_mode in cases:
+            with self.subTest(name=name):
+                canvas = Canvas(4, 2, backdrop_color)
+                bottom_img = Image.new("RGBA", (4, 2), (255, 0, 0, 255))
+                top_img = Image.new("RGBA", (4, 2), (0, 0, 255, 255))
+                canvas.add_layer("lower", bottom_img)
+                canvas.layers[1].visible = bottom_visible
+                canvas.add_layer("top", top_img)
+                canvas.layers[2].visible = top_visible
+                canvas.set_blend_mode(top_mode, 2)
+                canvas.layers[2].opacity = 0.6
+                canvas.layers[2].mask = Image.new("L", (4, 2), 200)
+                canvas.layers[2].mask.putpixel((0, 0), 0)
+                before_composite = canvas.composite()
+                before_lower = canvas.layers[1].to_dict()
+                before_top = canvas.layers[2].to_dict()
+                before_deeper = canvas.layers[0].to_dict()
+                canvas.select_layer(2)
+                canvas.merge_down()
+                after_composite = canvas.composite()
+                self.assertEqual(after_composite.tobytes(), before_composite.tobytes())
+                self.assertEqual(len(canvas.layers), 2)
+                self.assertEqual(canvas.layers[0].to_dict(), before_deeper)
+                self.assertEqual(canvas.layers[1].name, "lower")
+                if not top_visible:
+                    self.assertEqual(canvas.layers[1].to_dict(), before_lower)
+                else:
+                    before_top["name"] = "lower"
+                    self.assertEqual(canvas.layers[1].to_dict(), before_top)
+
+    def test_merge_down_partial_alpha_tolerance(self):
+        canvas = Canvas(4, 2, (50, 50, 50))
+        bottom_img = Image.new("RGBA", (4, 2), (200, 100, 50, 255))
+        bottom_mask = Image.new("L", (4, 2), 255)
+        bottom_mask.putdata([255, 128, 64, 32, 16, 8, 4, 2])
+        top_img = Image.new("RGBA", (4, 2), (10, 20, 30, 255))
+        top_mask = Image.new("L", (4, 2), 255)
+        top_mask.putdata([255, 200, 150, 100, 50, 25, 10, 5])
+        canvas.add_layer("lower", bottom_img)
+        canvas.layers[1].mask = bottom_mask
+        canvas.layers[1].opacity = 0.9
+        canvas.add_layer("top", top_img)
+        canvas.layers[2].mask = top_mask
+        canvas.layers[2].opacity = 0.8
+        before_composite = canvas.composite()
+        canvas.merge_down()
+        after_composite = canvas.composite()
+        for y in range(2):
+            for x in range(4):
+                b_px = before_composite.getpixel((x, y))
+                a_px = after_composite.getpixel((x, y))
+                for c in range(4):
+                    self.assertLessEqual(abs(b_px[c] - a_px[c]), 1, f"channel {c} at ({x}, {y})")
+
+    def test_merge_down_multiply_with_fullwhite_mask(self):
+        canvas = Canvas(4, 2, (100, 100, 100))
+        bottom_img = Image.new("RGBA", (4, 2), (255, 255, 255, 255))
+        bottom_mask = Image.new("L", (4, 2), 255)
+        top_img = Image.new("RGBA", (4, 2), (128, 128, 128, 255))
+        canvas.add_layer("lower", bottom_img)
+        canvas.layers[1].mask = bottom_mask
+        canvas.add_layer("top", top_img)
+        canvas.set_blend_mode("multiply", 2)
+        before_composite = canvas.composite()
+        canvas.merge_down()
+        after_composite = canvas.composite()
+        self.assertEqual(after_composite.tobytes(), before_composite.tobytes())
+
+    def test_merge_down_multiply_with_transparent_bottom_raises(self):
+        canvas = Canvas(4, 2, (100, 100, 100))
+        bottom_img = Image.new("RGBA", (4, 2), (255, 255, 255, 0))
+        top_img = Image.new("RGBA", (4, 2), (128, 128, 128, 255))
+        canvas.add_layer("lower", bottom_img)
+        canvas.add_layer("top", top_img)
+        canvas.set_blend_mode("multiply", 2)
+        before_layers = [l.to_dict() for l in canvas.layers]
+        before_active = canvas.active_layer_index
+        before_undo_len = len(canvas.undo_stack)
+        with self.assertRaises(ValueError):
+            canvas.merge_down()
+        self.assertEqual([l.to_dict() for l in canvas.layers], before_layers)
+        self.assertEqual(canvas.active_layer_index, before_active)
+        self.assertEqual(len(canvas.undo_stack), before_undo_len)
+
+    def test_merge_down_bottom_non_normal_above_backdrop_raises(self):
+        canvas = Canvas(4, 2, (100, 100, 100))
+        bottom_img = Image.new("RGBA", (4, 2), (255, 255, 255, 255))
+        top_img = Image.new("RGBA", (4, 2), (128, 128, 128, 255))
+        canvas.add_layer("lower", bottom_img)
+        canvas.set_blend_mode("screen", 1)
+        canvas.add_layer("top", top_img)
+        before_layers = [l.to_dict() for l in canvas.layers]
+        before_active = canvas.active_layer_index
+        before_undo_len = len(canvas.undo_stack)
+        with self.assertRaises(ValueError):
+            canvas.merge_down()
+        self.assertEqual([l.to_dict() for l in canvas.layers], before_layers)
+        self.assertEqual(canvas.active_layer_index, before_active)
+        self.assertEqual(len(canvas.undo_stack), before_undo_len)
+
 
 if __name__ == "__main__":
     unittest.main()

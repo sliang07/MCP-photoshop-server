@@ -61,6 +61,7 @@ MODEL_ANIMA_VAE = "qwen_image_vae.safetensors"
 # Upscale models
 MODEL_UPSCALE_FACE = "4xFaceUpDAT.pth"
 MODEL_UPSCALE_ANIME = "RealESRGAN_x4plus_anime_6B.pth"
+MODEL_UPSCALE_GENERAL = "RealESRGAN_x4plus.pth"
 
 # Server settings
 SERVER_NAME = "mcp-photoshop-server"

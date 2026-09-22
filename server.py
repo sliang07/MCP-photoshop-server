@@ -26,7 +26,7 @@ def TextContent(text="", **kwargs):
 
 from config import (
     COMFYUI_URL, DEFAULT_WIDTH, DEFAULT_HEIGHT, WEBSOCKET_TIMEOUT,
-    MODEL_UPSCALE_FACE, MODEL_UPSCALE_ANIME,
+    MODEL_UPSCALE_FACE, MODEL_UPSCALE_ANIME, MODEL_UPSCALE_GENERAL,
     COMFYUI_AUTO_KILL, VRAM_PRESSURE_THRESHOLD_MB,
 )
 from comfy_client import ComfyUIClient
@@ -35,6 +35,8 @@ from session import SessionManager
 from editing import (register_editing_tools, model_profiles, build_generation_workflow,
                      build_edit_workflow, prepare_image, png_bytes)
 from prompt_rules import get_prompt_guidance, prepare_prompts, unwrap_prompt, with_prompt_rules
+from project import load_project, save_project
+from jobs import GenerationJobs
 
 # ----------------------------------------------------------------------- #
 #  Globals
@@ -46,7 +48,11 @@ logger = logging.getLogger(__name__)
 # the automatic-startup behavior.
 GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4) remains an explicit option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
 
-Model selection: generate_image and batch_generate accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+Layer editing: edit_image(layer_index=...) edits only that layer's pixels and preserves its settings. output_mode=extract uses Qwen 2.1 to add an extracted subject as a new layer; inspect the preview and has_transparency. Use set_layer_visibility to compare layers, export_mask to reuse a selection as an independent edit mask, and save_project/open_project for layered documents. Project opening starts a fresh undo history.
+
+Model selection: generate_image, batch_generate and submit_generation_job accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+
+Background generation: submit_generation_job returns an ID, retains the full input list, and exports each completed image before starting the next. Poll get_job_status or list_jobs on the same server. cancel_job finishes the current image and skips remaining images without interrupting other jobs. Jobs survive an HTTP client disconnect only while the MCP server process runs; closing a stdio server or restarting loses workers/status, but exported files remain. batch_generate still waits for the whole batch before exporting.
 
 Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3/video and audio masters do not define Photoshop image prompts. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
@@ -54,8 +60,8 @@ ComfyUI starts automatically when a dependent tool is called, including get_edit
 
 GPU batching rule: this host's single 32GB GPU may be shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
 - Single generation with sufficient free GPU memory: run it directly. FLUX.2 Dev defaults to 50 steps, not the retired Klein four-step recipe.
-- For batches that need GPU memory currently occupied by qwen38: first queue the complete batch in a detached host process and export each result as it completes. Sequential awaited edit_image calls are not a detached batch.
-- Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval, and only once the batch is fully queued in the background.
+- For batches that need GPU memory currently occupied by qwen38: first hand the complete input list to submit_generation_job on an independently running host MCP server, or to a detached host runner. Verify that the worker's process will remain running when the LLM connection ends. Sequential awaited edit_image calls are not a detached batch.
+- Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval and verified background ownership of the complete batch.
 - Warning: `qwen38` serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to run `docker start qwen38 open-webui` afterwards.
 - `searxng` is CPU-only; never stop it for GPU speed.
 Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
@@ -227,6 +233,37 @@ async def open_image(path: str, session_id: str = "default"):
         return [TextContent(text=f"Error opening image: {str(e)}")]
 
 
+@app.tool("save_project")
+async def save_project_tool(path: str, session_id: str = "default"):
+    """Save the current document as a ZIP-based layered project (.mcpproj). Preserves layers/masks/settings. Saving replaces the supplied path atomically. This is not PSD."""
+    try:
+        canvas = sessions.get(session_id)
+        if canvas is None:
+            raise ValueError(f"Session '{session_id}' does not exist.")
+        save_project(canvas, path)
+        resolved_path = os.path.abspath(path)
+        info = {
+            "path": resolved_path,
+            "width": canvas.width,
+            "height": canvas.height,
+            "layer_count": len(canvas.layers)
+        }
+        return [TextContent(text=json.dumps(info))]
+    except Exception as e:
+        return [TextContent(text=f"Error saving project: {str(e)}")]
+
+
+@app.tool("open_project")
+async def open_project_tool(path: str, session_id: str = "default"):
+    """Open a ZIP-based layered project (.mcpproj). Replaces the chosen document and starts fresh history. This is not PSD."""
+    try:
+        canvas = load_project(path)
+        sessions.replace(session_id, canvas)
+        return [TextContent(text=json.dumps(canvas.get_info()))]
+    except Exception as e:
+        return [TextContent(text=f"Error opening project: {str(e)}")]
+
+
 @app.tool("export")
 async def export(path: Optional[str] = None, format: str = "PNG", quality: int = 95, session_id: str = "default"):
     """Export the current canvas to a file."""
@@ -310,12 +347,20 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
 
 @app.tool("crop")
 async def crop_tool(x: int, y: int, width: int, height: int, session_id: str = "default"):
-    """Crop the active layer to the specified region."""
+    """Crop the entire document (all images and masks) to the specified region."""
     try:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
         canvas = sessions.get_or_create(session_id)
-        # Crop all layers to preserve alignment
+        box = (x, y, x + width, y + height)
+        results = []
         for layer in canvas.layers:
-            layer.image = layer.image.crop((x, y, x + width, y + height))
+            new_image = layer.image.crop(box)
+            new_mask = layer.mask.crop(box) if layer.mask else None
+            results.append((layer, new_image, new_mask))
+        for layer, new_image, new_mask in results:
+            layer.image = new_image
+            layer.mask = new_mask
         canvas.width = width
         canvas.height = height
         canvas._save_state()
@@ -326,19 +371,43 @@ async def crop_tool(x: int, y: int, width: int, height: int, session_id: str = "
 
 @app.tool("resize")
 async def resize_tool(width: int, height: int, maintain_aspect: bool = False, session_id: str = "default"):
-    """Resize the active layer."""
+    """Resize the entire document (all images and masks) to the requested canvas size.
+    When maintain_aspect=True, scales all layers using one scale based on original canvas
+    dimensions and centers fitted content in a transparent target image and black target mask."""
     try:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
         canvas = sessions.get_or_create(session_id)
-        layer = canvas.layers[canvas.active_layer_index]
-        img = layer.image
+        orig_w, orig_h = canvas.width, canvas.height
         if maintain_aspect:
-            img = img.copy()
-            img.thumbnail((width, height), Image.LANCZOS)
-            new_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            new_img.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
-            layer.image = new_img
+            scale = min(width / orig_w, height / orig_h)
+            fitted_w = max(1, int(orig_w * scale))
+            fitted_h = max(1, int(orig_h * scale))
+            offset_x = (width - fitted_w) // 2
+            offset_y = (height - fitted_h) // 2
         else:
-            layer.image = layer.image.resize((width, height), Image.LANCZOS)
+            fitted_w, fitted_h = width, height
+            offset_x, offset_y = 0, 0
+        results = []
+        for layer in canvas.layers:
+            new_image = layer.image.resize((fitted_w, fitted_h), Image.LANCZOS)
+            if maintain_aspect:
+                target = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                target.paste(new_image, (offset_x, offset_y))
+                new_image = target
+            new_mask = None
+            if layer.mask:
+                mask_resized = layer.mask.resize((fitted_w, fitted_h), Image.LANCZOS)
+                if maintain_aspect:
+                    target_mask = Image.new("L", (width, height), 0)
+                    target_mask.paste(mask_resized, (offset_x, offset_y))
+                    new_mask = target_mask
+                else:
+                    new_mask = mask_resized
+            results.append((layer, new_image, new_mask))
+        for layer, new_image, new_mask in results:
+            layer.image = new_image
+            layer.mask = new_mask
         canvas.width = width
         canvas.height = height
         canvas._save_state()
@@ -349,12 +418,52 @@ async def resize_tool(width: int, height: int, maintain_aspect: bool = False, se
 
 @app.tool("rotate")
 async def rotate_tool(degrees: float, expand: bool = True, bg_color: str = "transparent", session_id: str = "default"):
-    """Rotate the active layer (counter-clockwise)."""
+    """Rotate the active layer counter-clockwise.
+    expand=False keeps original dimensions. expand=True expands canvas to fit the rotated
+    active layer, centering it and padding other layers by the original canvas offset."""
     try:
         canvas = sessions.get_or_create(session_id)
-        layer = canvas.layers[canvas.active_layer_index]
+        active_idx = canvas.active_layer_index
+        active_layer = canvas.layers[active_idx]
         fill_color = (0, 0, 0, 0) if bg_color == "transparent" else bg_color
-        layer.image = layer.image.rotate(degrees, expand=expand, fillcolor=fill_color, resample=Image.BICUBIC)
+        rotated_image = active_layer.image.rotate(degrees, expand=expand, fillcolor=fill_color, resample=Image.BICUBIC)
+        rotated_mask = None
+        if active_layer.mask:
+            rotated_mask = active_layer.mask.rotate(degrees, expand=expand, fillcolor=0, resample=Image.BICUBIC)
+        if expand:
+            new_w = max(canvas.width, rotated_image.width)
+            new_h = max(canvas.height, rotated_image.height)
+            rot_off_x = (new_w - rotated_image.width) // 2
+            rot_off_y = (new_h - rotated_image.height) // 2
+            orig_off_x = (new_w - canvas.width) // 2
+            orig_off_y = (new_h - canvas.height) // 2
+        else:
+            new_w, new_h = canvas.width, canvas.height
+            rot_off_x = rot_off_y = orig_off_x = orig_off_y = 0
+        results = []
+        for i, layer in enumerate(canvas.layers):
+            if i == active_idx:
+                img, mask = rotated_image, rotated_mask
+                off_x, off_y = rot_off_x, rot_off_y
+            else:
+                img, mask = layer.image, layer.mask
+                off_x, off_y = orig_off_x, orig_off_y
+            if expand:
+                new_image = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+                new_image.paste(img, (off_x, off_y))
+                new_mask = None
+                if mask:
+                    new_mask = Image.new("L", (new_w, new_h), 0)
+                    new_mask.paste(mask, (off_x, off_y))
+            else:
+                new_image = img
+                new_mask = mask
+            results.append((layer, new_image, new_mask))
+        for layer, new_image, new_mask in results:
+            layer.image = new_image
+            layer.mask = new_mask
+        canvas.width = new_w
+        canvas.height = new_h
         canvas._save_state()
         return [TextContent(text=f"Rotated {degrees} degrees")]
     except Exception as e:
@@ -363,11 +472,18 @@ async def rotate_tool(degrees: float, expand: bool = True, bg_color: str = "tran
 
 @app.tool("flip")
 async def flip_tool(axis: str = "horizontal", session_id: str = "default"):
-    """Flip the active layer. axis: 'horizontal' or 'vertical'."""
+    """Flip the active layer and its mask. axis: 'horizontal' or 'vertical'."""
     try:
         canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
-        layer.image = ImageOps.mirror(layer.image) if axis == "horizontal" else ImageOps.flip(layer.image)
+        if axis == "horizontal":
+            new_image = ImageOps.mirror(layer.image)
+            new_mask = ImageOps.mirror(layer.mask) if layer.mask else None
+        else:
+            new_image = ImageOps.flip(layer.image)
+            new_mask = ImageOps.flip(layer.mask) if layer.mask else None
+        layer.image = new_image
+        layer.mask = new_mask
         canvas._save_state()
         return [TextContent(text=f"Flipped {axis}")]
     except Exception as e:
@@ -391,12 +507,13 @@ async def adjust_tool(brightness: Optional[float] = None, contrast: Optional[flo
             img = ImageEnhance.Color(img).enhance(saturation)
         if sharpness is not None:
             img = ImageEnhance.Sharpness(img).enhance(sharpness)
-        if hue is not None and hue != 0:
+        if hue is not None and hue % 360 != 0:
+            alpha = img.getchannel("A")
             h, s, v = img.convert("HSV").split()
-            h_data = [(x + int(hue)) % 256 for x in h.getdata()]
-            h = h.copy()
-            h.putdata(h_data)
+            offset = round((hue % 360) / 360.0 * 255) % 256
+            h = h.point(lambda p: (p + offset) % 256)
             img = Image.merge("HSV", (h, s, v)).convert("RGBA")
+            img.putalpha(alpha)
         layer.image = img
         canvas._save_state()
         return [TextContent(text="Adjustments applied.")]
@@ -435,34 +552,38 @@ def _apply_sepia(img: Image.Image) -> Image.Image:
 
 
 @app.tool("apply_filter")
-async def apply_filter(name: str, session_id: str = "default", **params):
-    """Apply a filter: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, find_edges, emboss, pixelate, posterize, solarize, invert, grayscale, sepia."""
+async def apply_filter(name: str, session_id: str = "default", *, radius: float = 2.0, size: int = 8, levels: int = 4):
+    """Apply a filter: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, edge_enhance_more, find_edges, smooth, smooth_more, emboss, pixelate, posterize, solarize, invert, grayscale, sepia. Params: radius (gaussian_blur), size (pixelate), levels (posterize)."""
     try:
         canvas = sessions.get_or_create(session_id)
         layer = canvas.layers[canvas.active_layer_index]
         img = layer.image
+        alpha = img.getchannel("A")
         filters = {
-            "blur": lambda **k: img.filter(ImageFilter.BLUR),
-            "gaussian_blur": lambda **k: img.filter(ImageFilter.GaussianBlur(k.get("radius", 2))),
-            "sharpen": lambda **k: img.filter(ImageFilter.SHARPEN),
-            "contour": lambda **k: img.filter(ImageFilter.CONTOUR),
-            "detail": lambda **k: img.filter(ImageFilter.DETAIL),
-            "edge_enhance": lambda **k: img.filter(ImageFilter.EDGE_ENHANCE),
-            "edge_enhance_more": lambda **k: img.filter(ImageFilter.EDGE_ENHANCE_MORE),
-            "find_edges": lambda **k: img.filter(ImageFilter.FIND_EDGES),
-            "smooth": lambda **k: img.filter(ImageFilter.SMOOTH),
-            "smooth_more": lambda **k: img.filter(ImageFilter.SMOOTH_MORE),
-            "emboss": lambda **k: img.filter(ImageFilter.EMBOSS),
-            "pixelate": lambda **k: _pixelate(img, k.get("size", 8)),
-            "posterize": lambda **k: ImageOps.posterize(img.convert("RGB"), k.get("levels", 4)).convert("RGBA"),
-            "solarize": lambda **k: ImageOps.solarize(img.convert("RGB")).convert("RGBA"),
-            "invert": lambda **k: ImageOps.invert(img.convert("RGB")).convert("RGBA"),
-            "grayscale": lambda **k: img.convert("L").convert("RGBA"),
-            "sepia": lambda **k: _apply_sepia(img),
+            "blur": lambda: img.filter(ImageFilter.BLUR),
+            "gaussian_blur": lambda: img.filter(ImageFilter.GaussianBlur(radius)),
+            "sharpen": lambda: img.filter(ImageFilter.SHARPEN),
+            "contour": lambda: img.filter(ImageFilter.CONTOUR),
+            "detail": lambda: img.filter(ImageFilter.DETAIL),
+            "edge_enhance": lambda: img.filter(ImageFilter.EDGE_ENHANCE),
+            "edge_enhance_more": lambda: img.filter(ImageFilter.EDGE_ENHANCE_MORE),
+            "find_edges": lambda: img.filter(ImageFilter.FIND_EDGES),
+            "smooth": lambda: img.filter(ImageFilter.SMOOTH),
+            "smooth_more": lambda: img.filter(ImageFilter.SMOOTH_MORE),
+            "emboss": lambda: img.filter(ImageFilter.EMBOSS),
+            "pixelate": lambda: _pixelate(img, size),
+            "posterize": lambda: ImageOps.posterize(img.convert("RGB"), levels).convert("RGBA"),
+            "solarize": lambda: ImageOps.solarize(img.convert("RGB")).convert("RGBA"),
+            "invert": lambda: ImageOps.invert(img.convert("RGB")).convert("RGBA"),
+            "grayscale": lambda: img.convert("L").convert("RGBA"),
+            "sepia": lambda: _apply_sepia(img),
         }
         if name not in filters:
             return [TextContent(text=f"Unknown filter: {name}. Available: {', '.join(filters.keys())}")]
-        layer.image = filters[name](**params)
+        result = filters[name]()
+        if name in ("invert", "grayscale", "posterize", "solarize"):
+            result.putalpha(alpha)
+        layer.image = result
         canvas._save_state()
         return [TextContent(text=f"Filter '{name}' applied.")]
     except Exception as e:
@@ -475,6 +596,7 @@ async def add_text(text: str, x: int = 50, y: int = 50, font_size: int = 48, col
                    session_id: str = "default"):
     """Add text overlay to the active layer. Preserve the user's lettering exactly,
     including case, punctuation and language; do not paraphrase or add prompt tags.
+    The default font has limited glyph coverage; supply a font path for other scripts.
     """
     try:
         canvas = sessions.get_or_create(session_id)
@@ -482,9 +604,9 @@ async def add_text(text: str, x: int = 50, y: int = 50, font_size: int = 48, col
         img = layer.image.copy()
         draw = ImageDraw.Draw(img)
         try:
-            f = ImageFont.truetype(font, font_size) if font and os.path.exists(font) else ImageFont.load_default()
-        except Exception:
-            f = ImageFont.load_default()
+            f = ImageFont.truetype(font, font_size) if font and os.path.exists(font) else ImageFont.load_default(size=font_size)
+        except OSError:
+            f = ImageFont.load_default(size=font_size)
         if stroke_width > 0:
             draw.text((x, y), text, font=f, fill=stroke_color, stroke_width=stroke_width, stroke_fill=stroke_color)
         draw.text((x, y), text, font=f, fill=color)
@@ -544,6 +666,55 @@ async def set_layer_opacity_tool(opacity: float, index: Optional[int] = None, se
         return [TextContent(text="Invalid layer index")]
     except Exception as e:
         return [TextContent(text=f"Opacity error: {str(e)}")]
+
+
+@app.tool("set_layer_visibility")
+async def set_layer_visibility_tool(visible: bool, index: Optional[int] = None, session_id: str = "default"):
+    """Show or hide a layer, including originals hidden by an AI edit."""
+    try:
+        canvas = sessions.get_or_create(session_id)
+        if canvas.set_layer_visibility(visible, index):
+            return [TextContent(text=f"Layer visibility set to {visible}")]
+        return [TextContent(text="Invalid layer index")]
+    except Exception as e:
+        return [TextContent(text=f"Visibility error: {str(e)}")]
+
+
+@app.tool("rename_layer")
+async def rename_layer_tool(name: str, index: Optional[int] = None, session_id: str = "default"):
+    """Rename a layer."""
+    try:
+        canvas = sessions.get_or_create(session_id)
+        if canvas.rename_layer(name, index):
+            return [TextContent(text=f"Layer renamed to '{name}'")]
+        return [TextContent(text="Invalid layer index")]
+    except Exception as e:
+        return [TextContent(text=f"Rename error: {str(e)}")]
+
+
+@app.tool("duplicate_layer")
+async def duplicate_layer_tool(index: Optional[int] = None, name: Optional[str] = None, session_id: str = "default"):
+    """Insert an independent copy above a layer, preserve its settings, and select the copy."""
+    try:
+        canvas = sessions.get_or_create(session_id)
+        idx = canvas.duplicate_layer(index, name)
+        if idx is not None:
+            return [TextContent(text=f"Duplicated layer at index {idx}")]
+        return [TextContent(text="Invalid layer index")]
+    except Exception as e:
+        return [TextContent(text=f"Duplicate error: {str(e)}")]
+
+
+@app.tool("translate_layer")
+async def translate_layer_tool(dx: int, dy: int, index: Optional[int] = None, session_id: str = "default"):
+    """Move layer pixels and mask by relative (dx, dy). Clips overflow; undo restores it."""
+    try:
+        canvas = sessions.get_or_create(session_id)
+        if canvas.translate_layer(dx, dy, index):
+            return [TextContent(text=f"Layer translated by ({dx}, {dy})")]
+        return [TextContent(text="Invalid layer index")]
+    except Exception as e:
+        return [TextContent(text=f"Translate error: {str(e)}")]
 
 
 @app.tool("merge_down")
@@ -852,12 +1023,12 @@ async def curves_tool(red: str = "", green: str = "", blue: str = "", session_id
 async def upscale_tool(factor: int = 2, model: str = "anime", session_id: str = "default"):
     """Upscale by factor (1-4), preserving layer alignment. Automatically starts ComfyUI; no manual startup is required.
 
-    model: anime, face, or an installed model filename.
+    model: anime, face, general, or an installed model filename.
     """
     try:
         if factor not in (1, 2, 3, 4):
             raise ValueError("factor must be 1, 2, 3, or 4")
-        model_map = {"anime": MODEL_UPSCALE_ANIME, "face": MODEL_UPSCALE_FACE}
+        model_map = {"anime": MODEL_UPSCALE_ANIME, "face": MODEL_UPSCALE_FACE, "general": MODEL_UPSCALE_GENERAL}
         upscale_model = model_map.get(model, model)
         canvas = sessions.get_or_create(session_id)
         original_state = canvas.undo_stack[-1]
@@ -996,7 +1167,7 @@ DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_ou
 @with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
 async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
                               export_format: str = "PNG", timeout: Optional[int] = None):
-    """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass and export each result.
+    """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass, await completion, and export all results.
 
     Automatically starts ComfyUI when needed; no manual startup is required.
 
@@ -1006,15 +1177,20 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     Models may differ per job. Omitted steps/cfg use model defaults:
     flux2=50/4, qwen21=30/3 (custom preset), anima=30/4. Explicit values are preserved.
     For flux2 jobs, cfg is embedded FluxGuidance and negative_prompt is unused/reported.
-    All jobs are submitted up front so the batch runs unattended (GPU batching rule:
-    queue in a detached host process before asking approval to stop the qwen38 LLM container).
-    export_dir defaults to <server>/batch_output; export_format: PNG or JPG.
+    This tool waits for the batch results before exporting. Use submit_generation_job for a returned job ID
+    and per-image exports; its MCP server process must remain running. For work that must continue after
+    the LLM stops, verify independent server lifetime or use a detached host runner (see MEMORY.md).
+    export_dir defaults to <server>/batch_output; export_format: PNG, JPG, or JPEG.
+    Existing files are preserved by adding numeric filename suffixes.
     timeout: seconds for the whole batch wait. Returns a JSON summary with per-job
     status, output file path, and seed.
     """
     try:
         if not jobs:
             return [TextContent(text="jobs must contain at least one job")]
+        fmt = export_format.upper()
+        if fmt not in ("PNG", "JPG", "JPEG"):
+            return [TextContent(text="export_format must be PNG, JPG, or JPEG")]
         for i, job in enumerate(jobs):
             if not isinstance(job, dict) or not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job {i} is invalid: each job needs a non-empty 'prompt' string")]
@@ -1052,7 +1228,6 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
         batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
         out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
-        fmt = export_format.upper()
         ext = "jpg" if fmt in ("JPG", "JPEG") else fmt.lower()
         results = []
         for i, entry in enumerate(batch):
@@ -1075,14 +1250,31 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
                 continue
             base = str(job.get("filename") or f"batch_{i:03d}")
             base = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)[:60]
-            path = out_dir / f"{base}.{ext}"
             with Image.open(io.BytesIO(data)) as img:
+                img.load()
                 if fmt in ("JPG", "JPEG"):
-                    img.convert("RGB").save(path, "JPEG", quality=95)
-                else:
-                    img.save(path, ext)
-                record["size"] = list(img.size)
-            record["file"] = str(path)
+                    img = img.convert("RGB")
+                candidate = base
+                suffix = 0
+                while True:
+                    candidate_path = out_dir / f"{candidate}.{ext}"
+                    try:
+                        output_file = candidate_path.open("xb")
+                        break
+                    except FileExistsError:
+                        suffix += 1
+                        candidate = f"{base}_{suffix}"
+                try:
+                    with output_file:
+                        if fmt in ("JPG", "JPEG"):
+                            img.save(output_file, "JPEG", quality=95)
+                        else:
+                            img.save(output_file, "PNG")
+                    record["size"] = list(img.size)
+                except Exception:
+                    candidate_path.unlink(missing_ok=True)
+                    raise
+            record["file"] = str(candidate_path)
             results.append(record)
         summary = {"jobs": len(results), "ok": sum(1 for r in results if r["status"] == "ok"),
                    "failed": sum(1 for r in results if r["status"] != "ok"),
@@ -1090,6 +1282,91 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
         return [TextContent(text=json.dumps({"summary": summary, "results": results}, indent=2))]
     except Exception as e:
         return [TextContent(text=f"Batch generation error: {str(e)}")]
+
+
+async def _generate_job_item(item: dict, index: int, export_dir: Optional[str], export_format: str, timeout_per_image: Optional[int]):
+    entry = item.copy()
+    if not entry.get("filename"):
+        entry["filename"] = f"batch_{index:03d}"
+    response = await batch_generate_tool(jobs=[entry], export_dir=export_dir, export_format=export_format, timeout=timeout_per_image)
+    try:
+        payload = json.loads(response[0].text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(response[0].text) from e
+    return payload["results"][0]
+
+
+generation_jobs = GenerationJobs(_generate_job_item)
+
+
+@app.tool("submit_generation_job")
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
+async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = None,
+                                export_format: str = "PNG", timeout_per_image: Optional[int] = None):
+    """Submit a generation job for asynchronous processing.
+
+    Jobs are processed one image at a time; each image is exported before the next begins.
+    Lifecycle: process-local; survives HTTP client disconnect only while the MCP server keeps running;
+    restart/closed stdio process loses job state/worker; exported files persist.
+    Cancellation is graceful: current image finishes and exports; remaining images skipped, no Comfy interrupt.
+
+    Supported job fields: prompt (required), model ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime), width, height, steps, cfg, seed, negative_prompt, filename.
+    Default steps/guidance: flux2=50/4, qwen21=30/3, anima=30/4.
+    timeout_per_image: optional seconds per image; omitted uses the selected model's timeout.
+    """
+    try:
+        if not jobs:
+            return [TextContent(text="jobs must contain at least one job")]
+        fmt = export_format.upper()
+        if fmt not in ("PNG", "JPG", "JPEG"):
+            return [TextContent(text="export_format must be PNG, JPG, or JPEG")]
+        if timeout_per_image is not None and timeout_per_image <= 0:
+            return [TextContent(text="timeout_per_image must be positive when provided")]
+        for i, job in enumerate(jobs):
+            if not isinstance(job, dict):
+                return [TextContent(text=f"Job at index {i} must be a dict")]
+            if not str(job.get("prompt", "")).strip():
+                return [TextContent(text=f"Job at index {i} must have a non-empty prompt")]
+            model = job.get("model", "flux2")
+            if model not in ("flux2", "qwen21", "anima"):
+                return [TextContent(text=f"Job at index {i} has invalid model '{model}'. Must be flux2, qwen21, or anima.")]
+        report = generation_jobs.submit(jobs, export_dir=export_dir, export_format=fmt, timeout_per_image=timeout_per_image)
+        return [TextContent(text=json.dumps(report, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"Submit generation job error: {str(e)}")]
+
+
+@app.tool("get_job_status")
+async def get_job_status(job_id: str):
+    """Get the status of a generation job."""
+    try:
+        report = generation_jobs.status(job_id)
+        return [TextContent(text=json.dumps(report, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"Get job status error: {str(e)}")]
+
+
+@app.tool("list_jobs")
+async def list_jobs():
+    """List all generation jobs."""
+    try:
+        summaries = generation_jobs.list_jobs()
+        return [TextContent(text=json.dumps(summaries, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"List jobs error: {str(e)}")]
+
+
+@app.tool("cancel_job")
+async def cancel_job(job_id: str):
+    """Cancel a generation job.
+
+    Cancellation is graceful: current image finishes and exports; remaining images skipped, no Comfy interrupt.
+    """
+    try:
+        report = generation_jobs.cancel(job_id)
+        return [TextContent(text=json.dumps(report, indent=2))]
+    except Exception as e:
+        return [TextContent(text=f"Cancel job error: {str(e)}")]
 
 
 # ======================================================================= #

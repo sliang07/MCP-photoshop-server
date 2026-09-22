@@ -138,10 +138,11 @@ def build_generation_workflow(backend, profile, prompt, negative_prompt="", widt
     return graph
 
 
-def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed, resolution=0):
+def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed, resolution=0, cfg=None):
     """Use reference conditioning, separate from the sampled output latent."""
     if backend not in ("flux2", "qwen21"):
         raise ValueError("Instruction editing requires qwen21 or flux2; Anima supports generation only")
+    cfg = profile["default_cfg"] if cfg is None else cfg
     graph = {}
 
     def node(kind, **inputs):
@@ -160,7 +161,7 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         loaded.append(image)
     if backend == "flux2":
         positive = node("CLIPTextEncode", clip=clip, text=prompt)
-        positive = node("FluxGuidance", conditioning=positive, guidance=profile["default_cfg"])
+        positive = node("FluxGuidance", conditioning=positive, guidance=cfg)
         for image in loaded:
             latent = node("VAEEncode", pixels=image, vae=vae)
             positive = node("ReferenceLatent", conditioning=positive, latent=latent)
@@ -179,7 +180,7 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
                        **{f"images.image_{i + 1}": image for i, image in enumerate(loaded)})
         positive, negative, latent = encoder, [encoder[0], 1], [encoder[0], 2]
         sampled = node("KSampler", model=model, positive=positive, negative=negative,
-                       latent_image=latent, seed=seed, steps=steps, cfg=profile["default_cfg"],
+                       latent_image=latent, seed=seed, steps=steps, cfg=cfg,
                        sampler_name=profile["sampler"], scheduler=profile["scheduler"], denoise=profile["denoise"])
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix="mcp_instruction_edit")
@@ -339,7 +340,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
         No manual startup is required. This check does not load generation models.
         Set start_if_needed=False only for a passive check; offline does not mean editing is unavailable.
-        Choose qwen21 for detail/text/alpha, flux2 for speed, anima for anime generation.
+        Choose qwen21 for detail/text/alpha, flux2 for reference-guided rendering, anima for anime generation.
         Anima is generation-only; upscaling and semantic selection use their dedicated models.
         """
         try:
@@ -369,10 +370,12 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             "sam3": sam3_capabilities(info),
             "notes": ["Availability checks files and nodes; it does not benchmark generation or guarantee VRAM fit.",
                       "semantic_select runs SAM 3 text/point/box prompts on the canvas (point/box use sam3.pt; text prompts use sam3.1_multiplex_fp16.safetensors, both in models/checkpoints). select_object stays the fast color-heuristic fallback.",
-                      "edit_image supports independent white-to-edit masks and returns a new undoable layer.",
+                      "edit_image supports independent white-to-edit masks. Default composite edits add a replacement layer; layer_index edits only that layer's pixels; output_mode=extract adds a Qwen 2.1 subject layer. Inspect the preview and reported has_transparency.",
+                      "export_mask copies a layer selection to a reusable edit-mask PNG without changing the document; supports invert, expand/shrink and feather.",
                       "Legacy select_object uses color heuristics, not semantic object segmentation.",
                       "outpaint supports flux2 or qwen21 reference conditioning; original pixels are restored after generation. Style/identity guidance uses edit_image reference_paths.",
-                      "batch_generate queues a whole job list on one WebSocket connection and exports each result to disk as it completes (see the GPU batching rule).",
+                      "batch_generate queues a whole job list, awaits completion, then exports. submit_generation_job returns an ID and exports between images; use get_job_status/list_jobs for progress and cancel_job to stop after the current image.",
+                      "Background jobs survive HTTP client disconnect only while the same MCP server process runs. Server restart or closing stdio loses workers/status; exported files remain.",
                       "The GPU may be shared with qwen38. Never stop that LLM container without explicit approval.",
                       "Full GPU batching procedure: MEMORY.md, section 'GPU Contention & Batching Rule'."],
         }
@@ -383,7 +386,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
     async def edit_image(prompt: str, backend: Literal["qwen21", "flux2"] = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
-                         max_side: int = 1024, session_id: str = "default", timeout: int | None = None):
+                         max_side: int = 1024, session_id: str = "default", timeout: int | None = None, cfg: float | None = None,
+                         layer_index: int | None = None, output_mode: Literal["replace", "extract"] = "replace"):
         """Instruction-edit the canvas: remove objects, replace backgrounds, restyle, or use identity references.
 
         Automatically starts ComfyUI when needed; no manual startup is required.
@@ -393,17 +397,22 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Both support object removal, background replacement, restyling and references.
         Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
-        Image 1 is the canvas; images 2 onward are reference_paths, in order. For Qwen use
+        Image 1 is the canvas or the specified layer; images 2 onward are reference_paths, in order. For Qwen use
         <image1>, <image2>, etc. with multiple inputs (including a mask); for a lone canvas
         use 'the image' without tags. Describe the change and the identity/features to preserve.
         Qwen recommends at most 10 total images; this ComfyUI node accepts 16 including the mask.
         max_side limits working resolution (1024 default; use 2048 for fine detail), rounded to the model grid.
         Optional mask_path is grayscale, white=edit, black=preserve; or region=[x,y,width,height].
-        The mask is sent to the model as the last image and also enforces exact preservation outside it.
+        The mask is sent to the model last. Replace mode preserves outside pixels exactly;
+        extraction makes outside pixels transparent.
         Layer visibility masks/selections are not edit masks: pass mask_path or region explicitly.
-        Returns one undoable replacement layer and a preview; original layers remain hidden.
+        By default, returns one undoable replacement layer and a preview; original layers remain hidden.
+        With layer_index, replaces only that layer's image. With output_mode='extract' (qwen21 only),
+        requests a transparent cutout in a new layer while leaving originals intact.
+        has_transparency reports the result's actual alpha; inspect the returned layer preview.
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
         timeout defaults to 1800 seconds for either backend. Identity preservation is model-dependent.
+        Optional cfg overrides the profile default; omitting it keeps Qwen CFG or FLUX embedded guidance defaults.
         """
         prompt = unwrap_prompt(prompt)
         if not prompt.strip():
@@ -418,11 +427,20 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             seed = secrets.randbits(63)
         if not 0 <= seed < 2**64:
             raise ValueError("seed must be an unsigned 64-bit integer")
+        if output_mode not in ("replace", "extract"):
+            raise ValueError("output_mode must be 'replace' or 'extract'")
+        if output_mode == "extract" and backend != "qwen21":
+            raise ValueError("output_mode='extract' requires backend='qwen21'")
         canvas = sessions.get(session_id)
         if canvas is None:
             raise ValueError("Open an image or create a canvas in this session before calling edit_image")
         original_state = canvas.undo_stack[-1]
-        source = canvas.composite()
+        if layer_index is not None:
+            if layer_index < 0 or layer_index >= len(canvas.layers):
+                raise ValueError(f"layer_index {layer_index} out of bounds (0-{len(canvas.layers)-1})")
+            source = canvas.layers[layer_index].image.copy()
+        else:
+            source = canvas.composite()
         mask = make_edit_mask(source.size, mask_path, region, feather)
         references = reference_paths or []
         limit = (15 - int(mask is not None)) if backend == "qwen21" else None
@@ -437,14 +455,24 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             image_name = (lambda i: f"<image{i}>") if references or mask is not None else (lambda i: "the image")
         else:
             image_name = lambda i: f"image {i}"
-        instruction = f"Edit {image_name(1)}. {prompt.strip()} Preserve content and identity not affected by the requested change."
-        if references:
-            instruction += " Use the reference images only for the features requested; keep the canvas as the base image."
-        if mask is not None:
-            images.append(mask.resize(images[0].size, Image.Resampling.NEAREST).convert("RGBA"))
-            instruction += (f" {image_name(len(images))} is an edit mask for {image_name(1)}: "
-                            "white marks the area to change, black marks the area to preserve. "
-                            "Apply the requested change only in the white area. Do not render the mask in the result.")
+        if output_mode == "extract":
+            instruction = f"Extract the subject from {image_name(1)}. {prompt.strip()} Place the subject on a transparent background. Preserve the subject's appearance, position, and size exactly."
+            if references:
+                instruction += " Use the reference images only for the requested subject features."
+            if mask is not None:
+                images.append(mask.resize(images[0].size, Image.Resampling.NEAREST).convert("RGBA"))
+                instruction += (f" {image_name(len(images))} is an extraction mask for {image_name(1)}: "
+                                "white marks the area to extract, black marks the area to make transparent. "
+                                "Do not render the mask in the result.")
+        else:
+            instruction = f"Edit {image_name(1)}. {prompt.strip()} Preserve content and identity not affected by the requested change."
+            if references:
+                instruction += " Use the reference images only for the features requested; keep the canvas as the base image."
+            if mask is not None:
+                images.append(mask.resize(images[0].size, Image.Resampling.NEAREST).convert("RGBA"))
+                instruction += (f" {image_name(len(images))} is an edit mask for {image_name(1)}: "
+                                "white marks the area to change, black marks the area to preserve. "
+                                "Apply the requested change only in the white area. Do not render the mask in the result.")
         # Readiness checks happen before uploads and expensive inference.
         await comfy.start_comfyui()
         info = await comfy.get_object_info()
@@ -459,7 +487,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             name = f"mcp_edit_{secrets.token_hex(12)}.png"
             files.append(await comfy.upload_image(png_bytes(image), name))
         width, height = images[0].size
-        workflow = build_edit_workflow(backend, profile, instruction, files, width, height, steps, seed)
+        effective_cfg = profile["default_cfg"] if cfg is None else cfg
+        workflow = build_edit_workflow(backend, profile, instruction, files, width, height, steps, seed, cfg=effective_cfg)
         result = await run_workflow(workflow, timeout=timeout or 1800)
         if not result:
             raise RuntimeError("ComfyUI returned no image; the canvas was not modified")
@@ -467,20 +496,84 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             edited = opened.convert("RGBA")
         if edited.size != source.size:
             edited = edited.resize(source.size, Image.Resampling.LANCZOS)
-        if sessions.get_or_create(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
+        if sessions.get(session_id) is not canvas or canvas.undo_stack[-1] is not original_state:
             raise RuntimeError("Canvas changed during generation; result was not applied. It remains in ComfyUI output.")
         if mask is not None:
-            edited = Image.composite(edited, source, mask)
-        for layer in canvas.layers:
-            layer.visible = False
-        index = canvas.add_layer(name=f"Edit ({backend}, seed {seed}): {prompt[:40]}", image=edited)
+            outside = Image.new("RGBA", source.size) if output_mode == "extract" else source
+            edited = Image.composite(edited, outside, mask)
+        has_transparency = edited.getchannel("A").getextrema()[0] < 255
+        if output_mode == "extract":
+            index = canvas.add_layer(name=f"Extract ({backend}, seed {seed}): {prompt[:40]}", image=edited)
+            preview_img = canvas.layers[index].image
+        elif layer_index is not None:
+            canvas.layers[layer_index].image = edited
+            canvas._save_state()
+            index = layer_index
+            preview_img = canvas.layers[layer_index].image
+        else:
+            for layer in canvas.layers:
+                layer.visible = False
+            index = canvas.add_layer(name=f"Edit ({backend}, seed {seed}): {prompt[:40]}", image=edited)
+            preview_img = canvas.composite()
         report = {"layer": index, "backend": backend, "model": profile["model"], "seed": seed,
-                  "steps": steps, "cfg": profile["default_cfg"],
+                  "steps": steps, "cfg": effective_cfg,
                   "sampler": profile["sampler"], "scheduler": profile["scheduler"],
                   "reference_count": len(references), "masked": mask is not None,
                   "generation_size": [width, height], "canvas_size": list(source.size),
-                  "effective_prompt": instruction}
-        return [TextContent(type="text", text=json.dumps(report)), preview_content(canvas.composite())]
+                  "effective_prompt": instruction, "output_mode": output_mode,
+                  "source_layer": layer_index, "has_transparency": has_transparency}
+        return [TextContent(type="text", text=json.dumps(report)), preview_content(preview_img)]
+
+    @app.tool("export_mask")
+    async def export_mask(path: str, index: int | None = None, invert: bool = False, expand: int = 0,
+                          feather: float = 0, session_id: str = "default"):
+        """Export the active layer's selection mask as a standalone PNG file.
+
+        Takes the current visibility selection and exports an independent white-to-edit mask for use with edit_image(mask_path=returned_path).
+        Black pixels are preserved; white pixels are edited. Gaussian feather softens both sides of the boundary.
+        The exported file is independent of later layer changes.
+
+        path: absolute or relative file path where the PNG will be written (overwrites existing files).
+        index: layer index to export (defaults to active layer). Negative or out-of-range values raise errors.
+        invert: if True, invert the mask before other operations.
+        expand: signed pixel expansion (positive grows white areas via MaxFilter, negative shrinks via MinFilter).
+        feather: Gaussian blur radius in pixels (non-negative) applied last to soften boundaries.
+        session_id: canvas session identifier.
+
+        Returns JSON with absolute path, size, source_layer, operations, and a preview image."""
+        canvas = sessions.get(session_id)
+        if canvas is None:
+            raise ValueError(f"Session '{session_id}' not found")
+        if index is None:
+            index = canvas.active_layer_index
+        if index < 0 or index >= len(canvas.layers):
+            raise IndexError(f"Layer index {index} out of range")
+        layer = canvas.layers[index]
+        if layer.mask is None:
+            raise ValueError(f"Layer at index {index} has no mask to export")
+        if feather < 0:
+            raise ValueError("feather must be non-negative")
+        mask = layer.mask.convert("L")
+        if invert:
+            mask = ImageChops.invert(mask)
+        if expand != 0:
+            kernel_size = 2 * abs(expand) + 1
+            if expand > 0:
+                mask = mask.filter(ImageFilter.MaxFilter(kernel_size))
+            else:
+                mask = mask.filter(ImageFilter.MinFilter(kernel_size))
+        if feather > 0:
+            mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
+        target_path = Path(path).resolve()
+        png_data = png_bytes(mask)
+        target_path.write_bytes(png_data)
+        report = {
+            "path": str(target_path),
+            "size": list(mask.size),
+            "source_layer": index,
+            "operations": [op for op, enabled in [("invert", invert), ("expand", expand != 0), ("feather", feather > 0)] if enabled],
+        }
+        return [TextContent(type="text", text=json.dumps(report)), preview_content(mask)]
 
     @app.tool("semantic_select")
     async def semantic_select(prompt: str | None = None, point: list[int] | None = None, box: list[int] | None = None,

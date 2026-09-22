@@ -329,20 +329,117 @@ class Canvas:
             return True
         return False
 
+    def set_layer_visibility(self, visible: bool, index: Optional[int] = None) -> bool:
+        """Set layer visibility. Hidden originals can be shown again."""
+        idx = index if index is not None else self.active_layer_index
+        if 0 <= idx < len(self.layers):
+            self.layers[idx].visible = visible
+            self._save_state()
+            return True
+        return False
+
+    def rename_layer(self, name: str, index: Optional[int] = None) -> bool:
+        """Rename a layer."""
+        idx = index if index is not None else self.active_layer_index
+        if 0 <= idx < len(self.layers):
+            self.layers[idx].name = name
+            self._save_state()
+            return True
+        return False
+
+    def duplicate_layer(self, index: Optional[int] = None, name: Optional[str] = None) -> Optional[int]:
+        """Duplicate a layer. Preserves visibility/settings and selects copy."""
+        idx = index if index is not None else self.active_layer_index
+        if not (0 <= idx < len(self.layers)):
+            return None
+
+        source = self.layers[idx]
+        new_name = name if name is not None else f"{source.name} copy"
+
+        new_image = source.image.copy()
+        new_mask = source.mask.copy() if source.mask else None
+
+        new_layer = Layer(
+            name=new_name,
+            image=new_image,
+            opacity=source.opacity,
+            blend_mode=source.blend_mode,
+            visible=source.visible,
+            mask=new_mask
+        )
+
+        insert_idx = idx + 1
+        self.layers.insert(insert_idx, new_layer)
+        self.active_layer_index = insert_idx
+        self._save_state()
+        return insert_idx
+
+    def translate_layer(self, dx: int, dy: int, index: Optional[int] = None) -> bool:
+        """Translate layer by relative pixel offset. Content outside canvas is clipped, undo restores it."""
+        idx = index if index is not None else self.active_layer_index
+        if not (0 <= idx < len(self.layers)):
+            return False
+
+        layer = self.layers[idx]
+
+        new_image = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        new_mask = None
+        if layer.mask:
+            new_mask = Image.new("L", (self.width, self.height), 0)
+
+        new_image.paste(layer.image, (dx, dy))
+
+        if new_mask:
+            new_mask.paste(layer.mask, (dx, dy))
+
+        layer.image = new_image
+        layer.mask = new_mask
+        self._save_state()
+        return True
+
     def merge_down(self) -> bool:
         """Merge active layer into the layer below it."""
         idx = self.active_layer_index
         if idx <= 0:
             return False
+
         bottom = self.layers[idx - 1]
         top = self.layers[idx]
-        # Apply the top layer's mask first (mirroring composite()), then blend,
-        # so content outside the mask keeps the bottom layer's pixels and alpha.
-        if top.mask is not None:
-            top_image = self._apply_mask(top.image.convert("RGBA"), top.mask)
-        else:
-            top_image = top.image
-        bottom.image = self._apply_blend(bottom.image, top_image, top.blend_mode, top.opacity)
+
+        if top.visible and not bottom.visible:
+            bottom.image = top.image.copy()
+            bottom.mask = top.mask.copy() if top.mask else None
+            bottom.opacity = top.opacity
+            bottom.blend_mode = top.blend_mode
+            bottom.visible = True
+        elif top.visible:
+            temp_canvas = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+
+            bottom_img = bottom.image.convert("RGBA")
+            if bottom.mask is not None:
+                bottom_img = self._apply_mask(bottom_img, bottom.mask)
+            bottom_fn = BLEND_MODES.get(bottom.blend_mode.lower().replace(" ", "_"), blend_normal)
+            temp_canvas = bottom_fn(temp_canvas, bottom_img, bottom.opacity)
+
+            if idx > 1:
+                lower_is_normal = bottom_fn is blend_normal
+                top_fn = BLEND_MODES.get(top.blend_mode.lower().replace(" ", "_"), blend_normal)
+                top_is_normal = top_fn is blend_normal
+
+                if not lower_is_normal or (not top_is_normal and temp_canvas.getextrema()[3] != (255, 255)):
+                    raise ValueError("Cannot merge these blend modes over lower layers; keep them separate or flatten the whole document.")
+
+            top_img = top.image.convert("RGBA")
+            if top.mask is not None:
+                top_img = self._apply_mask(top_img, top.mask)
+            temp_canvas = self._apply_blend(temp_canvas, top_img, top.blend_mode, top.opacity)
+
+            bottom.image = temp_canvas
+            bottom.opacity = 1.0
+            bottom.mask = None
+            bottom.blend_mode = "normal"
+            bottom.visible = True
+
         self.layers.pop(idx)
         self.active_layer_index = idx - 1
         self._save_state()

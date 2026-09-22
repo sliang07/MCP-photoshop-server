@@ -2,18 +2,22 @@
 
 A local MCP (Model Context Protocol) server that combines **Photoshop-style image editing** with **AI image generation** powered by ComfyUI.
 
+This is a standalone editor; it does not control the Adobe Photoshop application.
+
 > **Designed for use with [Cline](https://github.com/cline/cline)** — an AI-powered coding assistant (stdio transport) — **and Open WebUI** (MCP streamable-HTTP transport). This server integrates as an MCP tool provider to enable image generation and editing directly from your Cline workflow or Open WebUI chat.
 
 ## Instruction editing upgrade
 
 - `preview_canvas` returns an image the assistant can inspect.
 - `get_editing_capabilities` starts ComfyUI if needed and reports live model/node availability without loading generation models.
-- `edit_image` defaults to Qwen Image 2.1 with reference guidance, model-visible edit masks, protected outside pixels, RGBA previews, and undoable replacement layers. Original layers remain hidden and can be restored with undo.
+- `edit_image` defaults to Qwen Image 2.1 with reference guidance, model-visible edit masks, protected outside pixels, and RGBA previews. Composite edits hide originals beneath a new replacement layer; use `set_layer_visibility` or undo to restore them. Pass `layer_index` to edit one layer, or `output_mode="extract"` to add an extracted subject while retaining originals.
 - `upscale` now honors its size factor and preserves layer/mask alignment and transparency.
 
 The legacy Flux.1-era tools (`img2img`, `character_transform`, `inpaint`, `controlnet_generate`, `style_transfer`) were removed 2026-09-20 — their models (Flux Kontext, ControlNet, Redux/CLIPVision) are no longer installed. Masked fills, restyling, and style/identity guidance all go through `edit_image` (`region`/`mask_path` for local edits, `reference_paths` for style/identity).
 
 Reconnect the MCP server after saving any in-memory work to load the new tools.
+
+Idle shutdown only stops the ComfyUI process launched by this MCP process, after an empty queue check. Busy or unknown queue state defers shutdown; separately started backends and unrelated port listeners are left running.
 
 ComfyUI does not need to be running beforehand. Call the requested generation/editing tool directly; it starts ComfyUI and waits for readiness. `get_comfyui_status` and `get_editing_capabilities` also start it by default. Pass `start_if_needed=False` only for a passive check. A stopped backend is normal with the five-second idle shutdown; it does not mean the tools are unavailable. Startup messages stay out of the MCP protocol stream.
 
@@ -22,8 +26,11 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 ### Canvas Management
 - `new_canvas` — Create a blank canvas with custom dimensions and background color
 - `open_image` — Load an existing image file
+- `save_project`, `open_project` — Save/reopen layers, masks, names, opacity, blend modes, visibility, dimensions, and the active layer in a local `.mcpproj` file
 - `export` — Save to file (PNG/JPG/WEBP); auto-named when `path` is omitted
 - `get_info` — View canvas dimensions, layers, undo/redo state
+
+Projects are versioned JSON plus lossless PNGs in a ZIP archive, not PSD files. Saving replaces the target atomically; a failed load leaves the current document intact. Opening starts a fresh undo history. Supply a path in an existing directory.
 
 ### AI Image Generation & Editing
 - `generate_image` — Text-to-image with `model="flux2"`, `"qwen21"`, or `"anima"`
@@ -84,23 +91,40 @@ Semantic requirements—intent, lighting, composition, character identity, suita
 - Every canvas tool accepts an optional `session_id` (default `"default"`), so multiple documents can be edited independently in one server process
 - `list_sessions` — List open sessions with size, layer count, and undo depth
 - `close_session` — Close a session by `session_id`, freeing its canvas
-- `batch_generate` — Queue a whole job list on ComfyUI in one pass (single WebSocket connection) and export each result to disk as it completes
+- `batch_generate` — Queue a whole job list on ComfyUI in one pass (single WebSocket connection), await full batch completion, then export results to disk. Existing files are preserved using numeric suffixes such as `_1`.
+- `submit_generation_job` — Return a job ID immediately; process images one at a time and export each result before starting the next
+- `get_job_status`, `list_jobs` — Read completed-image counts, current item, results, and exported paths
+- `cancel_job` — Let the current image finish and export, then skip remaining images; other jobs are unaffected
+
+Background jobs and their status belong to one MCP server process. They survive an HTTP client disconnect while that process remains running; closing a stdio server or restarting the server loses the worker and status. Already exported files remain. Background jobs run serially and do not interrupt unrelated ComfyUI work. Use the returned job ID with the same server instance.
 
 ### Deterministic Editing (Pillow — no GPU needed)
-- `crop`, `resize`, `rotate`, `flip` — Transform operations
-- `adjust` — Brightness, contrast, saturation, hue, sharpness
+- `crop`, `resize` — Transform every layer and mask; aspect-preserving resize centers the fitted document in transparent padding
+- `rotate`, `flip` — Transform the active layer and mask; expanded rotation pads the other layers without rotating them
+- `adjust` — Brightness, contrast, saturation, hue in degrees, sharpness; hue preserves alpha
 - `levels` — Black point, mid point (gamma), white point adjustment
 - `curves` — Per-channel tone curves (R/G/B) with control points
 - `apply_filter` — 17 filters: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, edge_enhance_more, find_edges, smooth, smooth_more, emboss, pixelate, posterize, solarize, invert, grayscale, sepia
-- `add_text` — Text overlay with font, color, stroke support
+- `add_text` — Text overlay with font, color, stroke support. The default font honors `font_size` (Pillow 10.1+); supply a font file for scripts outside its limited glyph coverage.
+
+`apply_filter` accepts optional `radius` (Gaussian blur, default 2), `size` (pixelate, default 8), and `levels` (posterize, default 4). Color-only filters preserve alpha.
 
 ### Upscaling
-- `upscale` — AI upscaling via ComfyUI (ESRGAN/SUPIR models)
+- `upscale` — AI upscaling via ComfyUI: `general` uses `RealESRGAN_x4plus.pth`, `anime` and `face` retain their existing models. An installed model filename is also accepted; the default remains `anime`.
 
 ### Layer System
 - `add_layer`, `select_layer`, `delete_layer`, `merge_down`, `reorder_layer`
 - `set_blend_mode` — 12 modes: normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion
 - `set_layer_opacity` — Per-layer transparency
+- `set_layer_visibility`, `rename_layer` — Show/hide or rename an addressed layer
+- `duplicate_layer` — Copy pixels, mask, and settings into an independent layer immediately above the original, and select it
+- `translate_layer` — Move a layer and its mask by relative pixel offsets, clipping at the canvas edges
+
+These layer operations accept an optional `index` (defaults to the active layer), preserve document dimensions, and are undoable.
+
+Merge-down applies both layers' opacity, masks, and visibility once. Normal blends may have small 8-bit rounding differences. Combinations whose blend depends on deeper layers return an error without changing the document; keep those layers separate or explicitly flatten the document. Undo restores the original layers.
+
+`edit_image` accepts optional `cfg`: Qwen uses CFG, while FLUX.2 uses embedded guidance. Omitting it preserves the current Qwen 30-step/CFG-3 and FLUX.2 50-step/guidance-4 presets. With `layer_index`, the source is that layer's raw pixels and replacement preserves its mask and other settings. With `output_mode="extract"` (Qwen only), the result becomes a new layer while originals retain their pixels and visibility. Inspect the returned preview and `has_transparency`; actual extraction quality depends on the model output. Qwen Image 2.1 already provides the required RGBA capability, so no separate Layered download is needed.
 
 ### Selections & Masks
 - `select_rect` — Rectangular mask
@@ -108,6 +132,9 @@ Semantic requirements—intent, lighting, composition, character identity, suita
 - `select_object` — Heuristic color/region selection (red, blue, sky, dark, etc.)
 - `semantic_select` — SAM 3 semantic object selection (text prompt via SAM 3.1, or point/box) — sets the active layer's mask
 - `clear_mask` — Remove layer mask
+- `export_mask` — Copy a layer mask to an independent grayscale PNG, optionally invert, grow/shrink with signed `expand`, then `feather`; leaves the document and history unchanged
+
+For reusable AI masks: create a selection, call `export_mask(path="selection.png")`, then pass that path to `edit_image(mask_path="selection.png")`. White permits editing and black protects original pixels. The layer visibility mask remains separate; call `clear_mask` after export if it should no longer hide pixels. Mask export needs no GPU and replaces the explicitly named output file.
 
 ### History
 - `undo` / `redo` — Full operation history (up to 20 steps)
@@ -116,7 +143,7 @@ Semantic requirements—intent, lighting, composition, character identity, suita
 - `get_comfyui_status` — Check ComfyUI connection (starts it by default; `start_if_needed=False` for a passive check)
 - `clear_vram` — Free GPU memory
 
-> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. For multiple or long ComfyUI generations, queue the whole batch to run in the background, then ask the user for explicit approval to stop the `qwen38` container (stopping it ends the LLM session; the batch keeps running on the host). `searxng` is CPU-only and never needs stopping. `batch_generate` implements the queue side server-side: it submits the whole job list up front on one WebSocket connection and exports each result as it completes; the `docker stop qwen38` approval step remains a conversation-level decision. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
+> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. Check contention before proposing changes. `submit_generation_job` retains the complete input list in the MCP server and exports between images, but its server process must remain running independently of the LLM connection. If that lifetime is uncertain, use a detached host runner. `batch_generate` waits for the whole batch before exporting and does not detach. Stopping `qwen38` ends the LLM session and still requires explicit user approval after background ownership is established. `searxng` is CPU-only and never needs stopping. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
 
 ## Installation
 
@@ -143,6 +170,7 @@ Semantic requirements—intent, lighting, composition, character identity, suita
   - Requires native `TextEncodeQwenImage21`, `QwenImage21Cache`, and `JoinImageWithAlpha` nodes. The old Qwen VAE remains necessary for ANIMA; Qwen 2511 models and Lightning adapters are not used by the editor.
 
   **Upscaling:**
+  - `RealESRGAN_x4plus.pth` (upscale_models) — General/photo upscaling
   - `RealESRGAN_x4plus_anime_6B.pth` (upscale_models) — Anime upscaling
   - `4xFaceUpDAT.pth` (upscale_models) — Face upscaling
 
@@ -177,6 +205,8 @@ Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_confi
   }
 }
 ```
+
+> **Local artifacts (gitignored):** `.env`, `mcp_http.log`, `batch_output/` and `verification/` hold machine-specific paths and runtime outputs (e.g. `.env` points at this machine's ComfyUI install; verification status JSONs contain local file paths). They are excluded by `.gitignore` — never commit or share them.
 
 ### Using with Open WebUI
 
@@ -219,8 +249,8 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
 | `COMFYUI_MAIN` | *(required for auto-start)* | Path to ComfyUI's `main.py` |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Extra startup arguments |
-| `COMFYUI_AUTO_KILL` | `1` (recommended) | Kill after generation (`0`=VRAM pressure mode, `1`=idle timeout mode) |
-| `COMFYUI_IDLE_TIMEOUT` | `5` | Seconds of inactivity before auto-kill (when AUTO_KILL=1) |
+| `COMFYUI_AUTO_KILL` | code default `0`; `1` recommended | Kill after generation (`0`=VRAM pressure mode, `1`=idle timeout mode) |
+| `COMFYUI_IDLE_TIMEOUT` | code default `60`; `5` recommended | Seconds of inactivity before auto-kill (when AUTO_KILL=1); 5 s prevents Cline freezes |
 | `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI to start |
 | `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM drops below this (MB) |
 | `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion |
@@ -231,18 +261,20 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 ```
 mcp-photoshop-server/
-├── server.py           # MCP server; 39 tools including editing registrations (canvas tools accept session_id)
+├── server.py           # MCP server; 50 tools including editing registrations (canvas tools accept session_id)
 ├── editing.py          # Instruction editing backends (qwen21 / flux2) + semantic selection + live capabilities
 ├── prompt_rules.py     # Tool-level master guidance, source reader and conservative prompt normalization
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
 ├── canvas.py           # Layered document with blend modes + undo/redo
 ├── session.py          # Per-session document management
+├── project.py          # Atomic layered-project save/load (versioned ZIP, JSON and PNG)
+├── jobs.py             # Process-owned background generation, progress and graceful cancellation
 ├── requirements.txt    # Python dependencies
 ├── masters/            # Master prompt files (Flux/Anima/Qwen) read by get_prompt_guidance
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (108 tests)
+├── tests/              # Regression suite (176 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md
@@ -320,8 +352,10 @@ mcp-photoshop-server/
 ```
 
 ## Future Work
+- [x] Layer controls, local layered projects, reusable edit masks, selected-layer edits, and Qwen extraction (2026-09-22; CPU coverage plus real Qwen extraction/masked-layer smoke checks)
+- [x] Background generation with progress, graceful cancellation, and per-image exports (2026-09-22; survives HTTP disconnect while the MCP process runs)
 - [x] SAM-based semantic selection — delivered via the `semantic_select` tool (SAM 3 text/point/box prompts, live-verified 2026-09-17)
 - [x] Multi-session support — all canvas tools accept `session_id`; `list_sessions`/`close_session` manage multiple open documents (2026-09-18)
-- [x] Batch processing — `batch_generate` queues a whole job list on one WebSocket connection and exports each result as it completes (live-verified 2026-09-18)
+- [x] Batch processing — `batch_generate` queues a whole job list on one WebSocket connection, awaits completion, and exports all results (live-verified 2026-09-18)
 - [x] Legacy ControlNet/Redux workflow repair — Flux2 pixel-dim latents, `ControlNetApply.conditioning`, `CLIPVisionLoader` + `crop`/`strength_type`, plus live capability pre-checks in `get_editing_capabilities` (2026-09-18)
 - [ ] Additional ComfyUI custom nodes integration (beyond ControlNet/Redux/SAM3 — e.g. new node packs)

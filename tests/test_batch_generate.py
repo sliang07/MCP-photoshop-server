@@ -79,6 +79,97 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("at least one job", out[0].text)
         self.client.batch_run_workflows.assert_not_awaited()
 
+    async def test_repeated_calls_preserve_original_bytes(self):
+        red_png = png_bytes(color=(200, 30, 60))
+        blue_png = png_bytes(color=(30, 60, 200))
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": red_png}, "error": None}]
+        await self.server.batch_generate_tool(
+            jobs=[{"prompt": "a", "width": 16, "height": 16, "steps": 4, "filename": "same"}],
+            export_dir=self.tmp.name)
+        first_path = Path(self.tmp.name) / "same.png"
+        self.assertTrue(first_path.is_file())
+        first_bytes = first_path.read_bytes()
+        self.assertEqual(first_bytes, red_png)
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": blue_png}, "error": None}]
+        await self.server.batch_generate_tool(
+            jobs=[{"prompt": "b", "width": 16, "height": 16, "steps": 4, "filename": "same"}],
+            export_dir=self.tmp.name)
+        second_path = Path(self.tmp.name) / "same_1.png"
+        self.assertTrue(second_path.is_file())
+        self.assertEqual(first_path.read_bytes(), red_png)
+        self.assertEqual(second_path.read_bytes(), blue_png)
+        self.assertNotEqual(first_path.read_bytes(), second_path.read_bytes())
+
+    async def test_duplicate_basenames_in_one_batch(self):
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None},
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
+        await self.server.batch_generate_tool(
+            jobs=[{"prompt": "a", "width": 16, "height": 16, "steps": 4, "filename": "dup"},
+                  {"prompt": "b", "width": 16, "height": 16, "steps": 4, "filename": "dup"}],
+            export_dir=self.tmp.name)
+        self.assertTrue((Path(self.tmp.name) / "dup.png").is_file())
+        self.assertTrue((Path(self.tmp.name) / "dup_1.png").is_file())
+
+    async def test_unsupported_format_rejected_before_startup(self):
+        out = await self.server.batch_generate_tool(
+            jobs=[{"prompt": "x", "width": 16, "height": 16, "steps": 4}],
+            export_dir=self.tmp.name,
+            export_format="GIF")
+        self.assertIn("export_format must be PNG, JPG, or JPEG", out[0].text)
+        self.client.start_comfyui.assert_not_awaited()
+        self.client.batch_run_workflows.assert_not_awaited()
+
+    async def test_filename_sanitization_keeps_output_inside_export_dir(self):
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
+        out = await self.server.batch_generate_tool(
+            jobs=[{"prompt": "x", "width": 16, "height": 16, "steps": 4, "filename": "../../etc/passwd"}],
+            export_dir=self.tmp.name)
+        expected = Path(json.loads(out[0].text)["results"][0]["file"])
+        self.assertTrue(expected.is_file())
+        self.assertEqual(expected.parent, Path(self.tmp.name))
+        self.assertNotIn("/", expected.name)
+        self.assertNotIn("\\", expected.name)
+
+    async def test_backslash_filename_sanitization(self):
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
+        out = await self.server.batch_generate_tool(
+            jobs=[{"prompt": "x", "width": 16, "height": 16, "steps": 4, "filename": "C:\\Windows\\System32"}],
+            export_dir=self.tmp.name)
+        expected = Path(json.loads(out[0].text)["results"][0]["file"])
+        self.assertTrue(expected.is_file())
+        self.assertEqual(expected.parent, Path(self.tmp.name))
+        self.assertNotIn("/", expected.name)
+        self.assertNotIn("\\", expected.name)
+
+    async def test_jpg_format_accepted_and_saves_as_jpeg(self):
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
+        await self.server.batch_generate_tool(
+            jobs=[{"prompt": "x", "width": 16, "height": 16, "steps": 4, "filename": "test"}],
+            export_dir=self.tmp.name,
+            export_format="jpg")
+        expected = Path(self.tmp.name) / "test.jpg"
+        self.assertTrue(expected.is_file())
+        with Image.open(expected) as img:
+            self.assertEqual(img.format, "JPEG")
+
+    async def test_jpeg_format_accepted_and_saves_as_jpeg(self):
+        self.client.batch_run_workflows.return_value = [
+            {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
+        await self.server.batch_generate_tool(
+            jobs=[{"prompt": "x", "width": 16, "height": 16, "steps": 4, "filename": "test"}],
+            export_dir=self.tmp.name,
+            export_format="jpeg")
+        expected = Path(self.tmp.name) / "test.jpg"
+        self.assertTrue(expected.is_file())
+        with Image.open(expected) as img:
+            self.assertEqual(img.format, "JPEG")
+
 
 if __name__ == "__main__":
     unittest.main()

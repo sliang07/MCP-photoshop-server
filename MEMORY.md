@@ -1,8 +1,30 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-09-21
+> Last updated: 2026-09-22
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-09-22 Live GPU validation and connection confirmation
+
+- The running HTTP MCP server exposes all 50 tools; Open WebUI's native client connection and a tool call passed. The user separately confirmed Cline's live connection.
+- Real Qwen 2.1 extraction and masked selected-layer editing passed at the unchanged 30 steps/CFG 3, Euler/simple, 1024×768. Extraction: 27.27 s, sampled peak whole-device memory 22,114 MiB (21.6 GiB). Masked recolour: 22.36 s, peak 25,731 MiB (25.1 GiB). These are individual smoke measurements, not a broad performance benchmark.
+- Extraction preserves the original layer and yields a usable transparent cabin cutout; mild coloured edge fringe and background alpha noise (typically 0–1/255) remain. Masked editing preserved every outside-mask pixel, the other layer, metadata and visibility mask exactly. Both undo/redo checks passed. Regenerated pixels inside the edit mask have alpha 248–255; their original alpha is not guaranteed.
+- Diagnostic artifacts: `gpu-validation-results.md`, `gpu-validation-restoration.json`, and the two GPU run folders in the local orchestration artifacts. The runner's helper argument collision was fixed after extraction; only the unstarted second test was resumed. No production code change was needed.
+- With explicit user approval, `qwen38` was stopped temporarily, ComfyUI models were unloaded after testing, and `qwen38` was restarted. Its models endpoint returned HTTP 200 with `qwen3.8-27b`. Open WebUI and searxng stayed running. Test documents were isolated and closed after saving; user documents and model presets were unchanged.
+
+## 2026-09-22 Layer, project, mask and background-job tools
+
+- Completed the remaining Qwen-assisted tasks Q07–Q11. Added undoable visibility, rename, independent duplication, and translation with masks; atomic local `.mcpproj` save/open preserves layered state and opens with fresh undo history. This format is ZIP/JSON/PNG, not PSD.
+- `export_mask` creates an independent grayscale PNG with optional invert, grow/shrink, and feather. `edit_image(layer_index=...)` replaces only that layer's pixels; `output_mode="extract"` uses installed Qwen 2.1/RGBA to add a subject layer while retaining originals. Check its preview and actual `has_transparency`; no Layered model download was needed.
+- `submit_generation_job` returns an ID and exports one image before starting the next. `get_job_status`/`list_jobs` expose progress; `cancel_job` finishes the current image and skips the rest without interrupting unrelated work. Workers/status survive HTTP disconnect only while the same MCP process runs, not restart or closure of a stdio process. Exported files persist. Existing `batch_generate` still waits for its complete batch before exporting.
+- Verification: 176 unit tests pass; fresh stdio and streamable-HTTP MCP checks pass with 50 tools. The HTTP check disconnected one client during a mocked generation, then retrieved status and the exported file through another. Evidence: `feature-unit-tests.txt` and `feature_mcp_smoke.json` in the local orchestration artifacts. Initial inference tests were mocked; real GPU validation is recorded in the entry above.
+- No persistent MCP restart, container stop, model download/removal, sampling-preset change, or ComfyUI core edit. Preserve open work before reloading server processes and reconnecting clients. Changes are uncommitted; all Qwen coding requests have finished.
+
+## 2026-09-21 MCP reliability fixes
+
+- Reviewed Qwen3.8-27B proposals fix batch filename collisions, overly broad process shutdown, document transforms/mask alignment, filter MCP arguments, color alpha/hue, merge-down opacity/masks/visibility, and default text size. Merge-down refuses blend combinations that depend on deeper layers rather than silently changing the image.
+- Added `upscale(model="general")` for the installed RealESRGAN model and optional `edit_image(cfg=...)`; existing sampling defaults are unchanged. Batch exports happen after the batch wait, and `batch_generate` does not detach a background worker. Automatic shutdown targets only this MCP process's managed ComfyUI handle and defers when queue state is busy or unknown.
+- Validation at this stage: 150 unit tests and a fresh CPU-only stdio MCP smoke check passed. No new GPU-generation test, container stop, model download/removal, persistent MCP restart, or ComfyUI core change. The planned layer/project/mask/background-job additions were completed in the September 22 entry above.
 
 ## 2026-09-21 FLUX.2 Dev NVFP4 migration
 
@@ -113,7 +135,7 @@
 - **Port management**: Handles Windows TIME_WAIT issues by waiting for port 8188 to be fully bindable
 - **3-strategy kill**: Direct process handle → port-based (netstat) → command-line matching (wmic)
 - **Pre-fetch output**: Downloads result bytes BEFORE killing ComfyUI when auto-kill is enabled
-- **Retry logic**: If ComfyUI fails to start, kills stale processes, clears port, and retries once
+- **Retry logic**: If ComfyUI fails to start, stops only its owned process and retries once after the port clears; a foreign listener or failed cleanup returns an error
 
 **VRAM Pressure Management:**
 - **Adaptive cleanup**: After each generation, checks free VRAM via ComfyUI system_stats or nvidia-smi
@@ -132,23 +154,27 @@
 | `config.py` | Configuration constants, model names, ComfyUI lifecycle | `COMFYUI_URL`, `COMFYUI_START_CMD`, `COMFYUI_PYTHON`, `COMFYUI_MAIN`, `COMFYUI_ARGS`, `COMFYUI_AUTO_KILL`, `COMFYUI_IDLE_TIMEOUT`, `COMFYUI_START_TIMEOUT`, `WEBSOCKET_TIMEOUT`, `VRAM_PRESSURE_THRESHOLD_MB` |
 | `comfy_client.py` | ComfyUI API wrapper with auto-start/idle-kill lifecycle | `ComfyUIClient`: `start_comfyui()`, `kill_comfyui()`, `run_workflow_and_wait()`, `batch_run_workflows()`, `_listen_for_many()`, `_schedule_idle_kill()`, `_cancel_idle_kill()`, `submit_workflow()`, `upload_image()`, `get_output_file()`, `free_memory()` |
 | `canvas.py` | Layered document model with blend modes | `Canvas`: layers with 12 blend modes (all non-normal modes alpha-aware via `_blend_with_alpha` since 2026-09-18), masks, undo/redo stack (20 steps), `resize_canvas()`, `composite()`, `composite_rgb()`, `BLEND_MODES` dict |
-| `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `delete()`, `get_default_session()`, `list_sessions()` |
-| `server.py` | MCP server + all tool registrations + workflow builders | 35 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, `build_upscale_workflow` (outpaint reuses `editing.build_edit_workflow` with server-side PIL padding), `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
-| `editing.py` | Generation and instruction editing backends + live capabilities | 4 `@app.tool()` registrations: `edit_image` (qwen21 default / flux2 Dev; reference + white-to-edit mask routing), `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `model_profiles`, `build_generation_workflow`, `build_edit_workflow` / `build_semantic_select_workflow` |
+| `session.py` | Per-session document management | `SessionManager`: `get_or_create()`, `get()`, `create()`, `replace()`, `delete()`, `get_default_session()`, `list_sessions()` |
+| `project.py` | Local layered-project persistence | `save_project()`, `load_project()`; atomic save, versioned manifest and lossless PNG members |
+| `jobs.py` | Process-owned background generation | `GenerationJobs`: submit, status, list, graceful cancel; serial workers and per-image results |
+| `server.py` | MCP server + all tool registrations + workflow builders | 45 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, `build_upscale_workflow` (outpaint reuses `editing.build_edit_workflow` with server-side PIL padding), `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
+| `editing.py` | Generation and instruction editing backends + live capabilities | 5 `@app.tool()` registrations: `edit_image` (qwen21 default / flux2 Dev; references, masks, layer editing and extraction), `export_mask`, `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `model_profiles`, `build_generation_workflow`, `build_edit_workflow` / `build_semantic_select_workflow` |
 | `prompt_rules.py` | Master prompt integration | Tool description rules, current master-file reader, outer-fence and Anima score-tag normalization |
-| `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.0.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0`, `python-dotenv>=1.0.0` |
+| `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.1.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0`, `python-dotenv>=1.0.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
 | `MEMORY.md` | This file — project memory bank |
 
 ---
 
-## 3. Tool Inventory (39 Tools)
+## 3. Tool Inventory (50 Tools)
 
-### Canvas Management (4)
+### Canvas Management (6)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `new_canvas` | `(width=1024, height=1024, bg_color="white")` | Create blank canvas |
 | `open_image` | `(path: str)` | Load existing image file as active document |
+| `save_project` | `(path: str)` | Atomically save the layered document as ZIP/JSON/PNG |
+| `open_project` | `(path: str)` | Replace the session after a complete valid load; fresh undo history |
 | `export` | `(path=None, format="PNG", quality=95)` | Save to file (PNG/JPG/WEBP); auto-named when `path` is omitted |
 | `get_info` | `()` | Canvas dimensions, layers, undo/redo state |
 
@@ -166,17 +192,17 @@
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="flux2", timeout=None)` | Extend canvas via Flux2 or Qwen 2.1 reference conditioning; preserve original pixels and layer/mask alignment |
-| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None)` | Qwen Image 2.1 (default, custom 30 steps/CFG 3) or FLUX.2 Dev (50 steps/embedded guidance 4); 1800 s timeout; references, white-to-edit mask and undoable layer |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace")` | Qwen Image 2.1 (custom 30/3) or FLUX.2 Dev (50/4); 1800 s timeout; references, masks, composite/selected-layer replacement or Qwen extraction to a new layer |
 | `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability per task: generation, editing, outpaint; notes carry the GPU batching rule |
 | `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
 ### Transforms (4)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `crop` | `(x, y, width, height)` | Crop active layer to region |
-| `resize` | `(width, height, maintain_aspect=False)` | Resize active layer |
-| `rotate` | `(degrees, expand=True, bg_color="transparent")` | Rotate counter-clockwise |
-| `flip` | `(axis="horizontal")` | Flip horizontal or vertical |
+| `crop` | `(x, y, width, height)` | Crop every layer and mask |
+| `resize` | `(width, height, maintain_aspect=False)` | Resize all layers/masks; aspect-preserving mode fits and centers in transparent padding |
+| `rotate` | `(degrees, expand=True, bg_color="transparent")` | Rotate active layer and mask; expanded bounds pad other layers |
+| `flip` | `(axis="horizontal")` | Flip active layer and mask horizontally or vertically |
 
 ### Color Adjustments (3)
 | Tool | Signature | Description |
@@ -188,7 +214,7 @@
 ### Filters (1) — 17 filters available
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `apply_filter` | `(name, **params)` | 17 filters: blur, gaussian_blur, sharpen, contour, detail, edge_enhance, edge_enhance_more, find_edges, smooth, smooth_more, emboss, pixelate, posterize, solarize, invert, grayscale, sepia |
+| `apply_filter` | `(name, session_id="default", *, radius=2, size=8, levels=4)` | 17 filters; explicit Gaussian radius, pixel size, posterize levels; color-only filters preserve alpha |
 
 ### Text (1)
 | Tool | Signature | Description |
@@ -198,9 +224,9 @@
 ### Upscaling (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `upscale` | `(factor=2, model="anime")` | AI upscaling via ComfyUI (model: "anime" or "face") |
+| `upscale` | `(factor=2, model="anime")` | AI upscaling via ComfyUI ("general", "anime", "face", or an installed filename) |
 
-### Layer System (7)
+### Layer System (11)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `add_layer` | `(name=None, source_path=None, opacity=1.0, blend_mode="normal")` | Add new layer, optionally from file |
@@ -210,8 +236,12 @@
 | `merge_down` | `()` | Merge active layer into layer below |
 | `delete_layer` | `(index=None)` | Delete layer by index or active |
 | `reorder_layer` | `(index=None, direction="up")` | Move layer up/down in stack |
+| `set_layer_visibility` | `(visible, index=None)` | Show/hide a layer |
+| `rename_layer` | `(name, index=None)` | Rename a layer |
+| `duplicate_layer` | `(index=None, name=None)` | Independent image/mask/settings copy above original; selects copy |
+| `translate_layer` | `(dx, dy, index=None)` | Move image and mask together, clipping at canvas bounds |
 
-### Selections & Masks (5)
+### Selections & Masks (6)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `select_rect` | `(x, y, width, height)` | Rectangular mask |
@@ -219,6 +249,7 @@
 | `select_object` | `(description, threshold=128)` | Heuristic color/region selection |
 | `semantic_select` | (prompt=None, point=None, box=None, threshold=0.5, refine=2, timeout=None, session_id="default") | SAM 3 semantic object mask; text prompts run `sam3.1_multiplex_fp16.safetensors` (via `CheckpointLoaderSimple` + `CLIPTextEncode`), point/box run `sam3.pt` (via `ImageOnlyCheckpointLoader`) — both in `models/checkpoints/`; applies the union mask to the active layer |
 | `clear_mask` | `(index=None)` | Remove layer mask |
+| `export_mask` | `(path, index=None, invert=False, expand=0, feather=0)` | Export an independent edit-mask PNG; invert, grow/shrink, then feather; document unchanged |
 
 **select_object supported descriptions:** `red, blue, green, sky, dark, shadow, light, white, black, yellow, purple, orange, cyan, pink, brown`
 
@@ -234,12 +265,16 @@
 | `get_comfyui_status` | `(start_if_needed=True)` | Check ComfyUI connection and system info; starts ComfyUI by default |
 | `clear_vram` | `()` | Free GPU VRAM by unloading cached models |
 
-### Sessions & Batch (3)
+### Sessions & Batch (7)
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `list_sessions` | `()` | All open document sessions with size/layers/active layer/undo depth |
 | `close_session` | `(session_id="default")` | Close a session, freeing its canvas |
 | `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (flux2/qwen21/anima) on one WebSocket; returns exported paths, model, steps, CFG and seed |
+| `submit_generation_job` | `(jobs, export_dir=None, export_format="PNG", timeout_per_image=None)` | Return an ID; generate and export one image at a time in the MCP process |
+| `get_job_status` | `(job_id)` | Progress and per-image results for this server instance |
+| `list_jobs` | `()` | Job summaries for this server instance |
+| `cancel_job` | `(job_id)` | Finish/export current image, then skip remaining images |
 
 > Every canvas tool takes an optional `session_id` (default `"default"`) so multiple documents can be edited independently in one server process.
 
@@ -250,17 +285,17 @@
 ### Auto-Start Flow
 1. `run_workflow_and_wait()` calls `_cancel_idle_kill()` then `start_comfyui()` before each workflow
 2. `start_comfyui()` checks if ComfyUI is already running via `/history` endpoint
-3. If not running: ensures port 8188 is free (kills stale processes if needed)
+3. If not running: checks the configured port, stopping only its own stale process; foreign listeners return an error
 4. Launches ComfyUI via embedded Python: `COMFYUI_PYTHON -s COMFYUI_MAIN COMFYUI_ARGS...`
 5. Falls back to `.bat` if Python path doesn't exist
 6. Polls `/history` every 2s until reachable (up to `COMFYUI_START_TIMEOUT`=180s)
-7. On timeout: kills process, waits for port clear, retries once
+7. On timeout: stops the owned process, verifies cleanup and port availability, then retries once
 
 ### Idle Timeout Auto-Kill (when `COMFYUI_AUTO_KILL=1`)
 1. After workflow completes successfully: schedules idle kill via `_schedule_idle_kill()`
 2. Idle timer set to `COMFYUI_IDLE_TIMEOUT` (default 60s / 1 minute)
 3. If a new workflow starts within the timeout: `_cancel_idle_kill()` cancels pending timer
-4. After timeout with no new workflow: `_do_idle_kill()` kills ComfyUI, freeing VRAM
+4. After timeout: checks the shared queue; busy, malformed or unreachable queue state defers shutdown. An empty queue permits stopping only this MCP process's owned backend.
 5. On error (RuntimeError, TimeoutError): immediate kill (no idle delay)
 6. Pre-fetches output file bytes via `/view` endpoint before any kill
 
@@ -277,8 +312,8 @@
 | `COMFYUI_MAIN` | *(required via env var)* | ComfyUI entry point |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_ARGS` | `--windows-standalone-build` | Launch args |
-| `COMFYUI_AUTO_KILL` | `1` (recommended) | Kill after generation (0=use free_memory, 1=idle timeout) |
-| `COMFYUI_IDLE_TIMEOUT` | `5` | Seconds of inactivity before auto-killing (when AUTO_KILL=1) — 5s recommended to prevent Cline freezes |
+| `COMFYUI_AUTO_KILL` | code default `0`; `1` recommended | Kill after generation (0=use free_memory, 1=idle timeout) |
+| `COMFYUI_IDLE_TIMEOUT` | code default `60`; `5` recommended | Seconds of inactivity before auto-killing (when AUTO_KILL=1) — 5s recommended to prevent Cline freezes |
 | `COMFYUI_START_TIMEOUT` | `180` | Seconds to wait for ComfyUI startup |
 | `WEBSOCKET_TIMEOUT` | `600` | Seconds to wait for workflow completion (10 min) |
 | `VRAM_PRESSURE_THRESHOLD_MB` | `8192` | Kill ComfyUI if free VRAM below this (MB) |
@@ -392,15 +427,16 @@ python server.py
 
 ## 9. Testing Status
 
-### Verified Working (39 tools)
+### Verified Working (50 tools)
 - Prompt Guidance: `get_prompt_guidance` (full Flux/Anima masters and task-specific Qwen generation/edit masters; real MCP stdio verified 2026-09-21) ✅
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
+- Local Projects: `save_project`, `open_project` (atomic `.mcpproj` ZIP/JSON/PNG, fresh undo history; unit + live MCP verified 2026-09-22) ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
 - Color Adjustments: `adjust`, `levels`, `curves` ✅
 - Filters: `apply_filter` (all 17 filters) ✅
 - Text: `add_text` ✅
-- Layer System: all 7 tools ✅
-- Selections: `select_rect`, `select_ellipse`, `clear_mask` ✅
+- Layer System: all 11 tools (`duplicate_layer`, `translate_layer`, `set_layer_visibility`, `rename_layer` added 2026-09-22) ✅
+- Selections: `select_rect`, `select_ellipse`, `clear_mask`, `export_mask` (independent edit-mask PNG with invert/expand/feather; 2026-09-22) ✅
 - History: `undo`, `redo` ✅
 - System: `get_comfyui_status`, `clear_vram` ✅
 - AI Generation: `generate_image` (Flux2 + ANIMA) ✅
@@ -410,6 +446,7 @@ python server.py
 - Upscale: `upscale` (anime + face + x4plus general-photo model, live MCP test 2026-09-17) ✅
 - Semantic Selection: `semantic_select` (SAM 3 text/point/box, live CPU MCP test 2026-09-17) ✅
 - Sessions & Batch: `list_sessions`, `close_session`, `batch_generate` + `session_id` on all canvas tools (unit-verified 2026-09-18, 23 new tests; live batch run in `verification/_live_sessions_batch_nodes_test.py`) ✅
+- Background Jobs: `submit_generation_job`, `get_job_status`, `list_jobs`, `cancel_job` (process-owned serial workers, per-image export, graceful cancel; unit + live HTTP disconnect/recovery checks 2026-09-22) ✅
 
 ### Idle Timeout Chaining (tested 2026-08-12)
 - `generate_image` → `img2img` chained successfully without ComfyUI restart (`img2img` removed 2026-09-20; chaining works between any two ComfyUI tools)
@@ -447,15 +484,15 @@ python server.py
 1. Single generation with sufficient GPU memory: run it directly. Dev defaults to 50 steps; the four-step Klein recipe is retired.
 2. Multiple generations or any long job (e.g. `qwen21` edits, full batches):
    a. Plan the complete job list with the user first.
-   b. Queue the whole batch so it runs unattended — back-to-back MCP tool calls in one turn, or (better) a detached host script that posts every prompt to `http://127.0.0.1:8188/prompt` and waits for history. The batch must not depend on the LLM staying alive.
-   c. `export` each result to disk as it completes.
+   b. Hand the complete input list to `submit_generation_job` on an independently running host MCP server, or to a detached host runner. Verify that its process survives loss of the LLM connection; sequential awaited tool calls do not establish background ownership.
+   c. Export each result as it completes (`submit_generation_job` does this automatically). Its job/status state is process-local; server restart or closing a stdio process loses it. Existing `batch_generate` waits for the whole batch before exporting.
    d. **Ask the user for explicit approval** to run `docker stop qwen38` (plus `open-webui` if desired). Stop only after approval, and only once the batch is fully backgrounded.
    e. The batch then runs on the full GPU; results accumulate in ComfyUI's output dir / exported files.
 3. Afterwards, tell the user to `docker start qwen38 open-webui` to restore the LLM.
 
 **Self-kill warning.** `qwen38` serves the LLM that is driving the MCP calls. Stopping it terminates the session — that is exactly what the rule anticipates, and it is only acceptable because step 2b guarantees the batch continues on the host. Never stop `qwen38` mid-conversation with work that still depends on the LLM.
 
-**Side note.** With `COMFYUI_AUTO_KILL=1` and `VRAM_PRESSURE_THRESHOLD_MB=8192`, a loaded `qwen38` can trip the server's VRAM-pressure heuristic (`free_or_kill_based_on_pressure`) and kill ComfyUI mid-batch. Another reason the batch should only be queued after the docker stop (or the threshold raised for the run).
+**Lifetime note.** HTTP client disconnection does not stop a submitted worker while its MCP server remains running. A client-managed stdio server may close with its client; do not assume it can outlive that client. No job persistence or automatic resume across server restart is implemented.
 
 ---
 

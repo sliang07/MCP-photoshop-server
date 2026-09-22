@@ -104,13 +104,16 @@ class ComfyUIClient:
         """
         try:
             queue = await self.get_queue_status()
-            running = queue.get("queue_running", [])
-            pending = queue.get("queue_pending", [])
+            running = queue.get("queue_running")
+            pending = queue.get("queue_pending")
+            if not isinstance(running, list) or not isinstance(pending, list):
+                raise ValueError("Malformed queue status response")
         except Exception as e:
-            # ComfyUI unreachable: nothing can be running via it; proceed
-            # with the kill (kill_comfyui handles "not running" gracefully).
-            logger.warning("Queue check before idle kill failed: %s", e)
-            running, pending = [], []
+            # ComfyUI unreachable or malformed: defer kill to avoid interrupting unknown jobs.
+            logger.warning("Queue check before idle kill failed: %s. Deferring kill.", e)
+            self._idle_kill_timer = asyncio.get_event_loop().call_later(
+                COMFYUI_IDLE_TIMEOUT, self._do_idle_kill)
+            return
         if running or pending:
             logger.info("ComfyUI queue not empty (%d running, %d pending); deferring idle kill by %ds.",
                         len(running), len(pending), COMFYUI_IDLE_TIMEOUT)
@@ -136,10 +139,9 @@ class ComfyUIClient:
         """Check if ComfyUI is reachable by hitting /history. Retries before giving up,
         since a busy ComfyUI can be briefly slow to respond.
 
-        Also verifies the response is ComfyUI's JSON history object. A foreign
+        Verifies the response is ComfyUI's JSON history object. A foreign
         HTTP listener on port 8188 can answer 200 with a non-JSON body; without
-        this check it would be mistaken for a running ComfyUI and the documented
-        stale-port self-heal (free the port, relaunch) would never trigger."""
+        this check it would be mistaken for a running ComfyUI."""
         for attempt in range(3):
             try:
                 resp = await self.session.get(f"{self.base_url}/history", timeout=8.0)
@@ -153,11 +155,11 @@ class ComfyUIClient:
                 data = resp.json()
             except Exception:
                 logger.warning("Port 8188 answered /history with a non-JSON body; a foreign "
-                               "process occupies the port. start_comfyui will attempt to free it.")
+                               "process occupies the port.")
                 return False
             if not isinstance(data, dict):
                 logger.warning("Port 8188 answered /history with JSON that is not an object; "
-                               "a foreign process occupies the port. start_comfyui will attempt to free it.")
+                               "a foreign process occupies the port.")
                 return False
             # Note: a fresh ComfyUI returns {} (empty object) - that is valid.
             # The /queue endpoint (not /history) is the one with queue_running/queue_pending.
@@ -205,77 +207,35 @@ class ComfyUIClient:
         pid = self._comfyui_process.pid
         logger.info("ComfyUI launched with PID %d", pid)
 
-    def _kill_process(self):
-        """Synchronous helper to terminate the ComfyUI process tree.
-        Uses three strategies: direct process handle, port-based, and command-line matching.
-        Command-line matching catches hung/crashed processes that no longer accept connections.
-        Note: Windows-only (uses taskkill, netstat, wmic).
+    def _kill_process(self) -> bool:
+        """Synchronous helper to terminate the owned ComfyUI process tree.
+        Only the live self._comfyui_process Popen handle authorizes killing.
+        Returns True only if the owned process was actually terminated.
         """
-        killed = False
-        my_pid = str(os.getpid())
+        if not self._comfyui_process or self._comfyui_process.poll() is not None:
+            return False
 
-        # Strategy 1: kill our own process if we started it
-        if self._comfyui_process and self._comfyui_process.poll() is None:
-            pid = self._comfyui_process.pid
-            logger.info("Killing ComfyUI process tree (PID %d)...", pid)
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True, timeout=15,
-                )
-                logger.info("ComfyUI process tree killed.")
-                killed = True
-            except subprocess.TimeoutExpired:
-                logger.warning("taskkill timed out for PID %d", pid)
-            except Exception as e:
-                logger.warning("taskkill failed: %s", e)
-
-        # Strategy 2: kill by port 8188 (handles externally-started ComfyUI still listening)
-        logger.info("Killing ComfyUI via port 8188...")
+        proc = self._comfyui_process
+        pid = proc.pid
+        logger.info("Killing owned ComfyUI process tree (PID %d)...", pid)
         try:
             result = subprocess.run(
-                ["netstat", "-ano"], capture_output=True, text=True, timeout=10,
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=15,
             )
-            pids_killed = set()
-            for line in result.stdout.splitlines():
-                if ":8188" in line and "LISTENING" in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        pid = parts[4]
-                        if pid != my_pid and pid not in pids_killed:
-                            subprocess.run(
-                                ["taskkill", "/F", "/T", "/PID", pid],
-                                capture_output=True, timeout=15,
-                            )
-                            pids_killed.add(pid)
-                            logger.info("Killed PID %s on port 8188", pid)
-                            killed = True
-        except Exception as e:
-            logger.warning("port-based kill failed: %s", e)
+            if result.returncode == 0:
+                proc.wait(timeout=5)
+                logger.info("Owned ComfyUI process tree killed.")
+                return True
+            else:
+                logger.warning("taskkill failed for PID %d (rc=%d): %s", pid, result.returncode, result.stderr.decode(errors='ignore'))
+        except subprocess.TimeoutExpired:
+            logger.warning("taskkill timed out for PID %d", pid)
+        except OSError as e:
+            logger.warning("taskkill raised OSError for PID %d: %s", pid, e)
 
-        # Strategy 3: match by command line (catches hung/crashed processes
-        # that no longer accept connections and thus aren't LISTENING anymore)
-        try:
-            result = subprocess.run(
-                ["wmic", "process", "where",
-                 "CommandLine like '%ComfyUI%' and CommandLine like '%main.py%'",
-                 "get", "ProcessId"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in result.stdout.splitlines():
-                pid = line.strip()
-                if pid.isdigit() and pid != my_pid:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", pid],
-                        capture_output=True, timeout=15,
-                    )
-                    logger.info("Killed hung ComfyUI PID %s via command-line match", pid)
-                    killed = True
-        except Exception as e:
-            logger.warning("command-line kill failed: %s", e)
-
-        if not killed:
-            logger.warning("could not find ComfyUI process to kill.")
+        # Keep ownership on failure so future attempts can retry
+        return False
 
     async def _wait_for_port_free(self, port=8188, timeout=60):
         """Wait until port is truly free (no LISTENING or TIME_WAIT sockets).
@@ -320,15 +280,15 @@ class ComfyUIClient:
         return False
 
     async def kill_comfyui(self):
-        """Kill the ComfyUI process to free VRAM, then wait for port to be released."""
-        await asyncio.get_event_loop().run_in_executor(None, self._kill_process)
-        self._comfyui_process = None
-        # Wait for port to be fully released before allowing next start
-        await self._wait_for_port_free()
+        """Kill the owned ComfyUI process to free VRAM."""
+        killed = await asyncio.get_event_loop().run_in_executor(None, self._kill_process)
+        if killed:
+            self._comfyui_process = None
 
     async def start_comfyui(self):
         """Start ComfyUI if not already running, then wait until it is reachable.
-        Ensures port 8188 is free before starting (kills stale processes if needed)."""
+        Ensures port 8188 is free before starting. Only cleans up its OWN stale process.
+        Raises RuntimeError if a foreign listener remains on the port."""
         self._cancel_idle_kill()
         if await self.is_running():
             logger.info("ComfyUI is already running.")
@@ -336,9 +296,17 @@ class ComfyUIClient:
 
         # Ensure port is free before starting
         if not await self._wait_for_port_free(timeout=5):
-            logger.warning("Port still in use, forcing cleanup...")
-            await asyncio.get_event_loop().run_in_executor(None, self._kill_process)
-            await self._wait_for_port_free()
+            # Attempt to clean up only our OWN stale process if we own one
+            if self._comfyui_process and self._comfyui_process.poll() is None:
+                logger.warning("Port in use by owned process, cleaning up...")
+                killed = await asyncio.get_event_loop().run_in_executor(None, self._kill_process)
+                if not killed:
+                    raise RuntimeError("Could not stop the managed ComfyUI process; startup was not retried.")
+                self._comfyui_process = None
+                if not await self._wait_for_port_free(timeout=10):
+                    raise RuntimeError("Failed to free port 8188 after killing owned process.")
+            else:
+                raise RuntimeError("Port 8188 is occupied by a foreign process. Check the configured backend/port.")
 
         # Launch in a thread to avoid blocking the event loop
         await asyncio.get_event_loop().run_in_executor(None, self._start_process)
@@ -355,10 +323,13 @@ class ComfyUIClient:
             await asyncio.sleep(2.0)
 
         # ComfyUI may have failed to start (e.g., port still in TIME_WAIT).
-        # Kill whatever we started, wait for port to fully clear, and retry once.
+        # Kill whatever we started, verify port is free, and retry once.
         logger.warning("ComfyUI not ready after %d polls, retrying after port clear...", attempts)
         await self.kill_comfyui()
-        await self._wait_for_port_free(timeout=60)
+        if self._comfyui_process is not None and self._comfyui_process.poll() is None:
+            raise RuntimeError("Could not stop the managed ComfyUI process; startup was not retried.")
+        if not await self._wait_for_port_free(timeout=60):
+            raise RuntimeError("Failed to free port 8188 before retry launch.")
         await asyncio.get_event_loop().run_in_executor(None, self._start_process)
 
         deadline2 = time.monotonic() + COMFYUI_START_TIMEOUT
@@ -370,8 +341,7 @@ class ComfyUIClient:
 
         raise TimeoutError(
             f"ComfyUI did not become reachable within {COMFYUI_START_TIMEOUT}s (even after retry). "
-            "Check that the start command is correct and ComfyUI can start. If another process "
-            "holds port 8188, find it with `netstat -ano | findstr :8188`, end it, and retry."
+            "Check the configured backend, port, and startup command."
         )
 
     # ------------------------------------------------------------------ #
@@ -692,12 +662,6 @@ class ComfyUIClient:
                         else:
                             results[i]["history"] = value
             if any(r["history"] for r in results):
-                # Wait for the queue to drain (VAE decode, etc.) before pre-fetching.
-                try:
-                    await self._wait_for_queue_drain(timeout=600)
-                except Exception as e:
-                    logger.warning("queue drain wait failed: %s", e)
-
                 # Pre-fetch output bytes BEFORE the idle kill (same reason as run_workflow_and_wait).
                 if COMFYUI_AUTO_KILL:
                     for i, res in enumerate(results):

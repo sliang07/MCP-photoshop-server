@@ -4,6 +4,14 @@
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
 
+## 2026-09-22 Idle cleanup follow-up
+
+- Reproduced two gaps after the adopted-PID change: attaching to an already-running backend did not arm an idle timer, and a dead owned Popen handle prevented fallback to an adopted process.
+- Backend checks now arm missing timers without extending existing ones. Workflow and upload activity suspend cleanup; completion, failure and cancellation rearm the queue-guarded check. Finished workflows no longer wait for unrelated queue entries before returning their output.
+- Adoption is local-only and verifies the configured Python executable, absolute main script and process creation time. The listener and identity are checked again before termination. Stale handles no longer block adoption, failed termination can retry, and a new operation invalidates an in-flight idle check or waits for an already-started shutdown.
+- The timer still belongs to the MCP process. If that process is forcibly closed, its timer cannot run; a later active backend check adopts a verified orphan. Passive status checks (`start_if_needed=False`) do not start ComfyUI again.
+- Regression suite: 202 tests pass, including 15 focused lifecycle regressions. Real ComfyUI checks passed for both an adopted process and a fresh launch followed by a model-free workflow: the configured port stopped listening after 6.28 s and 5.83 s respectively with a five-second idle timeout. Passive status stayed off. An isolated CPU backend passed the same checks, including its non-default port. Evidence: local `mcp_idle_shutdown_live_8188.json`, `mcp_idle_shutdown_live_8189.json` and `idle-shutdown-unit-tests.txt` artifacts. No image models were loaded or containers stopped.
+
 ## 2026-09-22 Repo sanitization for git push
 
 - Removed all machine-specific values from tracked files before push: tailnet IP, MagicDNS hostname, LAN IP examples, node names, the LLM container name, PIDs.
@@ -204,7 +212,7 @@
 ### AI Image Generation (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Flux2, Qwen 2.1, or Anima; model-specific sampling defaults |
+| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Flux2, Qwen 2.1, Anima, or MiniMax H3 (experimental stills); model-specific sampling defaults |
 
 ### Prompt Guidance (1)
 | Tool | Signature | Description |
@@ -215,7 +223,7 @@
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="flux2", timeout=None)` | Extend canvas via Flux2 or Qwen 2.1 reference conditioning; preserve original pixels and layer/mask alignment |
-| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace")` | Qwen Image 2.1 (custom 30/3) or FLUX.2 Dev (50/4); 1800 s timeout; references, masks, composite/selected-layer replacement or Qwen extraction to a new layer |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace")` | Qwen Image 2.1 (custom 30/3), FLUX.2 Dev (50/4) or MiniMax H3 ref2va (20/BasicGuider, experimental); 1800 s timeout (3600 s for H3); references, masks, composite/selected-layer replacement or Qwen extraction to a new layer |
 | `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability per task: generation, editing, outpaint; notes carry the GPU batching rule |
 | `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
@@ -293,7 +301,7 @@
 |------|-----------|-------------|
 | `list_sessions` | `()` | All open document sessions with size/layers/active layer/undo depth |
 | `close_session` | `(session_id="default")` | Close a session, freeing its canvas |
-| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (flux2/qwen21/anima) on one WebSocket; returns exported paths, model, steps, CFG and seed |
+| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (flux2/qwen21/anima/minimax_h3) on one WebSocket; returns exported paths, model, steps, CFG and seed |
 | `submit_generation_job` | `(jobs, export_dir=None, export_format="PNG", timeout_per_image=None)` | Return an ID; generate and export one image at a time in the MCP process |
 | `get_job_status` | `(job_id)` | Progress and per-image results for this server instance |
 | `list_jobs` | `()` | Job summaries for this server instance |
@@ -308,7 +316,7 @@
 ### Auto-Start Flow
 1. `run_workflow_and_wait()` calls `_cancel_idle_kill()` then `start_comfyui()` before each workflow
 2. `start_comfyui()` checks if ComfyUI is already running via `/history` endpoint
-3. If already running: adopts the instance (PID via `netstat -ano`) into `_adopted_pid` so the idle kill can manage it; the pending idle timer is NOT cancelled on this probe path
+3. If already running: adopts a local listener only after verifying the configured Python/main script and creation time; arms a missing idle timer without postponing an existing one
 4. If not running: cancels any stale pending idle timer, checks the configured port, stopping only its own stale process; foreign listeners return an error
 5. Launches ComfyUI via embedded Python: `COMFYUI_PYTHON -s COMFYUI_MAIN COMFYUI_ARGS...`
 6. Falls back to `.bat` if Python path doesn't exist
@@ -316,11 +324,11 @@
 8. On timeout: stops the owned process, verifies cleanup and port availability, then retries once
 
 ### Idle Timeout Auto-Kill (when `COMFYUI_AUTO_KILL=1`)
-1. After workflow completes successfully: schedules idle kill via `_schedule_idle_kill()`
+1. After a backend check, workflow or upload ends: arms idle cleanup when no operation is active
 2. Idle timer set to `COMFYUI_IDLE_TIMEOUT` (default 60s / 1 minute)
 3. If a new workflow starts within the timeout: `_cancel_idle_kill()` cancels pending timer
-4. After timeout: checks the shared queue; busy, malformed or unreachable queue state defers shutdown. An empty queue permits stopping this server's owned backend, or an adopted PID (a ComfyUI already running, e.g. from a previous MCP server session).
-5. On error (RuntimeError, TimeoutError): immediate kill (no idle delay)
+4. After timeout: checks the shared queue; busy, malformed or unreachable queue state defers shutdown. An empty queue permits stopping this server's owned backend, or an adopted local PID whose executable, script and creation time still match.
+5. Failure and cancellation also rearm guarded idle cleanup; they do not immediately kill other clients' queued work
 6. Pre-fetches output file bytes via `/view` endpoint before any kill
 
 ### VRAM Pressure Management (when `COMFYUI_AUTO_KILL=0`, default)

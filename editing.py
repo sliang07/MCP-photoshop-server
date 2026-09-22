@@ -442,7 +442,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         minimax_h3 uses the installed ref2va model, 20 steps/res_multistep/simple, saving frame 0 of 5.
         H3 is experimental for stills, outputs RGB, and ignores cfg (BasicGuider); allow 3600 seconds.
         H3 references use <Picture 1> for the canvas, <Picture 2> onward for references, then the mask.
-        Both support object removal, background replacement, restyling and references.
+        These backends support object removal, background replacement, restyling and references.
         Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
         Image 1 is the canvas or the specified layer; images 2 onward are reference_paths, in order. For Qwen use
@@ -460,7 +460,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         has_transparency reports the result's actual alpha; inspect the returned layer preview.
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
         timeout defaults to 1800 seconds, or 3600 for H3. Identity preservation is model-dependent.
-        Optional cfg overrides the profile default; omitting it keeps Qwen CFG or FLUX embedded guidance defaults.
+        Optional cfg overrides Qwen CFG or FLUX embedded guidance; H3 uses BasicGuider.
         """
         prompt = unwrap_prompt(prompt)
         if not prompt.strip():

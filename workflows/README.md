@@ -35,3 +35,5 @@ For edits, first call `open_image` with your source, then:
 ```
 
 Use the same `session_id` for related calls. `reference_paths` adds `<Picture 2>` onward. `get_editing_capabilities` checks installed files and nodes; `get_prompt_guidance(model="minimax_h3", task="editing")` provides the still-image rules. H3 also works in batch/background generation jobs. Its `cfg` and `negative_prompt` arguments are unused, and its default timeout is 3600 seconds.
+
+Validation: all nine UI files were imported into the installed ComfyUI frontend and converted back to API prompts with matching connections and settings. H3 text generation and a reference-guided recolor both completed at 640x384 with 20 steps. The MCP protocol reports H3 generation/editing ready, and the current 187-test suite passes. Other models' exported presets were checked for import and settings; they were not all rerun on the GPU for this pack.

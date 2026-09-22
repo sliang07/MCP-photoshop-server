@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 import websockets
@@ -52,7 +54,11 @@ class ComfyUIClient:
         self.session = httpx.AsyncClient(timeout=120.0)
         self._comfyui_process: Optional[subprocess.Popen] = None
         self._adopted_pid: Optional[int] = None  # PID of a running ComfyUI this server did not start
+        self._adopted_creation_time = None
         self._idle_kill_timer: Optional[asyncio.Handle] = None  # Background timer for idle kill
+        self._idle_kill_task = None
+        self._idle_generation = 0
+        self._active_operations = 0
 
     async def close(self):
         self._cancel_idle_kill()
@@ -64,6 +70,7 @@ class ComfyUIClient:
 
     def _cancel_idle_kill(self):
         """Cancel any pending idle kill timer."""
+        self._idle_generation += 1
         if self._idle_kill_timer is not None:
             self._idle_kill_timer.cancel()
             self._idle_kill_timer = None
@@ -76,6 +83,10 @@ class ComfyUIClient:
             self._do_idle_kill,
         )
         logger.info("Idle kill scheduled in %ds.", COMFYUI_IDLE_TIMEOUT)
+
+    def _arm_idle_shutdown(self):
+        if COMFYUI_AUTO_KILL and not self._active_operations and self._idle_kill_timer is None:
+            self._schedule_idle_kill()
 
     def _do_idle_kill(self):
         """Called by the idle timer to kill ComfyUI after timeout.
@@ -90,6 +101,7 @@ class ComfyUIClient:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             task = asyncio.create_task(self._idle_kill_guarded())
+            self._idle_kill_task = task
             task.add_done_callback(self._on_idle_kill_done)
         else:
             loop.run_until_complete(self._idle_kill_guarded())
@@ -103,6 +115,9 @@ class ComfyUIClient:
         the other's workflow is in progress - doing so fails that job.
         While the queue is busy the kill re-checks every COMFYUI_IDLE_TIMEOUT.
         """
+        generation = self._idle_generation
+        if self._active_operations:
+            return
         try:
             queue = await self.get_queue_status()
             running = queue.get("queue_running")
@@ -110,10 +125,14 @@ class ComfyUIClient:
             if not isinstance(running, list) or not isinstance(pending, list):
                 raise ValueError("Malformed queue status response")
         except Exception as e:
+            if generation != self._idle_generation:
+                return
             # ComfyUI unreachable or malformed: defer kill to avoid interrupting unknown jobs.
             logger.warning("Queue check before idle kill failed: %s. Deferring kill.", e)
             self._idle_kill_timer = asyncio.get_event_loop().call_later(
                 COMFYUI_IDLE_TIMEOUT, self._do_idle_kill)
+            return
+        if generation != self._idle_generation or self._active_operations:
             return
         if running or pending:
             logger.info("ComfyUI queue not empty (%d running, %d pending); deferring idle kill by %ds.",
@@ -122,9 +141,13 @@ class ComfyUIClient:
                 COMFYUI_IDLE_TIMEOUT, self._do_idle_kill)
             return
         await self.kill_comfyui()
+        if self._comfyui_process is not None or self._adopted_pid is not None:
+            self._arm_idle_shutdown()
 
     def _on_idle_kill_done(self, task):
         """Callback to log errors from idle kill task."""
+        if self._idle_kill_task is task:
+            self._idle_kill_task = None
         if task.cancelled():
             return
         try:
@@ -210,12 +233,11 @@ class ComfyUIClient:
 
     def _find_listening_pid(self, port=None):
         """Find the PID LISTENING on a TCP port via netstat -ano."""
+        endpoint = urlsplit(self.base_url)
+        if endpoint.hostname not in ("127.0.0.1", "localhost", "::1"):
+            return None
         if port is None:
-            port = 8188
-            try:
-                port = int(self.base_url.rsplit(":", 1)[1].split("/")[0])
-            except (ValueError, IndexError):
-                pass
+            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
         try:
             result = subprocess.run(
                 ["netstat", "-ano"], capture_output=True, text=True, timeout=10,
@@ -233,6 +255,39 @@ class ComfyUIClient:
             logger.debug("netstat lookup for port %d failed: %s", port, e)
         return None
 
+    def _get_process_identity(self, pid):
+        """Return the creation time only for the configured Python/main.py process."""
+        if not COMFYUI_PYTHON or not COMFYUI_MAIN:
+            return None
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}' | "
+                 "Select-Object ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode or not result.stdout.strip():
+                return None
+            process = json.loads(result.stdout)
+            executable = process.get("ExecutablePath")
+            command = process.get("CommandLine")
+            if not executable or not command:
+                return None
+            if os.path.normcase(os.path.abspath(executable)) != os.path.normcase(os.path.abspath(COMFYUI_PYTHON)):
+                return None
+            arguments = [arg.strip('"') for arg in shlex.split(command, posix=False)][1:]
+            while arguments and arguments[0] in ("-s", "-u", "-B", "-E", "-I", "-O", "-OO"):
+                arguments.pop(0)
+            if not arguments or not os.path.isabs(arguments[0]):
+                return None
+            if os.path.normcase(os.path.abspath(arguments[0])) != os.path.normcase(os.path.abspath(COMFYUI_MAIN)):
+                return None
+            return process.get("CreationDate")
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, AttributeError) as error:
+            logger.debug("Could not verify ComfyUI PID %s: %s", pid, error)
+            return None
+
     def _kill_process(self) -> bool:
         """Synchronous helper to terminate the managed ComfyUI process tree.
         A live Popen handle started by this server takes precedence; otherwise
@@ -242,7 +297,8 @@ class ComfyUIClient:
         """
         proc = self._comfyui_process
         if proc and proc.poll() is not None:
-            return False
+            self._comfyui_process = None
+            proc = None
 
         if proc is not None:
             pid = proc.pid
@@ -266,6 +322,13 @@ class ComfyUIClient:
 
         if self._adopted_pid:
             pid = self._adopted_pid
+            if (not self._adopted_creation_time
+                    or self._find_listening_pid() != pid
+                    or self._get_process_identity(pid) != self._adopted_creation_time):
+                logger.warning("Adopted ComfyUI PID %d no longer matches the configured backend; leaving it alone.", pid)
+                self._adopted_pid = None
+                self._adopted_creation_time = None
+                return False
             logger.info("Killing adopted ComfyUI process tree (PID %d)...", pid)
             try:
                 result = subprocess.run(
@@ -284,11 +347,14 @@ class ComfyUIClient:
         logger.warning("No managed ComfyUI process to kill (none started by this server, no adopted PID).")
         return False
 
-    async def _wait_for_port_free(self, port=8188, timeout=60):
+    async def _wait_for_port_free(self, port=None, timeout=60):
         """Wait until port is truly free (no LISTENING or TIME_WAIT sockets).
         Actually tries to bind to verify the port is available, since Windows
         cannot bind to ports with TIME_WAIT connections even after process is killed."""
         import socket
+        if port is None:
+            endpoint = urlsplit(self.base_url)
+            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
         deadline = time.monotonic() + timeout
         last_netstat_msg = ""
         while time.monotonic() < deadline:
@@ -332,8 +398,7 @@ class ComfyUIClient:
         if killed:
             self._comfyui_process = None
             self._adopted_pid = None
-        else:
-            logger.warning("kill_comfyui: nothing was killed; no live owned handle and no adopted PID.")
+            self._adopted_creation_time = None
 
     async def start_comfyui(self):
         """Start ComfyUI if not already running, then wait until it is reachable.
@@ -341,15 +406,22 @@ class ComfyUIClient:
         and adopts a running ComfyUI started elsewhere (e.g. a previous MCP server
         session) so the idle kill can manage it. Raises RuntimeError if a foreign
         non-ComfyUI listener remains on the port."""
+        if self._idle_kill_task is not None:
+            await asyncio.shield(self._idle_kill_task)
         if await self.is_running():
             logger.info("ComfyUI is already running.")
             # Track an instance this server did not start itself, so the idle
             # kill can terminate it after inactivity (previously a silent no-op).
             if self._comfyui_process is None or self._comfyui_process.poll() is not None:
-                self._adopted_pid = await asyncio.get_event_loop().run_in_executor(
-                    None, self._find_listening_pid)
-                if self._adopted_pid:
+                self._comfyui_process = None
+                pid = await asyncio.get_event_loop().run_in_executor(None, self._find_listening_pid)
+                identity = await asyncio.get_event_loop().run_in_executor(
+                    None, self._get_process_identity, pid) if pid is not None else None
+                self._adopted_pid = pid if identity else None
+                self._adopted_creation_time = identity
+                if identity:
                     logger.info("ComfyUI (PID %d) was started outside this server; adopted for idle management.", self._adopted_pid)
+            self._arm_idle_shutdown()
             return
 
         # A fresh launch must not be killed by a stale timer from an earlier instance.
@@ -380,6 +452,7 @@ class ComfyUIClient:
             attempts += 1
             if await self.is_running():
                 logger.info("ComfyUI is ready (attempt %d).", attempts)
+                self._arm_idle_shutdown()
                 return
             await asyncio.sleep(2.0)
 
@@ -397,6 +470,7 @@ class ComfyUIClient:
         while time.monotonic() < deadline2:
             if await self.is_running():
                 logger.info("ComfyUI is ready (retry).")
+                self._arm_idle_shutdown()
                 return
             await asyncio.sleep(2.0)
 
@@ -435,26 +509,24 @@ class ComfyUIClient:
     async def run_workflow_and_wait(self, workflow: dict, progress_callback=None, timeout: Optional[int] = None) -> dict:
         """
         Submit workflow and wait for completion atomically.
-        Auto-starts ComfyUI if not running. On success an idle kill is scheduled
-        (keeps ComfyUI warm for a follow-up); on error ComfyUI is killed immediately.
+        Auto-starts ComfyUI if not running. Idle cleanup is scheduled when the
+        operation ends; a busy or unknown queue always defers shutdown.
         Connects WebSocket FIRST, then submits with the same client_id,
         preventing race conditions where workflow finishes before WebSocket connects.
         Returns the history entry with output file bytes pre-fetched (if auto-kill is enabled).
-        Cleanup (kill_comfyui) runs in finally block to ensure VRAM is freed even on errors.
         timeout: optional override for WEBSOCKET_TIMEOUT.
         """
         # Cancel any pending idle kill — a new workflow is starting
         self._cancel_idle_kill()
-
-        # --- Auto-start ComfyUI if needed ---
-        await self.start_comfyui()
 
         client_id = str(uuid.uuid4())
         ws_url = f"{self.base_url.replace('http', 'ws')}/ws?clientId={client_id}"
         result = None
         success = False
 
+        self._active_operations += 1
         try:
+            await self.start_comfyui()
             # Only connection establishment may fall back to polling. Once a prompt
             # is submitted, never resubmit it after a lost WebSocket or timeout.
             ws = None
@@ -475,14 +547,6 @@ class ComfyUIClient:
             finally:
                 if ws is not None:
                     await ws.close()
-
-            # Wait for queue to drain (VAE decode, etc.) before pre-fetching
-            # This ensures post-processing nodes complete before we kill ComfyUI
-            if success and result:
-                try:
-                    await self._wait_for_queue_drain(timeout=600)
-                except Exception as e:
-                    logger.warning("queue drain wait failed: %s", e)
 
             # Pre-fetch output file bytes BEFORE killing ComfyUI
             # This is needed because after kill, /view endpoint is unavailable
@@ -516,19 +580,9 @@ class ComfyUIClient:
                     logger.warning("failed to pre-fetch output file: %s", e)
 
             return result
-        except (RuntimeError, TimeoutError):
-            # Error path: kill immediately
-            if COMFYUI_AUTO_KILL:
-                logger.info("Error detected, killing ComfyUI immediately...")
-                try:
-                    await self.kill_comfyui()
-                except Exception as e:
-                    logger.warning("cleanup kill failed: %s", e)
-            raise
         finally:
-            # Success path: schedule idle kill instead of immediate kill
-            if COMFYUI_AUTO_KILL and success:
-                self._schedule_idle_kill()
+            self._active_operations -= 1
+            self._arm_idle_shutdown()
 
     async def _listen_for_completion(self, ws, prompt_id: str, progress_callback=None, timeout: Optional[int] = None) -> dict:
         """Listen on an already-open WebSocket for execution events."""
@@ -665,7 +719,6 @@ class ComfyUIClient:
         timeout: seconds for the whole batch wait (default: max(WEBSOCKET_TIMEOUT, 60 * jobs)).
         """
         self._cancel_idle_kill()
-        await self.start_comfyui()
 
         n = len(workflows)
         effective_timeout = timeout if timeout is not None else max(WEBSOCKET_TIMEOUT, 60 * n)
@@ -676,7 +729,9 @@ class ComfyUIClient:
         prompt_ids = [None] * n
         ws = None
 
+        self._active_operations += 1
         try:
+            await self.start_comfyui()
             try:
                 ws = await websockets.connect(ws_url, open_timeout=15)
             except Exception as ws_error:
@@ -754,8 +809,8 @@ class ComfyUIClient:
                     await ws.close()
                 except Exception:
                     pass
-            if COMFYUI_AUTO_KILL and any(r["history"] for r in results):
-                self._schedule_idle_kill()
+            self._active_operations -= 1
+            self._arm_idle_shutdown()
 
     async def wait_for_completion(self, prompt_id: str, progress_callback=None) -> dict:
         """
@@ -818,36 +873,6 @@ class ComfyUIClient:
         response.raise_for_status()
         return response.json()
 
-    async def _wait_for_queue_drain(self, timeout: int = 600, check_interval: float = 3.0):
-        """Wait for ComfyUI's queue to drain (all nodes including VAE decode complete).
-
-        Polls /queue until both queue_running and queue_pending are empty,
-        ensuring post-processing nodes have finished before auto-kill.
-
-        Args:
-            timeout: Maximum seconds to wait (default 10 minutes)
-            check_interval: Seconds between queue checks
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                queue = await self.get_queue_status()
-                running = queue.get("queue_running", [])
-                pending = queue.get("queue_pending", [])
-                if not running and not pending:
-                    elapsed = timeout - (deadline - time.monotonic())
-                    logger.info("Queue drained after %.0fs wait.", elapsed)
-                    return True
-                logger.debug("Queue not empty: %d running, %d pending - waiting...", len(running), len(pending))
-            except Exception as e:
-                logger.warning("Queue check failed: %s", e)
-                # If we can't check queue, assume it's done (ComfyUI may be unresponsive)
-                return True
-            await asyncio.sleep(check_interval)
-
-        logger.warning("Queue did not drain after %ds", timeout)
-        return False
-
     # ------------------------------------------------------------------ #
     #  File retrieval
     # ------------------------------------------------------------------ #
@@ -895,30 +920,35 @@ class ComfyUIClient:
         """
         # An upload starts a new operation; cancel the previous idle timer.
         self._cancel_idle_kill()
-        # Ensure ComfyUI is running before attempting upload
-        await self.start_comfyui()
+        self._active_operations += 1
+        try:
+            # Ensure ComfyUI is running before attempting upload
+            await self.start_comfyui()
 
-        for attempt in range(max_retries):
-            try:
-                files = {"image": (filename, image_bytes, "image/png")}
-                data = {"subfolder": "", "type": "input"}
-                response = await self.session.post(
-                    f"{self.base_url}/upload/image",
-                    data=data,
-                    files=files,
-                )
-                response.raise_for_status()
-                uploaded = response.json()
-                name = uploaded["name"]
-                subfolder = uploaded.get("subfolder", "").strip("/\\")
-                return f"{subfolder}/{name}" if subfolder else name
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait = 2.0 ** attempt
-                    logger.warning("upload_image retry %d/%d for '%s': %s, waiting %.1fs...", attempt+1, max_retries, filename, e, wait)
-                    await asyncio.sleep(wait)
-                else:
-                    raise
+            for attempt in range(max_retries):
+                try:
+                    files = {"image": (filename, image_bytes, "image/png")}
+                    data = {"subfolder": "", "type": "input"}
+                    response = await self.session.post(
+                        f"{self.base_url}/upload/image",
+                        data=data,
+                        files=files,
+                    )
+                    response.raise_for_status()
+                    uploaded = response.json()
+                    name = uploaded["name"]
+                    subfolder = uploaded.get("subfolder", "").strip("/\\")
+                    return f"{subfolder}/{name}" if subfolder else name
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2.0 ** attempt
+                        logger.warning("upload_image retry %d/%d for '%s': %s, waiting %.1fs...", attempt+1, max_retries, filename, e, wait)
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+        finally:
+            self._active_operations -= 1
+            self._arm_idle_shutdown()
 
     # ------------------------------------------------------------------ #
     #  System info

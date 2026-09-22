@@ -349,6 +349,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         timer = self.client._idle_kill_timer
         self.client.is_running = AsyncMock(return_value=True)
         self.client._find_listening_pid = lambda port=None: 4321
+        self.client._get_process_identity = Mock(return_value="created-1")
         with patch.object(self.client, "_start_process") as launch:
             await self.client.start_comfyui()
         launch.assert_not_called()
@@ -446,7 +447,6 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client.start_comfyui = AsyncMock()
         self.client.submit_workflow = AsyncMock(return_value="job")
         self.client._wait_via_polling = AsyncMock(return_value={"outputs": {}})
-        self.client._wait_for_queue_drain = AsyncMock()
         with patch("comfy_client.websockets.connect", AsyncMock(side_effect=OSError("offline"))), patch("comfy_client.COMFYUI_AUTO_KILL", False):
             await self.client.run_workflow_and_wait({})
         self.client.submit_workflow.assert_awaited_once()
@@ -630,6 +630,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_adopted_pid_fallback_kill(self):
         self.client._comfyui_process = None
         self.client._adopted_pid = 4321
+        self.client._adopted_creation_time = "created-1"
+        self.client._find_listening_pid = Mock(return_value=4321)
+        self.client._get_process_identity = Mock(return_value="created-1")
         with patch("comfy_client.subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
             self.assertTrue(self.client._kill_process())
@@ -637,6 +640,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_kill_comfyui_clears_handles_on_success(self):
         self.client._adopted_pid = 4321
+        self.client._adopted_creation_time = "created-1"
+        self.client._find_listening_pid = Mock(return_value=4321)
+        self.client._get_process_identity = Mock(return_value="created-1")
         with patch("comfy_client.subprocess.run",
                    return_value=subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")):
             await self.client.kill_comfyui()

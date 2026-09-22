@@ -190,11 +190,11 @@ class GenerationJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         client.start_comfyui = AsyncMock()
         client.submit_workflow = AsyncMock(return_value="own-prompt")
-        client._wait_for_queue_drain = AsyncMock()
+        client.get_queue_status = AsyncMock(return_value={"queue_running": ["other-client"], "queue_pending": []})
         client._schedule_idle_kill = Mock()
         client._listen_for_many = AsyncMock(return_value={0: {"outputs": {"1": {"images": [{"filename": "done.png"}]}}}})
         client.get_output_file = AsyncMock(return_value=b"completed image bytes")
         with patch("comfy_client.websockets.connect", AsyncMock(return_value=AsyncMock())), patch("comfy_client.COMFYUI_AUTO_KILL", True):
             result = await client.batch_run_workflows([{"1": {"class_type": "SaveImage"}}])
         self.assertEqual(result[0]["history"]["_cached_file_bytes"], b"completed image bytes")
-        client._wait_for_queue_drain.assert_not_awaited()
+        client.get_queue_status.assert_not_awaited()

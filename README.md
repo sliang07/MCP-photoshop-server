@@ -17,7 +17,9 @@ The legacy Flux.1-era tools (`img2img`, `character_transform`, `inpaint`, `contr
 
 Reconnect the MCP server after saving any in-memory work to load the new tools.
 
-Idle shutdown only stops the ComfyUI process launched by this MCP process, after an empty queue check. Busy or unknown queue state defers shutdown; separately started backends and unrelated port listeners are left running.
+Idle shutdown starts after a backend availability check or the end of a workflow/upload, including failures and cancellation. It preserves an existing timer rather than postponing it on every status probe. An empty queue permits stopping this MCP's own backend or an adopted local process whose executable, main script and creation time match the configured ComfyUI; busy or unknown queue state defers shutdown. Unrelated listeners and remote backends are not adopted.
+
+The timer lives in the MCP process: keep that process running through the idle interval. After an MCP restart, an active backend check can adopt and clean up a verified orphan. To check whether ComfyUI stayed off, use `get_comfyui_status(start_if_needed=False)`; the default status check starts it again.
 
 ComfyUI does not need to be running beforehand. Call the requested generation/editing tool directly; it starts ComfyUI and waits for readiness. `get_comfyui_status` and `get_editing_capabilities` also start it by default. Pass `start_if_needed=False` only for a passive check. A stopped backend is normal with the five-second idle shutdown; it does not mean the tools are unavailable. Startup messages stay out of the MCP protocol stream.
 
@@ -283,7 +285,7 @@ mcp-photoshop-server/
 ├── masters/            # Master prompt files (Flux/Anima/Qwen) read by get_prompt_guidance
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (176 tests)
+├── tests/              # Regression suite (202 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md

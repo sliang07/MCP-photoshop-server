@@ -56,8 +56,14 @@ def model_profiles(info, task):
         ("anima", (MODEL_ANIMA, "anima-base-v1.0.safetensors"),
          (MODEL_ANIMA_TEXT_ENCODER,), MODEL_ANIMA_VAE, 0, 30, 4.0,
          "Anime and illustration text-to-image only; not instruction editing or typography."),
+        ("minimax_h3", ("minimax_h3_ref2va_pruned_int8_convrot.safetensors",),
+         ("qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+         "minimax_h3_video_vae_fp16.safetensors", None, 20, 1.0,
+         "Experimental H3 still images and reference edits: sample 5 frames and save the first. RGB output."),
     ):
         if name == "anima" and task != "generation":
+            continue
+        if name == "minimax_h3" and task == "outpaint":
             continue
         profile = {
             "model": resolve_model(unets, *model_names),
@@ -71,6 +77,10 @@ def model_profiles(info, task):
         if name == "flux2":
             profile["guidance_type"] = "embedded FluxGuidance (cfg argument)"
             profile["negative_prompt_supported"] = False
+        if name == "minimax_h3":
+            profile.update(sampler="res_multistep", scheduler="simple",
+                           guidance_type="BasicGuider (cfg unused)", negative_prompt_supported=False,
+                           frames=5, saved_frame=0)
         if task != "generation":
             profile["max_additional_references"] = refs
         missing = [key for key in ("model", "clip", "vae") if not profile[key]]
@@ -89,11 +99,13 @@ def model_profiles(info, task):
 def build_generation_workflow(backend, profile, prompt, negative_prompt="", width=1024, height=1024,
                               steps=None, cfg=None, seed=None):
     """Native ComfyUI text-to-image graphs, with per-model sampling defaults."""
-    if backend not in ("flux2", "qwen21", "anima"):
-        raise ValueError("model must be flux2, qwen21 or anima")
+    if backend not in ("flux2", "qwen21", "anima", "minimax_h3"):
+        raise ValueError("model must be flux2, qwen21, anima or minimax_h3")
     steps = profile["default_steps"] if steps is None else steps
     cfg = profile["default_cfg"] if cfg is None else cfg
     seed = secrets.randbits(63) if seed is None else seed
+    if backend == "minimax_h3":
+        return build_h3_image_workflow(profile, prompt, width, height, steps, seed)
     graph = {}
 
     def node(kind, **inputs):
@@ -140,8 +152,10 @@ def build_generation_workflow(backend, profile, prompt, negative_prompt="", widt
 
 def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed, resolution=0, cfg=None):
     """Use reference conditioning, separate from the sampled output latent."""
-    if backend not in ("flux2", "qwen21"):
-        raise ValueError("Instruction editing requires qwen21 or flux2; Anima supports generation only")
+    if backend not in ("flux2", "qwen21", "minimax_h3"):
+        raise ValueError("Instruction editing requires qwen21, flux2 or minimax_h3; Anima supports generation only")
+    if backend == "minimax_h3":
+        return build_h3_image_workflow(profile, prompt, width, height, steps, seed, images)
     cfg = profile["default_cfg"] if cfg is None else cfg
     graph = {}
 
@@ -184,6 +198,36 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
                        sampler_name=profile["sampler"], scheduler=profile["scheduler"], denoise=profile["denoise"])
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix="mcp_instruction_edit")
+    return graph
+
+
+def build_h3_image_workflow(profile, prompt, width, height, steps, seed, images=()):
+    """Use ref2va for both text-only and reference stills, keeping one decoded frame."""
+    graph = {}
+
+    def node(kind, **inputs):
+        key = str(len(graph) + 1)
+        graph[key] = {"class_type": kind, "inputs": inputs}
+        return [key, 0]
+
+    model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
+    clip = node("CLIPLoader", clip_name=profile["clip"], type="minimax")
+    vae = node("VAELoader", vae_name=profile["vae"])
+    references = {f"ref_images.ref_image_{i}": node("LoadImage", image=filename)
+                  for i, filename in enumerate(images)}
+    encoded = node("MiniMaxH3ReferenceToVideo", clip=clip, vae=vae, prompt=prompt,
+                   width=max(32, (width + 31) // 32 * 32),
+                   height=max(32, (height + 31) // 32 * 32),
+                   length=5, ref_image_size="match", **references)
+    guider = node("BasicGuider", model=model, conditioning=encoded)
+    noise = node("RandomNoise", noise_seed=seed)
+    sigmas = node("BasicScheduler", model=model, scheduler=profile["scheduler"], steps=steps, denoise=1.0)
+    sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
+    sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
+                   sigmas=sigmas, latent_image=[encoded[0], 1])
+    decoded = node("VAEDecode", samples=sampled, vae=vae)
+    still = node("ImageFromBatch", image=decoded, batch_index=0, length=1)
+    node("SaveImage", images=still, filename_prefix="mcp_minimax_h3")
     return graph
 
 
@@ -340,7 +384,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
         No manual startup is required. This check does not load generation models.
         Set start_if_needed=False only for a passive check; offline does not mean editing is unavailable.
-        Choose qwen21 for detail/text/alpha, flux2 for reference-guided rendering, anima for anime generation.
+        Choose qwen21 for detail/text/alpha, flux2 for reference-guided rendering, anima for anime generation,
+        or minimax_h3 for experimental H3 still generation and reference edits.
         Anima is generation-only; upscaling and semantic selection use their dedicated models.
         """
         try:
@@ -361,7 +406,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             "outpaint": model_profiles(info, "outpaint"),
             "default_edit_backend": "qwen21",
             "default_generation_model": "flux2", "default_outpaint_backend": "flux2",
-            "prompt_guidance": {"tool": "get_prompt_guidance", "models": ["flux2", "qwen21", "anima"],
+            "prompt_guidance": {"tool": "get_prompt_guidance", "models": ["flux2", "qwen21", "anima", "minimax_h3"],
                                 "note": "Essential master rules are in tool descriptions; full applicable sources are available without GPU startup."},
             "models": {"diffusion_models": model_options(info, "UNETLoader", "unet_name"),
                        "text_encoders": model_options(info, "CLIPLoader", "clip_name"),
@@ -376,14 +421,14 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                       "outpaint supports flux2 or qwen21 reference conditioning; original pixels are restored after generation. Style/identity guidance uses edit_image reference_paths.",
                       "batch_generate queues a whole job list, awaits completion, then exports. submit_generation_job returns an ID and exports between images; use get_job_status/list_jobs for progress and cancel_job to stop after the current image.",
                       "Background jobs survive HTTP client disconnect only while the same MCP server process runs. Server restart or closing stdio loses workers/status; exported files remain.",
-                      "The GPU may be shared with qwen38. Never stop that LLM container without explicit approval.",
+                      "The GPU may be shared with the host LLM container (Ollama-compatible API on :11434). Never stop that LLM container without explicit approval.",
                       "Full GPU batching procedure: MEMORY.md, section 'GPU Contention & Batching Rule'."],
         }
         return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
     @app.tool("edit_image")
-    @with_prompt_rules("editing", ("qwen21", "flux2"))
-    async def edit_image(prompt: str, backend: Literal["qwen21", "flux2"] = "qwen21", reference_paths: list[str] | None = None,
+    @with_prompt_rules("editing", ("qwen21", "flux2", "minimax_h3"))
+    async def edit_image(prompt: str, backend: Literal["qwen21", "flux2", "minimax_h3"] = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
                          max_side: int = 1024, session_id: str = "default", timeout: int | None = None, cfg: float | None = None,
@@ -394,6 +439,9 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
         backend: qwen21 (default, Qwen Image 2.1, custom 30 steps/CFG 3, RGBA)
         or flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4). Both use Euler.
+        minimax_h3 uses the installed ref2va model, 20 steps/res_multistep/simple, saving frame 0 of 5.
+        H3 is experimental for stills, outputs RGB, and ignores cfg (BasicGuider); allow 3600 seconds.
+        H3 references use <Picture 1> for the canvas, <Picture 2> onward for references, then the mask.
         Both support object removal, background replacement, restyling and references.
         Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
@@ -411,14 +459,14 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         requests a transparent cutout in a new layer while leaving originals intact.
         has_transparency reports the result's actual alpha; inspect the returned layer preview.
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
-        timeout defaults to 1800 seconds for either backend. Identity preservation is model-dependent.
+        timeout defaults to 1800 seconds, or 3600 for H3. Identity preservation is model-dependent.
         Optional cfg overrides the profile default; omitting it keeps Qwen CFG or FLUX embedded guidance defaults.
         """
         prompt = unwrap_prompt(prompt)
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
-        if backend not in ("flux2", "qwen21"):
-            raise ValueError("backend must be qwen21 or flux2; qwen and qwen2511 have been retired")
+        if backend not in ("flux2", "qwen21", "minimax_h3"):
+            raise ValueError("backend must be qwen21, flux2 or minimax_h3; qwen and qwen2511 have been retired")
         if max_side < 32:
             raise ValueError("max_side must be at least 32")
         if timeout is not None and timeout <= 0:
@@ -446,13 +494,15 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         limit = (15 - int(mask is not None)) if backend == "qwen21" else None
         if limit is not None and len(references) > limit:
             raise ValueError(f"{backend} supports at most {limit} additional references")
-        multiple = 32 if backend == "qwen21" else 16
+        multiple = 16 if backend == "flux2" else 32
         images = [prepare_image(source, max_side, multiple)]
         for path in references:
             with Image.open(Path(path)) as reference:
                 images.append(prepare_image(ImageOps.exif_transpose(reference), max_side, multiple))
         if backend == "qwen21":
             image_name = (lambda i: f"<image{i}>") if references or mask is not None else (lambda i: "the image")
+        elif backend == "minimax_h3":
+            image_name = lambda i: f"<Picture {i}>"
         else:
             image_name = lambda i: f"image {i}"
         if output_mode == "extract":
@@ -488,8 +538,10 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             files.append(await comfy.upload_image(png_bytes(image), name))
         width, height = images[0].size
         effective_cfg = profile["default_cfg"] if cfg is None else cfg
+        if backend == "minimax_h3":
+            effective_cfg = 1.0
         workflow = build_edit_workflow(backend, profile, instruction, files, width, height, steps, seed, cfg=effective_cfg)
-        result = await run_workflow(workflow, timeout=timeout or 1800)
+        result = await run_workflow(workflow, timeout=timeout or (3600 if backend == "minimax_h3" else 1800))
         if not result:
             raise RuntimeError("ComfyUI returned no image; the canvas was not modified")
         with Image.open(io.BytesIO(result)) as opened:
@@ -522,6 +574,10 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                   "generation_size": [width, height], "canvas_size": list(source.size),
                   "effective_prompt": instruction, "output_mode": output_mode,
                   "source_layer": layer_index, "has_transparency": has_transparency}
+        if backend == "minimax_h3":
+            report.update(frames=5, saved_frame=0, guidance_type=profile["guidance_type"])
+            if cfg is not None and cfg != 1.0:
+                report["sampling_note"] = "H3 uses BasicGuider; the supplied cfg is unused"
         return [TextContent(type="text", text=json.dumps(report)), preview_content(preview_img)]
 
     @app.tool("export_mask")

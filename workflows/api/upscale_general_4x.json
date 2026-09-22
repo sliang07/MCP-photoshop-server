@@ -1,0 +1,37 @@
+{
+  "0256f7a1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mcp_h3_example.png"
+    }
+  },
+  "e2aa7224": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x4plus.pth"
+    }
+  },
+  "297c92e2": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "e2aa7224",
+        0
+      ],
+      "image": [
+        "0256f7a1",
+        0
+      ]
+    }
+  },
+  "c20be8f8": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "297c92e2",
+        0
+      ],
+      "filename_prefix": "mcp_upscale"
+    }
+  }
+}

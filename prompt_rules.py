@@ -29,6 +29,18 @@ instructions take precedence over creative defaults. Inspect returned images or 
 preview_canvas after generation; do not claim to have inspected an unseen result."""
 
 MODEL_RULES = {
+    "minimax_h3": """MiniMax H3 still-image adaptation: describe one finished image, its
+subjects, composition, lighting, style and exact lettering. For edits, <Picture 1> is
+the canvas, <Picture 2> onward are reference_paths in order, and an optional mask is
+last. State each reference's role and what should change or remain. Do not invent
+camera motion, dialogue, audio, cuts or a video timeline for a still-image request.
+The installed non-turbo ref2va preset uses 20 steps, res_multistep/simple and BasicGuider.
+It samples the minimum 5-frame block and saves only frame 0 as RGB; still use is
+experimental and reference fidelity is model-dependent. cfg and negative_prompt
+are unused; express desired constraints in prompt. Dimensions round up to multiples
+of 32. No audio VAE, audio decode, video save, LoRA or custom speed patches are required.
+Use backend=minimax_h3 for edits or model=minimax_h3 for generation/batches.
+H3 outpaint and transparent extraction are not exposed by these tools.""",
     "flux2": """FLUX master (flux2prompt.txt): connected visual prose, usually 30–80 words;
 front-load the main priority, then setting/details, lighting and atmosphere. Expand only
 for meaningful requirements. No keyword dump, redundant quality adjectives or appended
@@ -141,9 +153,15 @@ def model_prompt_rules(model, task):
 
 def get_prompt_guidance(model, task):
     if model not in MODEL_RULES or task not in TASK_RULES:
-        raise ValueError("Choose model flux2/qwen21/anima and task generation/editing/outpaint")
+        raise ValueError("Choose model flux2/qwen21/anima/minimax_h3 and task generation/editing/outpaint")
     if model == "anima" and task != "generation":
         raise ValueError("Anima supports generation only; use qwen21 or flux2 for this task")
+    if model == "minimax_h3":
+        if task == "outpaint":
+            raise ValueError("H3 supports generation and editing; use qwen21 or flux2 for outpaint")
+        return {"model": model, "task": task,
+                "rules": [COMMON_RULES, TASK_RULES[task], model_prompt_rules(model, task)],
+                "sources": [], "scope": "Built-in still-image adaptation of the supplied H3 workflow and installed ComfyUI nodes; no video master is applied."}
     filename = QWEN_MASTER_FILES[task] if model == "qwen21" else MASTER_FILES[model]
     path = Path(MASTER_PROMPT_DIR) / filename
     try:
@@ -197,6 +215,9 @@ def prepare_prompts(model, checkpoint, prompt, negative_prompt):
     if model == "flux2" and negative:
         negative = ""
         adjustments.append("FLUX.2 Dev does not use negative_prompt; express desired constraints in prompt")
+    if model == "minimax_h3" and negative:
+        negative = ""
+        adjustments.append("H3 uses BasicGuider without negative_prompt; express desired constraints in prompt")
     if model == "anima" and not Path(checkpoint.replace("\\", "/")).name.startswith("anima-base-"):
         cleaned = _without_score_tags(positive), _without_score_tags(negative)
         if cleaned != (positive, negative):

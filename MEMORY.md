@@ -4,11 +4,28 @@
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
 
+## 2026-09-22 Repo sanitization for git push
+
+- Removed all machine-specific values from tracked files before push: tailnet IP, MagicDNS hostname, LAN IP examples, node names, the LLM container name, PIDs.
+- Tailnet transport admission now comes from `MCP_HTTP_ALLOWED_HOSTS` (comma-separated `host:port` patterns) in the gitignored `.env`; `server.py` appends them to the Host allowlist (421) and mirrored `http://` Origins (403). `run_openwebui.bat` keeps the `MCP_HTTP_HOST=0.0.0.0` bind but no longer embeds tailnet values in comments.
+- The LLM docker's container name is generalized to "the LLM container" in `server.py` instructions, `editing.py`, README and this file (the name stays out of the repo; identify it via `docker ps` / `:11434`).
+- `unittest_run.txt` added to `.gitignore`; README documents `MCP_HTTP_HOST` / `MCP_HTTP_ALLOWED_HOSTS`; `.env_example` carries commented placeholders.
+- Verification: full unit suite green (187). HTTP server restarted via `run_openwebui.bat` (the temporary scheduled task that had kept it alive was deleted); live raw-socket probes: MCP `initialize` with tailnet-IP and MagicDNS Host headers -> 200, LAN Host -> 421, plain GET -> 406 "Not Acceptable: Client must accept text/event-stream" (the expected Mac-probe response). Staged-tree token sweep shows no machine-specific values (only a generic "MacBook" mention).
+
+## 2026-09-22 Tailnet HTTP access for the Mac (MCP_HTTP_HOST)
+
+- Made the streamable-HTTP server reachable from the user's MacBook over Tailscale. `run_openwebui.bat` sets `MCP_HTTP_HOST=0.0.0.0`; `server.py` reads it (`os.getenv("MCP_HTTP_HOST", "127.0.0.1")`) and passes it as `host=` to `FastMCP`. Note: `MCP_HOST`/`FASTMCP_HOST` env vars do NOT work here — mcp SDK 1.29.0's `FastMCP.__init__` always passes the constructor host explicitly to `Settings`, which overrides env-based settings.
+- `tailscale serve` (the no-code alternative) is broken on this PC: the CLI hangs on every variant (any port, --bg/--yes, stdin closed) and never writes a serve config; GUI restart did not help. Needs an admin service reset or Tailscale reinstall to revisit.
+- Tailnet peers are admitted via `MCP_HTTP_ALLOWED_HOSTS` in the gitignored `.env` (comma-separated `host:port` patterns for the PC's tailnet IP and MagicDNS name). `server.py` appends them to the `_TRANSPORT_SECURITY` Host allowlist (421) and mirrored `http://` Origins (403). The SDK validates Host/Origin headers only, not the peer IP.
+- Bound 0.0.0.0 (not the tailnet IP alone) so Open WebUI's `host.docker.internal` -> loopback path keeps working; the allowlist keeps LAN out (verified: a LAN-style Host header -> 421).
+- Mac client URL: the PC's tailnet IP or MagicDNS name, port 8000, path `/mcp` (exact values in `.env`), Streamable HTTP, no auth. If a Mac probe hangs instead of erroring, Windows Firewall is eating it: add inbound TCP 8000 restricted to the tailnet (`remoteip=100.64.0.0/10`).
+- Verification: 187 unit tests pass (new `run_tests.bat`, plain `unittest`); log shows `Uvicorn running on http://0.0.0.0:8000` and a 406 response from the tailnet IP.
+
 ## 2026-09-22 Auto-kill fix: adopted PIDs and probe-safe idle timer
 
 - Fixed the reported ComfyUI-not-killed failure mode. Two defects in `comfy_client.py`: `_kill_process()`/`kill_comfyui()` only terminated the live Popen handle started by the current MCP server, so a ComfyUI started in a previous session (orphaned, holding port 8188) was never killed; and `start_comfyui()` cancelled the pending idle-kill timer on every call, including read-only probes, so the timer never fired.
 - New behavior: `start_comfyui()` adopts an already-running ComfyUI (PID found via `netstat -ano` on the `COMFYUI_URL` port) into `_adopted_pid`; the pending idle timer is cancelled only on the fresh-launch path; `_kill_process()` prefers the owned Popen and falls back to the adopted PID via `taskkill /F /T`; `kill_comfyui()` clears both handles and logs when nothing was killed.
-- Verification: full unit suite green (187 tests, including 6 new adopted-PID / idle-timer / netstat-parsing tests). The stuck external ComfyUI (PID 18312, port 8188) was terminated and the port confirmed free.
+- Verification: full unit suite green (187 tests, including 6 new adopted-PID / idle-timer / netstat-parsing tests). The stuck external ComfyUI (port 8188) was terminated and the port confirmed free.
 
 ## 2026-09-22 Live GPU validation and connection confirmation
 
@@ -16,7 +33,7 @@
 - Real Qwen 2.1 extraction and masked selected-layer editing passed at the unchanged 30 steps/CFG 3, Euler/simple, 1024×768. Extraction: 27.27 s, sampled peak whole-device memory 22,114 MiB (21.6 GiB). Masked recolour: 22.36 s, peak 25,731 MiB (25.1 GiB). These are individual smoke measurements, not a broad performance benchmark.
 - Extraction preserves the original layer and yields a usable transparent cabin cutout; mild coloured edge fringe and background alpha noise (typically 0–1/255) remain. Masked editing preserved every outside-mask pixel, the other layer, metadata and visibility mask exactly. Both undo/redo checks passed. Regenerated pixels inside the edit mask have alpha 248–255; their original alpha is not guaranteed.
 - Diagnostic artifacts: `gpu-validation-results.md`, `gpu-validation-restoration.json`, and the two GPU run folders in the local orchestration artifacts. The runner's helper argument collision was fixed after extraction; only the unstarted second test was resumed. No production code change was needed.
-- With explicit user approval, `qwen38` was stopped temporarily, ComfyUI models were unloaded after testing, and `qwen38` was restarted. Its models endpoint returned HTTP 200 with `qwen3.8-27b`. Open WebUI and searxng stayed running. Test documents were isolated and closed after saving; user documents and model presets were unchanged.
+- With explicit user approval, the local LLM container was stopped temporarily, ComfyUI models were unloaded after testing, and the container was restarted. Its models endpoint returned HTTP 200 with `qwen3.8-27b`. Open WebUI and searxng stayed running. Test documents were isolated and closed after saving; user documents and model presets were unchanged.
 
 ## 2026-09-22 Layer, project, mask and background-job tools
 
@@ -43,8 +60,8 @@
 
 ## 2026-09-21 Klein 9B Base swap — historical verification & process pitfalls
 
-- Live verification of `flux-2-klein-base-9b-fp8.safetensors` (28 steps / CFG 4 / Euler / `Flux2Scheduler`, seed 42, 1024x1024) passed standalone: ~30 s generation with `qwen38` stopped, output at `klein_base_verify/result.png` in a local scratch dir (script bug fixed: ComfyUI history entries use the `filename` key, not `name`).
-- MCP-level smoke test then exercised the real on-disk `server.generate_image` path outside Cline (`mcp_smoke_test.py` in a local scratch dir): profiles resolve `flux2` → fp8 base at 28/4.0 for generation/editing/outpaint, and a 512x512 cabin image was produced with `qwen38` running concurrently. Evidence: `klein_base_verify/mcp_smoke.png`.
+- Live verification of `flux-2-klein-base-9b-fp8.safetensors` (28 steps / CFG 4 / Euler / `Flux2Scheduler`, seed 42, 1024x1024) passed standalone: ~30 s generation with the local LLM container stopped, output at `klein_base_verify/result.png` in a local scratch dir (script bug fixed: ComfyUI history entries use the `filename` key, not `name`).
+- MCP-level smoke test then exercised the real on-disk `server.generate_image` path outside Cline (`mcp_smoke_test.py` in a local scratch dir): profiles resolve `flux2` → fp8 base at 28/4.0 for generation/editing/outpaint, and a 512x512 cabin image was produced with the local LLM container running concurrently. Evidence: `klein_base_verify/mcp_smoke.png`.
 - Pitfall 1: a long-lived Cline MCP server process keeps pre-edit code in memory. After the model swap it kept returning `flux2 is unavailable: ['model']` even though ComfyUI listed the new checkpoint — fixed by killing the stale `python.exe` MCP process (Cline shows the server "Not connected" afterwards; the user must reconnect it).
 - Pitfall 2: a ComfyUI child process spawned by that stale server survives its parent (orphaned, port 8188 held, idle-kill timer dies with the parent). `kill_comfyui`/auto-kill can only free processes the current client spawned itself. Check `netstat -ano | findstr :8188` after killing MCP processes and `taskkill` any orphan.
 - Note: `start "" python ...` from the chat shell hangs for 30 s and loses the child (console inheritance); use a `subprocess.Popen` launcher with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
@@ -96,7 +113,7 @@
 - Removed 5 tools: `img2img` + `character_transform` (legacy Flux2 denoise transforms; `edit_image` is the instruction-edit path), `inpaint` (Flux Kontext chain — its UNET/clip_l/t5xxl files are no longer installed; `edit_image` with `mask_path`/`region` is the masked-edit path), `controlnet_generate` (`models/controlnet` empty), `style_transfer` (`models/style_models` + `models/clip_vision` empty — `edit_image` with `reference_paths` is the style/identity path). Tool count 43 → 38.
 - `outpaint` was dead on the same missing Flux.1 chain and was rewritten onto the installed Flux2 Klein chain: `LoadImage` → `ImageScale` → `UNETLoader`/`CLIPLoader`(flux2)/`VAELoader` + `Flux2KleinSectionedEncoder` → `VAEEncode` → `SetLatentNoiseMask` (LoadImage MASK output: transparent padding = generate, original content = protected). `steps` default 30 → 6 (Flux2 distilled cap), `guidance` param dropped.
 - Fixed a latent `outpaint` bug the live test exposed: only the active layer was resized, leaving sibling layers (and masks) at the old size so `composite()` crashed with "images do not match". `outpaint_tool` now extends every layer (and every mask) to the new canvas size, transparent where new. 3 regression tests in `tests/test_outpaint.py`.
-- Live-verified 2026-09-20 end-to-end on ComfyUI 0.33.0 (`verification/_live_outpaint_flux2_test.py` → `verification/outpaint_flux2_live.png`): 512x512 canvas outpainted right by 256px → 768x512, original content preserved exactly, new region filled. Fill content was semantically poor because the `qwen38` LLM container was holding VRAM (GPU contention — see §11); the chain/graph itself is proven.
+- Live-verified 2026-09-20 end-to-end on ComfyUI 0.33.0 (`verification/_live_outpaint_flux2_test.py` → `verification/outpaint_flux2_live.png`): 512x512 canvas outpainted right by 256px → 768x512, original content preserved exactly, new region filled. Fill content was semantically poor because the local LLM container was holding VRAM (GPU contention — see §11); the chain/graph itself is proven.
 - Dead code removed: `build_img2img_kontext_workflow`, `build_inpaint_workflow`, `build_controlnet_workflow`, `build_style_transfer_workflow` (server.py); `controlnet_capabilities`, `style_transfer_capabilities` + their capability-report sections (editing.py); `MODEL_KONTEXT` (config.py); `tests/test_custom_nodes.py` (tested only the removed tools).
 - Docs synced: README (feature list, model list, examples, tool counts) and this file's §5/§7/§9/§10.
 
@@ -121,7 +138,7 @@
 - Migrated all three saved Qwen 2511 character-sheet workflows in ComfyUI; backups are in `verification/qwen2511_workflows_before_migration.zip`. The shared old VAE stays on the ANIMA branch only.
 - Verification: 79 tests pass; all four UI graphs pass ComfyUI prompt validation. Actual MCP stdio → ComfyUI → GPU tests: a masked/reference circle recolor completed in 28.3 seconds; an elf's silver-to-blue hair edit completed in 9.9 seconds. Both changed zero pixels outside the mask. Evidence: `verification/migration_live_status.json`, `migration_character_status.json`, `workflow_validation.json`.
 - Added `user/default/workflows/qwen_image_2_1_edit.json` as a simple standalone editor. Old model files are retained on disk but no active saved user workflow or MCP editing backend uses Qwen 2511.
-- GPU instructions now require checking actual contention. A normal edit on an available GPU needs no container shutdown. Stopping `qwen38` still requires explicit approval because it may serve the client LLM.
+- GPU instructions now require checking actual contention. A normal edit on an available GPU needs no container shutdown. Stopping the local LLM container still requires explicit approval because it may serve the client LLM.
 
 ---
 
@@ -477,14 +494,14 @@ python server.py
 
 > Added 2026-09-17. This is a standing rule for any LLM that calls this MCP server. It is delivered to every client in the MCP `initialize` response (server `instructions`, see `GPU_BATCH_RULE` in `server.py`) and is also repeated in the `get_editing_capabilities` notes.
 
-**The problem.** One 32 GB GPU (RTX 5090). The `qwen38` docker runs the LLM itself (Ollama-compatible API on `:11434`) and holds most of the VRAM while serving. ComfyUI is a host process (`:8188`, python from `COMFYUI_PYTHON` in `.env`), not a container. Generation sharing the GPU with a loaded LLM slows exponentially (qwen2511 alone peaked at ~32.1 GB).
+**The problem.** One 32 GB GPU (RTX 5090). The LLM docker runs the LLM itself (Ollama-compatible API on `:11434`; the container name is machine-local and kept out of this repo - identify it via `docker ps`) and holds most of the VRAM while serving. ComfyUI is a host process (`:8188`, python from `COMFYUI_PYTHON` in `.env`), not a container. Generation sharing the GPU with a loaded LLM slows exponentially (qwen2511 alone peaked at ~32.1 GB).
 
 **Container inventory:**
 
 | Container | Port | Uses GPU? | Action before a generation batch |
 |-----------|------|-----------|----------------------------------|
-| `qwen38` | `:11434` | Yes — the LLM backend | **Ask the user for explicit approval, then `docker stop qwen38`** |
-| `open-webui` | `:3000` | No (frontend for qwen38) | Optional stop; only useful if qwen38 stops too |
+| LLM container | `:11434` | Yes — the LLM backend | **Ask the user for explicit approval, then `docker stop` that container** |
+| `open-webui` | `:3000` | No (frontend for the LLM) | Optional stop; only useful if the LLM container stops too |
 | `searxng` | `:8080` | No (CPU-only) | Never stop it for GPU speed |
 
 **Procedure (any LLM client):**
@@ -493,11 +510,11 @@ python server.py
    a. Plan the complete job list with the user first.
    b. Hand the complete input list to `submit_generation_job` on an independently running host MCP server, or to a detached host runner. Verify that its process survives loss of the LLM connection; sequential awaited tool calls do not establish background ownership.
    c. Export each result as it completes (`submit_generation_job` does this automatically). Its job/status state is process-local; server restart or closing a stdio process loses it. Existing `batch_generate` waits for the whole batch before exporting.
-   d. **Ask the user for explicit approval** to run `docker stop qwen38` (plus `open-webui` if desired). Stop only after approval, and only once the batch is fully backgrounded.
+   d. **Ask the user for explicit approval** to run `docker stop` on the LLM container (plus `open-webui` if desired). Stop only after approval, and only once the batch is fully backgrounded.
    e. The batch then runs on the full GPU; results accumulate in ComfyUI's output dir / exported files.
-3. Afterwards, tell the user to `docker start qwen38 open-webui` to restore the LLM.
+3. Afterwards, tell the user to `docker start` the LLM container (and `open-webui`) to restore the LLM.
 
-**Self-kill warning.** `qwen38` serves the LLM that is driving the MCP calls. Stopping it terminates the session — that is exactly what the rule anticipates, and it is only acceptable because step 2b guarantees the batch continues on the host. Never stop `qwen38` mid-conversation with work that still depends on the LLM.
+**Self-kill warning.** The LLM container serves the LLM that is driving the MCP calls. Stopping it terminates the session — that is exactly what the rule anticipates, and it is only acceptable because step 2b guarantees the batch continues on the host. Never stop that container mid-conversation with work that still depends on the LLM.
 
 **Lifetime note.** HTTP client disconnection does not stop a submitted worker while its MCP server remains running. A client-managed stdio server may close with its client; do not assume it can outlive that client. No job persistence or automatic resume across server restart is implemented.
 
@@ -514,7 +531,7 @@ python server.py
 
 - **`comfy_client.py` adopted-PID kill:** `_kill_process()` previously required the live Popen handle started by this server, so a ComfyUI started outside the current MCP session (an orphan holding port 8188) was never killed. New `_find_listening_pid()` resolves the PID via `netstat -ano`; `start_comfyui()` records it in `_adopted_pid` when ComfyUI is already running, and `_kill_process()`/`kill_comfyui()` fall back to `taskkill /F /T` on that PID (owned Popen takes precedence).
 - **`comfy_client.py` probe-safe idle timer:** `start_comfyui()` no longer cancels the pending idle-kill timer on read-only probes (status/capability checks); only the fresh-launch path cancels it.
-- **Verification:** 187 unit tests green (6 new: adopted-PID fallback kill, handle clearing, no-handle no-op, netstat parsing, port-absent None, probe-keeps-timer/launch-cancels). Stuck external ComfyUI (PID 18312) terminated; port 8188 confirmed free.
+- **Verification:** 187 unit tests green (6 new: adopted-PID fallback kill, handle clearing, no-handle no-op, netstat parsing, port-absent None, probe-keeps-timer/launch-cancels). Stuck external ComfyUI terminated; port 8188 confirmed free.
 
 ### 2026-09-21 — FLUX.2 Dev NVFP4 (32B) replaces the Klein checkpoints
 - `config.py`: `MODEL_FLUX2` → `flux2-dev-nvfp4.safetensors`, text encoder → `mistral_3_small_flux2_fp8.safetensors` (CLIP type `flux2`); VAE unchanged. `model_profiles` flux2 preset 28/4.0 → 50 steps/embedded guidance 4.
@@ -561,7 +578,7 @@ python server.py
 ### 2026-09-17 — RealESRGAN x4plus + SAM 3 Supporting Models
 - `RealESRGAN_x4plus.pth` (67,040,989 bytes; SHA-256 `4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1`) installed in `models/upscale_models` from the official Real-ESRGAN release (v0.1.0 asset per the project README; the v0.2.0 download link 404s). Live MCP stdio test `verification/_realesrgan_test.py` upscaled a 512px canvas to 1024px (15.1s cold / 7.7s warm, alpha intact); evidence `verification/realesrgan_test_status.json`, `verification/realesrgan_upscaled.png`.
 - `sam3.pt` (3,450,062,241 bytes; SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`) installed in `models/detection/`. Official `facebook/sam3` HF repo is access-gated (local token not approved), so the `cubert-gmbh/sam3` mirror was used — verified byte-identical by matching LFS pointer OID.
-- ComfyUI 0.33.0 `SAM3_Detect` smoke-tested via `/prompt` on a temporary CPU instance (GPU saturated by qwen38): point-prompt mask in 42.2s, white fraction 0.110 matching the synthetic circle; evidence `verification/sam3_smoke_status.json`, `verification/sam3_smoke_mask.png`. Found: `CheckpointLoaderSimple` fails on the original SAM 3 clip (wrapper expects SAM 3.1 shapes); `ImageOnlyCheckpointLoader` + point/box prompts work; text prompting needs the SAM 3.1 checkpoint. MCP semantic-mask integration remains pending (no server code changed, no MCP restart needed).
+- ComfyUI 0.33.0 `SAM3_Detect` smoke-tested via `/prompt` on a temporary CPU instance (GPU saturated by the LLM container): point-prompt mask in 42.2s, white fraction 0.110 matching the synthetic circle; evidence `verification/sam3_smoke_status.json`, `verification/sam3_smoke_mask.png`. Found: `CheckpointLoaderSimple` fails on the original SAM 3 clip (wrapper expects SAM 3.1 shapes); `ImageOnlyCheckpointLoader` + point/box prompts work; text prompting needs the SAM 3.1 checkpoint. MCP semantic-mask integration remains pending (no server code changed, no MCP restart needed).
 - ComfyUI model folders rescan per request (`folder_paths` mtime cache) — new model files appear in loader dropdowns without a restart.
 
 ### 2026-09-17 — semantic_select (SAM 3) MCP Tool
@@ -581,9 +598,9 @@ python server.py
 - MEMORY.md: tool inventory updated to 39, file architecture adds `editing.py` and notes `GPU_BATCH_RULE` in `instructions`, Qwen 2511 model files added under Instruction Editing, testing status now 39 tools.
 
 ### 2026-09-17 — GPU Contention & Batching Rule
-- Added standing rule: batch all ComfyUI generations in the background, then (with explicit user approval) stop the `qwen38` LLM docker so generation gets the full GPU. Stopping `qwen38` ends the LLM session, which is acceptable only after the batch is fully queued; remind the user to `docker start qwen38 open-webui` afterwards.
+- Added standing rule: batch all ComfyUI generations in the background, then (with explicit user approval) stop the LLM docker so generation gets the full GPU. Stopping it ends the LLM session, which is acceptable only after the batch is fully queued; remind the user to `docker start` the LLM (and `open-webui`) afterwards.
 - Delivered via three channels: FastMCP `instructions` (MCP `initialize` response, `GPU_BATCH_RULE` in `server.py`), `get_editing_capabilities` notes (`editing.py`), and this MEMORY.md section.
-- Context: qwen2511 FP8 `e4m3fn` (1038lab) deployed and live-verified (see EDITING_UPGRADE.md); running it alongside the `qwen38` LLM causes severe GPU contention.
+- Context: qwen2511 FP8 `e4m3fn` (1038lab) deployed and live-verified (see EDITING_UPGRADE.md); running it alongside the LLM causes severe GPU contention.
 
 ### 2026-09-17 — SAM 3.1 Text Prompting for semantic_select
 - Deployed `sam3.1_multiplex_fp16.safetensors` (1,745,546,848 bytes; SHA-256 `9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03`) to `models/checkpoints/` from the open `Comfy-Org/sam3.1` HF repo (not gated). Header parses (1,590 tensors incl. `language_backbone`); live :8188 ComfyUI listed it under `CheckpointLoaderSimple` + `ImageOnlyCheckpointLoader` via per-request rescan — no restart.

@@ -33,3 +33,6 @@ _live_edit_check.py
 
 # Generated batch outputs (batch_generate default export dir)
 batch_output/
+
+# Test artifacts
+unittest_run.txt

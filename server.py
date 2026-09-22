@@ -50,19 +50,19 @@ GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 b
 
 Layer editing: edit_image(layer_index=...) edits only that layer's pixels and preserves its settings. output_mode=extract uses Qwen 2.1 to add an extracted subject as a new layer; inspect the preview and has_transparency. Use set_layer_visibility to compare layers, export_mask to reuse a selection as an independent edit mask, and save_project/open_project for layered documents. Project opening starts a fresh undo history.
 
-Model selection: generate_image, batch_generate and submit_generation_job accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), or anima (anime/illustration). edit_image and outpaint accept backend=qwen21 or flux2. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+Model selection: generate_image, batch_generate and submit_generation_job accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), anima (anime/illustration), or minimax_h3 (experimental H3 stills). edit_image accepts backend=qwen21, flux2 or minimax_h3; outpaint accepts qwen21 or flux2. H3 uses <Picture 1> for the canvas and subsequent numbered pictures for references. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
 
 Background generation: submit_generation_job returns an ID, retains the full input list, and exports each completed image before starting the next. Poll get_job_status or list_jobs on the same server. cancel_job finishes the current image and skips remaining images without interrupting other jobs. Jobs survive an HTTP client disconnect only while the MCP server process runs; closing a stdio server or restarting loses workers/status, but exported files remain. batch_generate still waits for the whole batch before exporting.
 
-Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3/video and audio masters do not define Photoshop image prompts. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
+Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3 uses its built-in still-image guidance; video and audio masters do not override still-image requests. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
-GPU batching rule: this host's single 32GB GPU may be shared with the `qwen38` docker (the LLM backend itself - Ollama-compatible API on :11434) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
+GPU batching rule: this host's single 32GB GPU may be shared with the LLM backend docker (Ollama-compatible API on :11434 - its container name is machine-local and kept out of the repo; identify it via `docker ps`) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
 - Single generation with sufficient free GPU memory: run it directly. FLUX.2 Dev defaults to 50 steps, not the retired Klein four-step recipe.
-- For batches that need GPU memory currently occupied by qwen38: first hand the complete input list to submit_generation_job on an independently running host MCP server, or to a detached host runner. Verify that the worker's process will remain running when the LLM connection ends. Sequential awaited edit_image calls are not a detached batch.
-- Only then ask the user for explicit approval to run `docker stop qwen38` (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval and verified background ownership of the complete batch.
-- Warning: `qwen38` serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to run `docker start qwen38 open-webui` afterwards.
+- For batches that need GPU memory currently occupied by the LLM container: first hand the complete input list to submit_generation_job on an independently running host MCP server, or to a detached host runner. Verify that the worker's process will remain running when the LLM connection ends. Sequential awaited edit_image calls are not a detached batch.
+- Only then ask the user for explicit approval to run `docker stop` on that LLM container (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval and verified background ownership of the complete batch.
+- Warning: that container serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to `docker start` the LLM (and optionally `open-webui`) afterwards.
 - `searxng` is CPU-only; never stop it for GPU speed.
 Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
 
@@ -71,13 +71,28 @@ Full procedure: MEMORY.md, section "GPU Contention & Batching Rule"."""
 # (Docker) reaches this server via host.docker.internal, so allow that host
 # explicitly. Protection stays enabled for all other hosts. (Harmless in
 # stdio mode - the checks only apply to the HTTP endpoints.)
+#
+# Remote MCP clients (e.g. tailnet peers) are admitted via MCP_HTTP_ALLOWED_HOSTS:
+# a comma-separated list of host:port patterns (see .env / .env_example).
+# Machine-specific values stay in the gitignored .env, never in this file.
+_EXTRA_ALLOWED_HOSTS = [
+    h.strip() for h in os.getenv("MCP_HTTP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
 _TRANSPORT_SECURITY = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
-    allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "host.docker.internal:*"],
-    allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", "http://host.docker.internal:*"],
+    allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "host.docker.internal:*"] + _EXTRA_ALLOWED_HOSTS,
+    allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", "http://host.docker.internal:*"]
+                    + [f"http://{h}" for h in _EXTRA_ALLOWED_HOSTS],
 )
 
-app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE, transport_security=_TRANSPORT_SECURITY)
+# Bind host for streamable-HTTP mode. Default 127.0.0.1 keeps Open WebUI working
+# (Docker NATs host.docker.internal -> host loopback). run_openwebui.bat sets
+# MCP_HTTP_HOST=0.0.0.0 so tailnet peers (MCP_HTTP_ALLOWED_HOSTS in .env) can
+# also reach it; non-allowlisted Host/Origin headers (421/403) stay rejected,
+# so LAN/Internet stay out.
+_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+
+app = FastMCP("mcp-photoshop-server", instructions=GPU_BATCH_RULE, host=_HTTP_HOST, transport_security=_TRANSPORT_SECURITY)
 comfy = ComfyUIClient(COMFYUI_URL)
 sessions = SessionManager()
 
@@ -290,12 +305,13 @@ async def get_info(session_id: str = "default"):
 
 
 @app.tool("get_prompt_guidance")
-async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima"] = "flux2",
+async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima", "minimax_h3"] = "flux2",
                                    task: Literal["generation", "editing", "outpaint"] = "generation"):
     """Read the applicable local master prompt and its Photoshop tool adaptation.
 
     No ComfyUI startup or GPU use. Returns the current full master with path and hash.
     Qwen generation selects the t2i master; editing/outpaint select the edit master.
+    minimax_h3 returns built-in still-image rules without reading a video master.
     Standalone code-block/JSON output instructions become raw MCP prompt arguments;
     size metadata maps to supported tool arguments, not text sent to the image model.
     Read when needed; the essential rules are already included in the image tools.
@@ -304,23 +320,25 @@ async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima"] = 
 
 
 @app.tool("generate_image")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
-async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"] = "flux2", width: int = 1024, height: int = 1024,
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
+async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima", "minimax_h3"] = "flux2", width: int = 1024, height: int = 1024,
                          steps: Optional[int] = None, cfg: Optional[float] = None, seed: Optional[int] = None, negative_prompt: str = "",
                          session_id: str = "default", timeout: Optional[int] = None):
     """Generate an image from text. Automatically starts ComfyUI; no manual startup is required.
 
     Choose model='flux2' for generation (FLUX.2 Dev NVFP4, 50 steps/guidance 4, guidance-distilled),
     'qwen21' for detail, typography or transparent output (custom 30 steps/CFG 3),
-    or 'anima' for anime/illustration (30 steps/CFG 4). Omit steps/cfg for these defaults.
+    'anima' for anime/illustration (30 steps/CFG 4), or 'minimax_h3' for experimental H3 stills
+    (20 steps/res_multistep/simple, frame 0 of 5, RGB). Omit steps/cfg for these defaults.
+    H3 ignores cfg and negative_prompt (reported), rounds dimensions up to 32, and allows 3600 seconds.
     For flux2, cfg controls embedded FluxGuidance; negative_prompt is unused and reported
     if supplied. Express desired constraints positively in prompt.
     get_editing_capabilities reports installed choices. For changes to an existing
     image use edit_image instead. A missing model is reported, never silently substituted.
     """
     try:
-        if model not in ("flux2", "qwen21", "anima"):
-            raise ValueError("model must be flux2, qwen21 or anima")
+        if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
+            raise ValueError("model must be flux2, qwen21, anima or minimax_h3")
         await comfy.start_comfyui()
         profile = model_profiles(await comfy.get_object_info(), "generation")[model]
         if not profile["available"]:
@@ -328,7 +346,9 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima"]
         prompt, negative_prompt, adjustments = prepare_prompts(model, profile["model"], prompt, negative_prompt)
         workflow = build_generation_workflow(model, profile, prompt, negative_prompt,
                                              width, height, steps, cfg, seed)
-        result = await run_workflow(workflow, timeout=timeout or (1800 if model in ("flux2", "qwen21") else None))
+        if model == "minimax_h3" and cfg is not None and cfg != 1.0:
+            adjustments.append("H3 uses BasicGuider; the supplied cfg is unused")
+        result = await run_workflow(workflow, timeout=timeout or (3600 if model == "minimax_h3" else 1800 if model in ("flux2", "qwen21") else None))
         if not result:
             return [TextContent(text="Generation failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
@@ -1164,7 +1184,7 @@ DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_ou
 
 
 @app.tool("batch_generate")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
 async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
                               export_format: str = "PNG", timeout: Optional[int] = None):
     """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass, await completion, and export all results.
@@ -1172,10 +1192,10 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     Automatically starts ComfyUI when needed; no manual startup is required.
 
     jobs: list of job objects, each with 'prompt' (required) and optional
-    'model' ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime), 'width', 'height', 'steps', 'cfg',
+    'model' ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), 'width', 'height', 'steps', 'cfg',
     'seed', 'negative_prompt', and 'filename' (output basename without extension).
     Models may differ per job. Omitted steps/cfg use model defaults:
-    flux2=50/4, qwen21=30/3 (custom preset), anima=30/4. Explicit values are preserved.
+    flux2=50/4, qwen21=30/3 (custom preset), anima=30/4, minimax_h3=20/BasicGuider. H3 cfg/negative_prompt are unused and reported.
     For flux2 jobs, cfg is embedded FluxGuidance and negative_prompt is unused/reported.
     This tool waits for the batch results before exporting. Use submit_generation_job for a returned job ID
     and per-image exports; its MCP server process must remain running. For work that must continue after
@@ -1195,8 +1215,8 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
             if not isinstance(job, dict) or not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job {i} is invalid: each job needs a non-empty 'prompt' string")]
             model = job.get("model", "flux2")
-            if model not in ("flux2", "qwen21", "anima"):
-                return [TextContent(text=f"Job {i}: 'model' must be 'flux2', 'qwen21' or 'anima'")]
+            if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
+                return [TextContent(text=f"Job {i}: 'model' must be 'flux2', 'qwen21', 'anima' or 'minimax_h3'")]
         await comfy.start_comfyui()
         profiles = model_profiles(await comfy.get_object_info(), "generation")
         workflows = []
@@ -1213,6 +1233,9 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
             seed = int(seed) if seed is not None else secrets.randbits(63)
             prompt, negative_prompt, adjustments = prepare_prompts(
                 model, profile["model"], str(job["prompt"]), str(job.get("negative_prompt", "")))
+            if model == "minimax_h3" and cfg != 1.0:
+                adjustments.append("H3 uses BasicGuider; the supplied cfg is unused")
+                cfg = 1.0
             workflows.append(build_generation_workflow(model, profile,
                 prompt=prompt, negative_prompt=negative_prompt,
                 width=int(job.get("width", DEFAULT_WIDTH)), height=int(job.get("height", DEFAULT_HEIGHT)),
@@ -1223,7 +1246,7 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
                 setting.update(prompt_adjustments=adjustments, effective_prompt=prompt, negative_prompt=negative_prompt)
             settings.append(setting)
         if timeout is None:
-            timeout = sum(1800 if job.get("model", "flux2") in ("flux2", "qwen21") else WEBSOCKET_TIMEOUT for job in jobs)
+            timeout = sum(3600 if job.get("model") == "minimax_h3" else 1800 if job.get("model", "flux2") in ("flux2", "qwen21") else WEBSOCKET_TIMEOUT for job in jobs)
         batch = await comfy.batch_run_workflows(workflows, timeout=timeout)
         batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
         out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR
@@ -1300,7 +1323,7 @@ generation_jobs = GenerationJobs(_generate_job_item)
 
 
 @app.tool("submit_generation_job")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima"))
+@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
 async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = None,
                                 export_format: str = "PNG", timeout_per_image: Optional[int] = None):
     """Submit a generation job for asynchronous processing.
@@ -1310,8 +1333,8 @@ async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = No
     restart/closed stdio process loses job state/worker; exported files persist.
     Cancellation is graceful: current image finishes and exports; remaining images skipped, no Comfy interrupt.
 
-    Supported job fields: prompt (required), model ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime), width, height, steps, cfg, seed, negative_prompt, filename.
-    Default steps/guidance: flux2=50/4, qwen21=30/3, anima=30/4.
+    Supported job fields: prompt (required), model ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), width, height, steps, cfg, seed, negative_prompt, filename.
+    Default steps/guidance: flux2=50/4, qwen21=30/3, anima=30/4, minimax_h3=20/BasicGuider (cfg and negative_prompt unused).
     timeout_per_image: optional seconds per image; omitted uses the selected model's timeout.
     """
     try:
@@ -1328,8 +1351,8 @@ async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = No
             if not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job at index {i} must have a non-empty prompt")]
             model = job.get("model", "flux2")
-            if model not in ("flux2", "qwen21", "anima"):
-                return [TextContent(text=f"Job at index {i} has invalid model '{model}'. Must be flux2, qwen21, or anima.")]
+            if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
+                return [TextContent(text=f"Job at index {i} has invalid model '{model}'. Must be flux2, qwen21, anima or minimax_h3.")]
         report = generation_jobs.submit(jobs, export_dir=export_dir, export_format=fmt, timeout_per_image=timeout_per_image)
         return [TextContent(text=json.dumps(report, indent=2))]
     except Exception as e:

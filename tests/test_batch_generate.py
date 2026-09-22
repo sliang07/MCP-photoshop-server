@@ -71,7 +71,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_unknown_model(self):
         out = await self.server.batch_generate_tool(jobs=[{"prompt": "x", "model": "sd15"}], export_dir=self.tmp.name)
-        self.assertIn("must be 'flux2', 'qwen21' or 'anima'", out[0].text)
+        self.assertIn("must be 'flux2', 'qwen21', 'anima' or 'minimax_h3'", out[0].text)
         self.client.batch_run_workflows.assert_not_awaited()
 
     async def test_empty_job_list_rejected(self):

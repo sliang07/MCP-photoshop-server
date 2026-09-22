@@ -33,7 +33,7 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 Projects are versioned JSON plus lossless PNGs in a ZIP archive, not PSD files. Saving replaces the target atomically; a failed load leaves the current document intact. Opening starts a fresh undo history. Supply a path in an existing directory.
 
 ### AI Image Generation & Editing
-- `generate_image` — Text-to-image with `model="flux2"`, `"qwen21"`, or `"anima"`
+- `generate_image` — Text-to-image with `model="flux2"`, `"qwen21"`, `"anima"`, or `"minimax_h3"`
 - `outpaint` — Extend left/right/top/bottom with `backend="flux2"` or `"qwen21"`; restores the original pixels exactly after generating the new margin
 
 | Model | Generate / batch | Edit / masked edit / references | Outpaint | Default steps / guidance | Sampler | Scheduler |
@@ -41,6 +41,13 @@ Projects are versioned JSON plus lossless PNGs in a ZIP archive, not PSD files. 
 | `flux2` (FLUX.2 Dev NVFP4, 32B) | Yes | Yes | Yes | 50 / embedded guidance 4 | Euler | Native `Flux2Scheduler` |
 | `qwen21` (Qwen Image 2.1; custom preset) | Yes; detail, typography, alpha | Yes | Yes | 30 / 3 | Euler | Simple |
 | `anima` (installed Aesthetic v1.1) | Yes; anime/illustration | No | No | 30 / 4 | `er_sde` | Simple |
+| `minimax_h3` (installed ref2va INT8) | Yes; experimental stills | Yes; RGB | No | 20 / BasicGuider | `res_multistep` | Simple |
+
+H3 is available through `generate_image`, `batch_generate`, `submit_generation_job` and `edit_image(backend="minimax_h3")`. It generates the minimum five-frame block and saves frame 0. Editing uses `<Picture 1>` for the canvas, subsequent pictures for references, and the final picture for an optional edit mask; the MCP restores outside-mask pixels afterward. `cfg` and `negative_prompt` are unused and reported when supplied with non-default values. Dimensions round up to multiples of 32 for generation; edits return the original canvas size. H3 allows 3600 seconds per image and does not provide transparent extraction or outpaint.
+
+This adapts `minimax_h3_ref2img_single.json` to installed weights: `minimax_h3_ref2va_pruned_int8_convrot.safetensors`, `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, and `minimax_h3_video_vae_fp16.safetensors`. The supplied file's hybrid model, Turbo LoRA and custom speed patches are not required or substituted silently. The installed H3 node makes the audio VAE optional for image references. Five frames are below its documented trained video duration, so still quality is experimental. A live 640x384, 20-step check generated a red mug and edited it blue successfully.
+
+[Nine ready-to-open workflows](workflows/README.md) include H3 text-to-image, one-reference edits, two-reference composition, Flux/Qwen generation and edits, Anima generation, and general 4x upscaling. Each has UI and API JSON versions. UI copies are installed under ComfyUI's **MCP Image Presets** folder. Save in-memory MCP work and reconnect the server to load the new H3 tool options.
 
 These are the active MCP presets for the installed models. Qwen generation, editing and outpainting all use the requested **30 steps / CFG 3** preset. This is a user preference, not the official Qwen 2.1 recommendation: ComfyUI's current 2.1 templates use **25 steps / CFG 1 / Euler / Simple**. Older Qwen base and Lightning/Flash recipes do not define the 2.1 defaults; no Lightning LoRA or AuraFlow shift is applied.
 
@@ -80,10 +87,10 @@ Qwen generation descriptions are English; edit descriptions are Chinese for Chin
 
 The server removes a single surrounding prompt code fence. For Anima Aesthetic/unknown checkpoints, it removes standalone comma-separated `score_*` tags from both positive and negative prompts, while preserving quoted text verbatim; known Anima base checkpoints retain scores. Generation/batch results disclose any normalization. It does not truncate prompts to editorial word targets or automatically append negative tags that could conflict with the request.
 
-Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the masters reviewed September 21, including the two newly supplied Qwen guides; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. The H3 video, audio/music, historical review and backup files do not supply still-image syntax or override active MCP sampling presets. Original master files are unchanged.
+Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the masters reviewed September 21, including the two newly supplied Qwen guides; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. H3 stills use built-in image guidance; H3 video, audio/music, historical review and backup files do not override active MCP sampling presets. Original master files are unchanged.
 
 ### Instruction Editing
-- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3) or FLUX.2 Dev (`flux2`, 50 steps/embedded guidance 4). Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. Both backends default to a 1800-second timeout.
+- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3), FLUX.2 Dev (`flux2`, 50 steps/embedded guidance 4), or experimental MiniMax H3 (`minimax_h3`, 20 steps/BasicGuider). Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. Flux/Qwen default to a 1800-second timeout; H3 uses 3600 seconds.
 - `get_editing_capabilities` — Live ComfyUI model/node availability per task (generation, editing, outpaint; notes also carry the GPU batching rule)
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
 
@@ -143,7 +150,7 @@ For reusable AI masks: create a selection, call `export_mask(path="selection.png
 - `get_comfyui_status` — Check ComfyUI connection (starts it by default; `start_if_needed=False` for a passive check)
 - `clear_vram` — Free GPU memory
 
-> **GPU batching rule:** the host GPU is shared with the `qwen38` LLM docker and Open WebUI. Check contention before proposing changes. `submit_generation_job` retains the complete input list in the MCP server and exports between images, but its server process must remain running independently of the LLM connection. If that lifetime is uncertain, use a detached host runner. `batch_generate` waits for the whole batch before exporting and does not detach. Stopping `qwen38` ends the LLM session and still requires explicit user approval after background ownership is established. `searxng` is CPU-only and never needs stopping. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
+> **GPU batching rule:** the host GPU is shared with the LLM backend docker (Ollama-compatible API on :11434; container name kept out of the repo) and Open WebUI. Check contention before proposing changes. `submit_generation_job` retains the complete input list in the MCP server and exports between images, but its server process must remain running independently of the LLM connection. If that lifetime is uncertain, use a detached host runner. `batch_generate` waits for the whole batch before exporting and does not detach. Stopping the LLM container ends the LLM session and still requires explicit user approval after background ownership is established. `searxng` is CPU-only and never needs stopping. Full procedure: `MEMORY.md` → "GPU Contention & Batching Rule".
 
 ## Installation
 
@@ -206,13 +213,13 @@ Add to your MCP client configuration (e.g., Claude Desktop `claude_desktop_confi
 }
 ```
 
-> **Local artifacts (gitignored):** `.env`, `mcp_http.log`, `batch_output/` and `verification/` hold machine-specific paths and runtime outputs (e.g. `.env` points at this machine's ComfyUI install; verification status JSONs contain local file paths). They are excluded by `.gitignore` — never commit or share them.
+> **Local artifacts (gitignored):** `.env`, `mcp_http.log`, `unittest_run.txt`, `batch_output/` and `verification/` hold machine-specific paths and runtime outputs (e.g. `.env` points at this machine's ComfyUI install and carries the tailnet `MCP_HTTP_ALLOWED_HOSTS` values; verification status JSONs contain local file paths). They are excluded by `.gitignore` — never commit or share them.
 
 ### Using with Open WebUI
 
 The server can also serve Open WebUI over MCP **streamable-HTTP** — it registers as an **external tool server**, so it appears in chat as the **"Mcp Photoshop" tool** (enabled per-chat via the Tools panel, which requires the "Direct Tool Servers" user permission). Each client gets its own server process, so Cline's stdio connection is unaffected.
 
-1. Double-click `run_openwebui.bat` in this folder. It sets `MCP_TRANSPORT=streamable-http` and serves `127.0.0.1:8000` (endpoint `/mcp`); logs append to `mcp_http.log`.
+1. Double-click `run_openwebui.bat` in this folder. It sets `MCP_TRANSPORT=streamable-http` and `MCP_HTTP_HOST=0.0.0.0` (endpoint `/mcp`); the transport allowlist admits local/Docker clients by default and tailnet peers configured in `.env` (`MCP_HTTP_ALLOWED_HOSTS`), keeping the LAN itself blocked; logs append to `mcp_http.log`.
 2. Register the tool server in Open WebUI — admin only, the personal Integrations page accepts OpenAPI servers only. Two ways:
    - **UI (current `open-webui:main` builds):** Settings → **Admin** → **Integrations** → **External Tool Servers** → **Manage Direct Connections** → **Add Connection** → click the **OpenAPI** toggle to switch it to **MCP** (badge shows "MCP Streamable HTTP") → URL `http://host.docker.internal:8000/mcp`, API key left blank (optional), Name `Mcp Photoshop` → Save.
    - **Direct DB (required on v0.11.3 — its connection dialog was type-locked to OpenAPI and could not create an MCP connection):** stop the container, upsert this entry into the SQLite config (`/app/backend/data/webui.db`, table `config`, key `tool_server.connections`), then start it:
@@ -242,7 +249,9 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served on `127.0.0.1:8000` at `/mcp`) |
+| `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served at `/mcp`) |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Bind address for the streamable-HTTP server; `0.0.0.0` (set by `run_openwebui.bat`) also admits tailnet peers via the allowlist |
+| `MCP_HTTP_ALLOWED_HOSTS` | *(empty)* | Optional comma-separated `host:port` patterns (e.g. a tailnet IP and MagicDNS name) admitted as Host + `http://` Origin; machine-specific, belongs in `.env` |
 | `MASTER_PROMPT_DIR` | `masters/` (repository-local, next to `server.py`) | Directory containing the current Flux, Anima and Qwen master files; read by `get_prompt_guidance` |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |

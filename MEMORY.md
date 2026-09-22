@@ -4,6 +4,12 @@
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
 
+## 2026-09-22 Auto-kill fix: adopted PIDs and probe-safe idle timer
+
+- Fixed the reported ComfyUI-not-killed failure mode. Two defects in `comfy_client.py`: `_kill_process()`/`kill_comfyui()` only terminated the live Popen handle started by the current MCP server, so a ComfyUI started in a previous session (orphaned, holding port 8188) was never killed; and `start_comfyui()` cancelled the pending idle-kill timer on every call, including read-only probes, so the timer never fired.
+- New behavior: `start_comfyui()` adopts an already-running ComfyUI (PID found via `netstat -ano` on the `COMFYUI_URL` port) into `_adopted_pid`; the pending idle timer is cancelled only on the fresh-launch path; `_kill_process()` prefers the owned Popen and falls back to the adopted PID via `taskkill /F /T`; `kill_comfyui()` clears both handles and logs when nothing was killed.
+- Verification: full unit suite green (187 tests, including 6 new adopted-PID / idle-timer / netstat-parsing tests). The stuck external ComfyUI (PID 18312, port 8188) was terminated and the port confirmed free.
+
 ## 2026-09-22 Live GPU validation and connection confirmation
 
 - The running HTTP MCP server exposes all 50 tools; Open WebUI's native client connection and a tool call passed. The user separately confirmed Cline's live connection.
@@ -131,7 +137,7 @@
 
 **ComfyUI Lifecycle Management:**
 - **Auto-start**: Automatically launches ComfyUI via embedded Python when needed (no manual startup required)
-- **Idle timeout auto-kill**: When `COMFYUI_AUTO_KILL=1`, ComfyUI is killed after `COMFYUI_IDLE_TIMEOUT` (default 60s) of inactivity instead of immediately. This allows chaining multiple ComfyUI tools without restarting each time, while still freeing VRAM when idle.
+- **Idle timeout auto-kill**: When `COMFYUI_AUTO_KILL=1`, ComfyUI is killed after `COMFYUI_IDLE_TIMEOUT` (default 60s) of inactivity instead of immediately. This allows chaining multiple ComfyUI tools without restarting each time, while still freeing VRAM when idle. The kill targets the process this server started or adopted (an already-running instance found via `netstat -ano`), so an externally started ComfyUI is terminated too.
 - **Port management**: Handles Windows TIME_WAIT issues by waiting for port 8188 to be fully bindable
 - **3-strategy kill**: Direct process handle → port-based (netstat) → command-line matching (wmic)
 - **Pre-fetch output**: Downloads result bytes BEFORE killing ComfyUI when auto-kill is enabled
@@ -285,17 +291,18 @@
 ### Auto-Start Flow
 1. `run_workflow_and_wait()` calls `_cancel_idle_kill()` then `start_comfyui()` before each workflow
 2. `start_comfyui()` checks if ComfyUI is already running via `/history` endpoint
-3. If not running: checks the configured port, stopping only its own stale process; foreign listeners return an error
-4. Launches ComfyUI via embedded Python: `COMFYUI_PYTHON -s COMFYUI_MAIN COMFYUI_ARGS...`
-5. Falls back to `.bat` if Python path doesn't exist
-6. Polls `/history` every 2s until reachable (up to `COMFYUI_START_TIMEOUT`=180s)
-7. On timeout: stops the owned process, verifies cleanup and port availability, then retries once
+3. If already running: adopts the instance (PID via `netstat -ano`) into `_adopted_pid` so the idle kill can manage it; the pending idle timer is NOT cancelled on this probe path
+4. If not running: cancels any stale pending idle timer, checks the configured port, stopping only its own stale process; foreign listeners return an error
+5. Launches ComfyUI via embedded Python: `COMFYUI_PYTHON -s COMFYUI_MAIN COMFYUI_ARGS...`
+6. Falls back to `.bat` if Python path doesn't exist
+7. Polls `/history` every 2s until reachable (up to `COMFYUI_START_TIMEOUT`=180s)
+8. On timeout: stops the owned process, verifies cleanup and port availability, then retries once
 
 ### Idle Timeout Auto-Kill (when `COMFYUI_AUTO_KILL=1`)
 1. After workflow completes successfully: schedules idle kill via `_schedule_idle_kill()`
 2. Idle timer set to `COMFYUI_IDLE_TIMEOUT` (default 60s / 1 minute)
 3. If a new workflow starts within the timeout: `_cancel_idle_kill()` cancels pending timer
-4. After timeout: checks the shared queue; busy, malformed or unreachable queue state defers shutdown. An empty queue permits stopping only this MCP process's owned backend.
+4. After timeout: checks the shared queue; busy, malformed or unreachable queue state defers shutdown. An empty queue permits stopping this server's owned backend, or an adopted PID (a ComfyUI already running, e.g. from a previous MCP server session).
 5. On error (RuntimeError, TimeoutError): immediate kill (no idle delay)
 6. Pre-fetches output file bytes via `/view` endpoint before any kill
 
@@ -502,6 +509,12 @@ python server.py
 - Re-verified all four local master files through live MCP `get_prompt_guidance` (path + SHA-256 + full text per call): qwen21 t2i/edit and anima hashes matched the previously verified records; `flux2prompt.txt` had drifted to the 2026-09-19 FLUX.2 [dev] revision (SHA `eda66664…870f`) and the served text now reflects it.
 - Dropped the stale "historical Klein heading" sentence from `prompt_rules` `MODEL_RULES["flux2"]` (and resynced the changelog line above); repo-wide Klein scan confirmed all remaining references are correctly historical. 176 tests pass.
 - Live master-compliant proofs through the MCP server (RTX 5090, 30.9 GB VRAM free, qwen3.8 LLM container untouched): one Qwen21 image from a t2i-master observer-style prompt (1152x768, quoted "MEADOW" sign rendered exactly) and one Anima image from an Aesthetic hybrid tag+prose prompt (768x1152, quoted "PLATFORM 3" sign rendered exactly, no `score_*` tags, conflicting "blurry" negative removed). Artifacts: `verification/master_compliance/` (gitignored, on disk).
+
+### 2026-09-22 — Auto-kill now manages externally started ComfyUI (adopted PID)
+
+- **`comfy_client.py` adopted-PID kill:** `_kill_process()` previously required the live Popen handle started by this server, so a ComfyUI started outside the current MCP session (an orphan holding port 8188) was never killed. New `_find_listening_pid()` resolves the PID via `netstat -ano`; `start_comfyui()` records it in `_adopted_pid` when ComfyUI is already running, and `_kill_process()`/`kill_comfyui()` fall back to `taskkill /F /T` on that PID (owned Popen takes precedence).
+- **`comfy_client.py` probe-safe idle timer:** `start_comfyui()` no longer cancels the pending idle-kill timer on read-only probes (status/capability checks); only the fresh-launch path cancels it.
+- **Verification:** 187 unit tests green (6 new: adopted-PID fallback kill, handle clearing, no-handle no-op, netstat parsing, port-absent None, probe-keeps-timer/launch-cancels). Stuck external ComfyUI (PID 18312) terminated; port 8188 confirmed free.
 
 ### 2026-09-21 — FLUX.2 Dev NVFP4 (32B) replaces the Klein checkpoints
 - `config.py`: `MODEL_FLUX2` → `flux2-dev-nvfp4.safetensors`, text encoder → `mistral_3_small_flux2_fp8.safetensors` (CLIP type `flux2`); VAE unchanged. `model_profiles` flux2 preset 28/4.0 → 50 steps/embedded guidance 4.

@@ -342,16 +342,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def test_start_cancels_idle_shutdown_before_health_check(self):
+    async def test_start_keeps_pending_idle_shutdown_when_already_running(self):
+        # A probe-style start (ComfyUI already up) must not cancel the pending
+        # idle kill; it adopts the running instance PID for later management.
         self.client._schedule_idle_kill()
         timer = self.client._idle_kill_timer
-        async def healthy():
-            self.assertTrue(timer.cancelled())
-            return True
-        self.client.is_running = healthy
+        self.client.is_running = AsyncMock(return_value=True)
+        self.client._find_listening_pid = lambda port=None: 4321
         with patch.object(self.client, "_start_process") as launch:
             await self.client.start_comfyui()
         launch.assert_not_called()
+        self.assertFalse(timer.cancelled())
+        self.assertEqual(self.client._adopted_pid, 4321)
+
+    async def test_start_cancels_stale_idle_shutdown_before_launching(self):
+        # A fresh launch must not be killed by a timer from an earlier instance.
+        self.client._schedule_idle_kill()
+        timer = self.client._idle_kill_timer
+        self.client.is_running = AsyncMock(side_effect=[False, True])
+        self.client._wait_for_port_free = AsyncMock(return_value=True)
+        with patch.object(self.client, "_start_process") as launch:
+            await self.client.start_comfyui()
+        self.assertTrue(timer.cancelled())
+        launch.assert_called_once()
+
 
     async def test_stopped_comfyui_is_launched_and_waited_for(self):
         self.client.is_running = AsyncMock(side_effect=[False, True])
@@ -611,6 +625,46 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.client.kill_comfyui.assert_awaited_once()
         self.assertIsNone(self.client._idle_kill_timer)
+
+
+    async def test_adopted_pid_fallback_kill(self):
+        self.client._comfyui_process = None
+        self.client._adopted_pid = 4321
+        with patch("comfy_client.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
+            self.assertTrue(self.client._kill_process())
+        self.assertEqual(mock_run.call_args.args[0], ["taskkill", "/F", "/T", "/PID", "4321"])
+
+    async def test_kill_comfyui_clears_handles_on_success(self):
+        self.client._adopted_pid = 4321
+        with patch("comfy_client.subprocess.run",
+                   return_value=subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")):
+            await self.client.kill_comfyui()
+        self.assertIsNone(self.client._adopted_pid)
+        self.assertIsNone(self.client._comfyui_process)
+
+    async def test_kill_comfyui_without_any_handle_is_a_noop(self):
+        self.client._comfyui_process = None
+        self.client._adopted_pid = None
+        await self.client.kill_comfyui()  # must not raise
+
+    def test_find_listening_pid_parses_netstat(self):
+        sample = (
+            "Active\r\n\r\n"
+            "  TCP    0.0.0.0:135          0.0.0.0:0              LISTENING       1234\r\n"
+            "  TCP    127.0.0.1:8188       0.0.0.0:0              LISTENING       4321\r\n"
+            "  TCP    127.0.0.1:54321      127.0.0.1:8188         TIME_WAIT       0\r\n"
+        )
+        with patch("comfy_client.subprocess.run",
+                   return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=sample, stderr="")):
+            self.assertEqual(self.client._find_listening_pid(), 4321)
+
+    def test_find_listening_pid_none_when_port_absent(self):
+        with patch("comfy_client.subprocess.run",
+                   return_value=subprocess.CompletedProcess(args=[], returncode=0,
+                                                            stdout="  TCP    0.0.0.0:8189          0.0.0.0:0              LISTENING       9\r\n",
+                                                            stderr="")):
+            self.assertIsNone(self.client._find_listening_pid())
 
 
 if __name__ == "__main__":

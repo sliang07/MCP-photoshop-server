@@ -51,6 +51,7 @@ class ComfyUIClient:
         self.base_url = base_url.rstrip("/")
         self.session = httpx.AsyncClient(timeout=120.0)
         self._comfyui_process: Optional[subprocess.Popen] = None
+        self._adopted_pid: Optional[int] = None  # PID of a running ComfyUI this server did not start
         self._idle_kill_timer: Optional[asyncio.Handle] = None  # Background timer for idle kill
 
     async def close(self):
@@ -207,34 +208,80 @@ class ComfyUIClient:
         pid = self._comfyui_process.pid
         logger.info("ComfyUI launched with PID %d", pid)
 
-    def _kill_process(self) -> bool:
-        """Synchronous helper to terminate the owned ComfyUI process tree.
-        Only the live self._comfyui_process Popen handle authorizes killing.
-        Returns True only if the owned process was actually terminated.
-        """
-        if not self._comfyui_process or self._comfyui_process.poll() is not None:
-            return False
-
-        proc = self._comfyui_process
-        pid = proc.pid
-        logger.info("Killing owned ComfyUI process tree (PID %d)...", pid)
+    def _find_listening_pid(self, port=None):
+        """Find the PID LISTENING on a TCP port via netstat -ano."""
+        if port is None:
+            port = 8188
+            try:
+                port = int(self.base_url.rsplit(":", 1)[1].split("/")[0])
+            except (ValueError, IndexError):
+                pass
         try:
             result = subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=15,
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=10,
             )
-            if result.returncode == 0:
-                proc.wait(timeout=5)
-                logger.info("Owned ComfyUI process tree killed.")
-                return True
-            else:
-                logger.warning("taskkill failed for PID %d (rc=%d): %s", pid, result.returncode, result.stderr.decode(errors='ignore'))
-        except subprocess.TimeoutExpired:
-            logger.warning("taskkill timed out for PID %d", pid)
-        except OSError as e:
-            logger.warning("taskkill raised OSError for PID %d: %s", pid, e)
+            suffix = ":" + str(port)
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if (len(parts) >= 5 and parts[0] == "TCP"
+                        and parts[1].endswith(suffix) and parts[3] == "LISTENING"):
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        continue
+        except Exception as e:
+            logger.debug("netstat lookup for port %d failed: %s", port, e)
+        return None
 
-        # Keep ownership on failure so future attempts can retry
+    def _kill_process(self) -> bool:
+        """Synchronous helper to terminate the managed ComfyUI process tree.
+        A live Popen handle started by this server takes precedence; otherwise
+        an adopted PID (a ComfyUI already running, e.g. from a previous MCP
+        server session) is terminated. Returns True only if a process was
+        actually killed.
+        """
+        proc = self._comfyui_process
+        if proc and proc.poll() is not None:
+            return False
+
+        if proc is not None:
+            pid = proc.pid
+            logger.info("Killing owned ComfyUI process tree (PID %d)...", pid)
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    proc.wait(timeout=5)
+                    logger.info("Owned ComfyUI process tree killed.")
+                    return True
+                logger.warning("taskkill failed for PID %d (rc=%d): %s", pid, result.returncode, result.stderr.decode(errors='ignore'))
+            except subprocess.TimeoutExpired:
+                logger.warning("taskkill timed out for PID %d", pid)
+            except OSError as e:
+                logger.warning("taskkill raised OSError for PID %d: %s", pid, e)
+            # Keep ownership on failure so future attempts can retry
+            return False
+
+        if self._adopted_pid:
+            pid = self._adopted_pid
+            logger.info("Killing adopted ComfyUI process tree (PID %d)...", pid)
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    logger.info("Adopted ComfyUI process tree killed.")
+                    return True
+                logger.warning("taskkill failed for adopted PID %d (rc=%d): %s", pid, result.returncode, result.stderr.decode(errors='ignore'))
+            except subprocess.TimeoutExpired:
+                logger.warning("taskkill timed out for adopted PID %d", pid)
+            except OSError as e:
+                logger.warning("taskkill raised OSError for adopted PID %d: %s", pid, e)
+
+        logger.warning("No managed ComfyUI process to kill (none started by this server, no adopted PID).")
         return False
 
     async def _wait_for_port_free(self, port=8188, timeout=60):
@@ -280,19 +327,33 @@ class ComfyUIClient:
         return False
 
     async def kill_comfyui(self):
-        """Kill the owned ComfyUI process to free VRAM."""
+        """Kill the managed ComfyUI process (owned or adopted) to free VRAM."""
         killed = await asyncio.get_event_loop().run_in_executor(None, self._kill_process)
         if killed:
             self._comfyui_process = None
+            self._adopted_pid = None
+        else:
+            logger.warning("kill_comfyui: nothing was killed; no live owned handle and no adopted PID.")
 
     async def start_comfyui(self):
         """Start ComfyUI if not already running, then wait until it is reachable.
-        Ensures port 8188 is free before starting. Only cleans up its OWN stale process.
-        Raises RuntimeError if a foreign listener remains on the port."""
-        self._cancel_idle_kill()
+        Ensures port 8188 is free before starting. Cleans up owned stale processes
+        and adopts a running ComfyUI started elsewhere (e.g. a previous MCP server
+        session) so the idle kill can manage it. Raises RuntimeError if a foreign
+        non-ComfyUI listener remains on the port."""
         if await self.is_running():
             logger.info("ComfyUI is already running.")
+            # Track an instance this server did not start itself, so the idle
+            # kill can terminate it after inactivity (previously a silent no-op).
+            if self._comfyui_process is None or self._comfyui_process.poll() is not None:
+                self._adopted_pid = await asyncio.get_event_loop().run_in_executor(
+                    None, self._find_listening_pid)
+                if self._adopted_pid:
+                    logger.info("ComfyUI (PID %d) was started outside this server; adopted for idle management.", self._adopted_pid)
             return
+
+        # A fresh launch must not be killed by a stale timer from an earlier instance.
+        self._cancel_idle_kill()
 
         # Ensure port is free before starting
         if not await self._wait_for_port_free(timeout=5):
@@ -374,7 +435,8 @@ class ComfyUIClient:
     async def run_workflow_and_wait(self, workflow: dict, progress_callback=None, timeout: Optional[int] = None) -> dict:
         """
         Submit workflow and wait for completion atomically.
-        Auto-starts ComfyUI if not running, auto-kills after completion (success or failure).
+        Auto-starts ComfyUI if not running. On success an idle kill is scheduled
+        (keeps ComfyUI warm for a follow-up); on error ComfyUI is killed immediately.
         Connects WebSocket FIRST, then submits with the same client_id,
         preventing race conditions where workflow finishes before WebSocket connects.
         Returns the history entry with output file bytes pre-fetched (if auto-kill is enabled).

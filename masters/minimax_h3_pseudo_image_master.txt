@@ -122,10 +122,21 @@ the user wants printed, such as a badge reading "4K" or a label reading "16:9".
 For MCP, pass only the decoded rewritten_prompt string as prompt. Generation uses
 model="minimax_h3"; edits use backend="minimax_h3" with the intended source canvas
 already open. wh_ratio and ratio_follow are authoring metadata, not MCP arguments.
-Map generation ratios to width/height, honoring explicit dimensions. H3 generation
-rounds dimensions up to multiples of 32. Editing returns the source canvas size;
-max_side controls working resolution. A framing change needs a separate explicit
-canvas operation; H3 outpaint is not exposed by this MCP.
+Map generation ratios to width/height, honoring explicit dimensions. MCP H3
+generation uses those dimensions rounded up to multiples of 32. MCP editing fits
+the source within max_side without first enlarging it, then rounds each working
+axis to the nearest multiple of 32, with a minimum of 32. The result is resized
+back to the source canvas dimensions before masked compositing. It does not use
+ImageScaleToTotalPixels or a fixed 0.75MP working area.
+
+The standalone ComfyUI reference presets have a separate sizing path:
+ImageScaleToTotalPixels defaults to 0.75MP, follows the first image's proportions
+approximately after per-axis 32px rounding, and sets the generated output size.
+Those graphs save that generated size; they have no max_side input or automatic
+resize back to the original source. In the installed native H3 node, adapt_canvas's
+768-short-edge / 768x1344-area rule normalizes reference-video frames only.
+Neither still-image path uses that rule. A framing change in MCP needs a separate
+explicit canvas operation; H3 outpaint is not exposed by this MCP.
 
 In ComfyUI, paste only rewritten_prompt's decoded text into the H3 prompt widget.
 The JSON object and this master are instructions for the authoring LLM, not text
@@ -143,6 +154,44 @@ Do not treat another author's frame count, saved index or high-resolution advice
 as a validated upgrade for this installation. They require a separate comparison.
 After generation, inspect the returned image before claiming fidelity or legibility.
 Retry only the observed problem, preserving the user's brief and reference roles.
+
+### Masked-edit acceptance and the supplied local benchmark
+
+The supplied H3-only examples show usable photographic and anime generation and
+largely preserved structure in global edits made with detail=max. A later masked
+redo used max, max_side=1024 and feather=16. These are examples of workable settings,
+not proof that max or feathering caused improvement: seeds, prompts and edit scope
+also changed. Do not infer a controlled max/match comparison or a speed ratio.
+
+Judge the entire edited region and its boundary, not just the requested object.
+Reject unintended white or black panels, hard rectangular seams, cut-off objects,
+background discontinuities and incompatible lighting inside the selection. The
+MCP preserving pixels outside a mask does not prove the generated interior blends
+with them. Its current feathering is inward; fully black mask pixels are restored
+from the source, while feathered pixels inside the selection can blend. Global
+unmasked edits have no such pixel lock. Request continuous scene surfaces and
+consistent lighting through the edited area; wording cannot guarantee a clean result.
+
+Assess two separate requirements: the requested semantic change must be visibly
+achieved, and it must integrate cleanly. A near-copy of the source can have perfect
+boundaries while failing the request. For an object replacement, verify defining
+features such as armrests, material and color, not just any small surface change.
+Use precise source-relative target wording when several similar objects exist.
+
+The initial round showed panels and seams. In the September 22 redo, the anime
+maple-leaf lantern is integrated without the earlier panel. The realistic chair
+retry removes the white-out, but the comparison does not clearly establish the
+requested light-oak armchair replacement. Record visual integration separately
+from unconfirmed instruction adherence; do not label this an independently
+verified 4/4 semantic pass. Output dimensions alone also do not prove the internal
+working resolution or that a documentation change improved model behavior.
+
+If a retry is authorized, restore the original source or undo the failed edit,
+keep the intended prompt, mask and references, and try one fresh seed. Inspect
+again; if integration defects or an insufficient edit remain, report them instead of repeatedly
+rerunning or presenting it as finished. A seed change may help but is not a proven
+fix. Respect a request to stop or to run no further tests. Do not infer an overall
+reliability ranking or measured speed from this small, untimed sample.
 
 ## 7. Original examples
 

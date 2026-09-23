@@ -46,8 +46,11 @@ Text generation uses the installed fl2va model; reference edits use ref2va.
 Both non-turbo presets use 20 steps, res_multistep/simple and BasicGuider.
 It samples the minimum 5-frame block and saves only frame 0 as RGB; still use is
 experimental and reference fidelity is model-dependent. cfg and negative_prompt
-are unused; express desired constraints in prompt. Dimensions round up to multiples
-of 32. No audio VAE, audio decode, video save, LoRA or custom speed patches are required.
+are unused; express desired constraints in prompt. Generation dimensions round up
+to 32. MCP edit working dimensions fit max_side then round to the nearest 32; results
+return to source canvas size. The standalone UI's 0.75MP sizing node is a separate
+path that saves its generated size. No audio VAE, audio decode, video save, LoRA or
+custom speed patches are required.
 Use backend=minimax_h3 for edits or model=minimax_h3 for generation/batches.
 For finer reference detail, edit_image accepts h3_reference_detail=max (more memory
 and compute); match is the default. max_side controls working output size separately.
@@ -151,7 +154,20 @@ framing and medium; do not weaken a strong requested change. Assign supplied ref
 roles explicitly using <Picture N>, even for a single image. For ordinary edits use
 wh_ratio empty and ratio_follow='<Picture 1>'; reframing needs an explicit canvas
 operation first. The MCP appends mask-role wording; do not invent an extra mask input.
-Avoid describing unchanged details so fully that the model reconstructs them.""",
+Avoid describing unchanged details so fully that the model reconstructs them.
+Inspect the entire mask interior and boundary: unintended white/black panels,
+rectangular seams, cut-off objects and lighting/background discontinuities mean
+the edit is not clean. Outside-mask preservation alone is not visual success.
+Also verify the requested change actually occurred: a seam-free near-copy is not
+a successful object replacement. Check defining features such as material/color
+and armrests, using precise target wording when objects look similar. Global edits
+can drift; masked MCP edits restore fully black mask pixels, with feathering inward.
+If retrying is authorized, restore the original source and try one fresh seed with
+the same intended edit, then inspect again. A changed artifact is not a successful
+retry; stop and report persistent defects. Respect a request for no further tests.
+The supplied max/feather=16 redo improves the anime local result, but the chair
+retry's semantic change is not clearly verified. This is not a controlled max/match
+or speed comparison. Do not turn examples into a universal reliability ranking.""",
 }
 
 TASK_RULES = {

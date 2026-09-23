@@ -4,6 +4,18 @@
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
 
+## H3 redo review and sizing clarification
+
+- Reviewed the supplied September 22 redo images/report and current code without running generation or tests. Anime local output cleanly replaces the lantern with a glowing maple-leaf lantern. The realistic retry removes the first attempt's white-out, but the crop comparison does not clearly establish a light-oak armchair replacement; do not repeat 4/4 semantic success as independently verified. Global preservation looks good; detail gains are not quantified.
+- The active master's latest sizing edit conflated two paths. Corrected both copies: MCP uses `prepare_image`/`max_side`, nearest-32 working axes, and final resize to source size; standalone reference graphs use 0.75MP `ImageScaleToTotalPixels` and save their generated dimensions. `adapt_canvas` only handles reference-video frames. A 1024x1024 final file alone does not prove internal resolution.
+- Current `make_edit_mask` feathers inward and final compositing restores fully black mask pixels. Global unmasked edits can drift; that differs from outside-selection pixels in a masked MCP edit. Added acceptance checks for both the requested change and integration, including insufficient edits that merely resemble the source. Preserved the original reports as supplied; recorded qualifications in workflow guidance and the master collection changelog.
+
+## H3 initial supplied benchmark visual review
+
+- User requested no further tests and dropped Qwen/Flux benchmarking. Reviewed existing PNGs only; no generation, LLM check or test rerun. The folder currently contains eight PNGs (seven individual renders plus grid), not the reported nine.
+- The summary overstates local-edit success: `edit_anime_local_h3_attempt1_fail.png` has a white panel, `edit_anime_local_h3.png` still has a black panel, and `edit_realistic_local_h3.png` has a visible rectangular seam through the floor/left chair. Do not record the anime retry or realistic local edit as clean. Global max edits largely preserve structure; no controlled max/match comparison or measured speed data supports a universal ranking.
+- Updated H3 master and compact edit guidance to inspect the full region and boundary, reject unintended panels/seams, restore the original before an authorized fresh-seed retry, and report persistent defects. Exact outside-mask compositing is not proof of visual integration. See `workflows/README.md` for the qualified review; prior 206-test results predate these wording-only changes.
+
 ## 2026-09-22 H3 pseudo-image master
 
 - Added `masters/minimax_h3_pseudo_image_master.txt` and installed it in the configured `MASTER_PROMPT_DIR`. `get_prompt_guidance` reads it fresh, with path/SHA-256, for H3 generation and editing. Compact task-specific rules are embedded in generation, batch and edit descriptions; H3 outpaint remains unsupported.

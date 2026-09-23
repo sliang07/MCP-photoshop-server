@@ -1,5 +1,5 @@
 {
-  "id": "a0d23dc6-31dc-4cb1-a720-213691ba6b5b",
+  "id": "280b265f-3c1a-4d68-ac77-b1e73c95c5cc",
   "revision": 0,
   "last_node_id": 13,
   "last_link_id": 14,
@@ -50,11 +50,11 @@
         "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
-        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
         "default"
       ],
       "widgets_values_named": {
-        "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
         "weight_dtype": "default"
       }
     },
@@ -167,7 +167,7 @@
     },
     {
       "id": 4,
-      "type": "MiniMaxH3ReferenceToVideo",
+      "type": "MiniMaxH3ImageToVideo",
       "pos": [
         390,
         0
@@ -184,6 +184,11 @@
           "name": "clip",
           "type": "CLIP",
           "link": 1
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 2
         },
         {
           "name": "prompt",
@@ -218,22 +223,14 @@
           }
         },
         {
-          "name": "ref_image_size",
-          "type": "COMBO",
+          "name": "first_frame",
+          "type": "IMAGE",
           "link": null,
-          "widget": {
-            "name": "ref_image_size"
-          }
-        },
-        {
-          "name": "vae",
-          "type": "VAE",
-          "link": 2,
           "shape": 7
         },
         {
-          "name": "audio_vae",
-          "type": "VAE",
+          "name": "last_frame",
+          "type": "IMAGE",
           "link": null,
           "shape": 7
         }
@@ -255,21 +252,19 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+        "Node name for S&R": "MiniMaxH3ImageToVideo"
       },
       "widgets_values": [
         "A product photograph of one glossy red ceramic mug with a rounded handle on the right, on a light gray tabletop against a plain cream background. Soft window light from the left, gentle shadow, centered composition, no lettering.",
         1024,
         768,
-        5,
-        "match"
+        5
       ],
       "widgets_values_named": {
         "prompt": "A product photograph of one glossy red ceramic mug with a rounded handle on the right, on a light gray tabletop against a plain cream background. Soft window light from the left, gentle shadow, centered composition, no lettering.",
         "width": 1024,
         "height": 768,
-        "length": 5,
-        "ref_image_size": "match"
+        "length": 5
       }
     },
     {
@@ -680,11 +675,11 @@
       "type": "MarkdownNote",
       "pos": [
         0,
-        -320
+        -400
       ],
       "size": [
         740,
-        280
+        360
       ],
       "flags": {},
       "order": 12,
@@ -694,7 +689,7 @@
       "title": "minimax h3 text to image",
       "properties": {},
       "widgets_values": [
-        "MCP image preset: minimax_h3_text_to_image\n\nSelect your own image in each LoadImage node. The supplied mug is a generated example. Change prompt and dimensions before running. Saved images go to the ComfyUI output folder. Seed is fixed for repeatable comparisons.\n\nExperimental H3 still adaptation: installed ref2va model, 20 steps, res_multistep/simple. Generates 5 frames and saves only frame 0. RGB output. BasicGuider has no CFG or negative prompt. Use <Picture 1>, <Picture 2>, etc. in connected order. Width/height: multiples of 32. Audio VAE and custom speed nodes are unnecessary. This is not the missing hybrid/Turbo model from the original reference file. Start with 1024x768; 5 frames are below the trained video duration."
+        "MCP image preset: minimax_h3_text_to_image\n\nSelect your own image in each LoadImage node. The supplied mug is a generated example. Change prompt and dimensions before running. Saved images go to the ComfyUI output folder. Seed is fixed for repeatable comparisons.\n\nH3 still adaptation: 20 steps, res_multistep/simple. Generates 5 frames and saves frame 0 as RGB. BasicGuider has no CFG or negative prompt. No audio VAE or custom speed nodes needed. ImageFromBatch selects the saved frame; set length=5 to save all five for comparison. Five-frame still quality and reference fidelity remain experimental.\n\nFL2VA text generation: leave first_frame/last_frame disconnected. Start at 1024x768; dimensions must be multiples of 32.\n\nPROMPT MASTER: Give your LLM minimax_h3_pseudo_image_master.txt (beside these presets) and your brief. It returns rewritten_prompt, wh_ratio and ratio_follow. Paste only the decoded rewritten_prompt into the H3 prompt field; apply size choices separately. The graph does not run the authoring LLM automatically. Keep still-image prose; no video/audio field wrapper is needed."
       ]
     }
   ],
@@ -712,7 +707,7 @@
       3,
       0,
       4,
-      6,
+      1,
       "VAE"
     ],
     [

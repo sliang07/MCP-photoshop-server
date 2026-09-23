@@ -56,7 +56,8 @@ def model_profiles(info, task):
         ("anima", (MODEL_ANIMA, "anima-base-v1.0.safetensors"),
          (MODEL_ANIMA_TEXT_ENCODER,), MODEL_ANIMA_VAE, 0, 30, 4.0,
          "Anime and illustration text-to-image only; not instruction editing or typography."),
-        ("minimax_h3", ("minimax_h3_ref2va_pruned_int8_convrot.safetensors",),
+        ("minimax_h3", ("minimax_h3_fl2va_pruned_int8_convrot.safetensors" if task == "generation"
+                        else "minimax_h3_ref2va_pruned_int8_convrot.safetensors",),
          ("qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
          "minimax_h3_video_vae_fp16.safetensors", None, 20, 1.0,
          "Experimental H3 still images and reference edits: sample 5 frames and save the first. RGB output."),
@@ -80,7 +81,8 @@ def model_profiles(info, task):
         if name == "minimax_h3":
             profile.update(sampler="res_multistep", scheduler="simple",
                            guidance_type="BasicGuider (cfg unused)", negative_prompt_supported=False,
-                           frames=5, saved_frame=0)
+                           frames=5, saved_frame=0, ref_image_size="match",
+                           conditioning_node="MiniMaxH3ImageToVideo" if task == "generation" else "MiniMaxH3ReferenceToVideo")
         if task != "generation":
             profile["max_additional_references"] = refs
         missing = [key for key in ("model", "clip", "vae") if not profile[key]]
@@ -202,7 +204,7 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
 
 
 def build_h3_image_workflow(profile, prompt, width, height, steps, seed, images=()):
-    """Use ref2va for both text-only and reference stills, keeping one decoded frame."""
+    """Use task-specific H3 conditioning and keep one decoded frame."""
     graph = {}
 
     def node(kind, **inputs):
@@ -213,12 +215,14 @@ def build_h3_image_workflow(profile, prompt, width, height, steps, seed, images=
     model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
     clip = node("CLIPLoader", clip_name=profile["clip"], type="minimax")
     vae = node("VAELoader", vae_name=profile["vae"])
-    references = {f"ref_images.ref_image_{i}": node("LoadImage", image=filename)
-                  for i, filename in enumerate(images)}
-    encoded = node("MiniMaxH3ReferenceToVideo", clip=clip, vae=vae, prompt=prompt,
-                   width=max(32, (width + 31) // 32 * 32),
-                   height=max(32, (height + 31) // 32 * 32),
-                   length=5, ref_image_size="match", **references)
+    inputs = {"clip": clip, "vae": vae, "prompt": prompt,
+              "width": max(32, (width + 31) // 32 * 32),
+              "height": max(32, (height + 31) // 32 * 32), "length": 5}
+    if profile["conditioning_node"] == "MiniMaxH3ReferenceToVideo":
+        inputs["ref_image_size"] = profile["ref_image_size"]
+        inputs.update({f"ref_images.ref_image_{i}": node("LoadImage", image=filename)
+                       for i, filename in enumerate(images)})
+    encoded = node(profile["conditioning_node"], **inputs)
     guider = node("BasicGuider", model=model, conditioning=encoded)
     noise = node("RandomNoise", noise_seed=seed)
     sigmas = node("BasicScheduler", model=model, scheduler=profile["scheduler"], steps=steps, denoise=1.0)
@@ -432,7 +436,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
                          max_side: int = 1024, session_id: str = "default", timeout: int | None = None, cfg: float | None = None,
-                         layer_index: int | None = None, output_mode: Literal["replace", "extract"] = "replace"):
+                         layer_index: int | None = None, output_mode: Literal["replace", "extract"] = "replace",
+                         h3_reference_detail: Literal["match", "max"] = "match"):
         """Instruction-edit the canvas: remove objects, replace backgrounds, restyle, or use identity references.
 
         Automatically starts ComfyUI when needed; no manual startup is required.
@@ -442,6 +447,9 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         minimax_h3 uses the installed ref2va model, 20 steps/res_multistep/simple, saving frame 0 of 5.
         H3 is experimental for stills, outputs RGB, and ignores cfg (BasicGuider); allow 3600 seconds.
         H3 references use <Picture 1> for the canvas, <Picture 2> onward for references, then the mask.
+        h3_reference_detail='match' keeps the existing faster reference sizing. 'max' sends original-resolution
+        H3 references to its native encoder (up to a 2048px short edge), preserving more detail at higher cost.
+        max_side still controls the H3 output's working size independently of reference detail.
         These backends support object removal, background replacement, restyling and references.
         Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
@@ -469,6 +477,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             raise ValueError("backend must be qwen21, flux2 or minimax_h3; qwen and qwen2511 have been retired")
         if max_side < 32:
             raise ValueError("max_side must be at least 32")
+        if h3_reference_detail not in ("match", "max"):
+            raise ValueError("h3_reference_detail must be match or max")
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         if seed is None:
@@ -495,10 +505,14 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         if limit is not None and len(references) > limit:
             raise ValueError(f"{backend} supports at most {limit} additional references")
         multiple = 16 if backend == "flux2" else 32
-        images = [prepare_image(source, max_side, multiple)]
+        working = prepare_image(source, max_side, multiple)
+        width, height = working.size
+        full_h3_references = backend == "minimax_h3" and h3_reference_detail == "max"
+        images = [source.convert("RGBA") if full_h3_references else working]
         for path in references:
             with Image.open(Path(path)) as reference:
-                images.append(prepare_image(ImageOps.exif_transpose(reference), max_side, multiple))
+                reference = ImageOps.exif_transpose(reference)
+                images.append(reference.convert("RGBA") if full_h3_references else prepare_image(reference, max_side, multiple))
         if backend == "qwen21":
             image_name = (lambda i: f"<image{i}>") if references or mask is not None else (lambda i: "the image")
         elif backend == "minimax_h3":
@@ -529,6 +543,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         profile = edit_profiles(info)[backend]
         if not profile["available"]:
             raise ValueError(f"{backend} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
+        if backend == "minimax_h3":
+            profile["ref_image_size"] = h3_reference_detail
         steps = profile["default_steps"] if steps is None else steps
         if steps < 1:
             raise ValueError("steps must be positive")
@@ -536,7 +552,6 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         for image in images:
             name = f"mcp_edit_{secrets.token_hex(12)}.png"
             files.append(await comfy.upload_image(png_bytes(image), name))
-        width, height = images[0].size
         effective_cfg = profile["default_cfg"] if cfg is None else cfg
         if backend == "minimax_h3":
             effective_cfg = 1.0
@@ -575,7 +590,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                   "effective_prompt": instruction, "output_mode": output_mode,
                   "source_layer": layer_index, "has_transparency": has_transparency}
         if backend == "minimax_h3":
-            report.update(frames=5, saved_frame=0, guidance_type=profile["guidance_type"])
+            report.update(frames=5, saved_frame=0, guidance_type=profile["guidance_type"],
+                          reference_detail=h3_reference_detail, reference_sizes=[list(image.size) for image in images])
             if cfg is not None and cfg != 1.0:
                 report["sampling_note"] = "H3 uses BasicGuider; the supplied cfg is unused"
         return [TextContent(type="text", text=json.dumps(report)), preview_content(preview_img)]

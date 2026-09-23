@@ -98,6 +98,37 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "qwen_image_2.1_system_prompt_edit.txt"):
                 prompt_rules.get_prompt_guidance("qwen21", "editing")
 
+    def test_h3_master_is_read_fresh_for_both_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(prompt_rules, "MASTER_PROMPT_DIR", tmp):
+            path = Path(tmp) / "minimax_h3_pseudo_image_master.txt"
+            path.write_text('H3 stills: keep "4K" as literal lettering.', encoding="utf-8-sig")
+            for task in ("generation", "editing"):
+                result = prompt_rules.get_prompt_guidance("minimax_h3", task)
+                self.assertEqual(result["sources"][0]["text"], path.read_text(encoding="utf-8-sig"))
+                self.assertEqual(Path(result["sources"][0]["path"]), path)
+            old_hash = result["sources"][0]["sha256"]
+            path.write_text('Revised H3 master.', encoding="utf-8")
+            self.assertNotEqual(prompt_rules.get_prompt_guidance("minimax_h3", "editing")["sources"][0]["sha256"], old_hash)
+            path.unlink()
+            for task in ("generation", "editing"):
+                with self.assertRaisesRegex(ValueError, "Cannot read master prompt.*minimax_h3_pseudo_image_master"):
+                    prompt_rules.get_prompt_guidance("minimax_h3", task)
+            with self.assertRaisesRegex(ValueError, "H3 supports generation and editing"):
+                prompt_rules.get_prompt_guidance("minimax_h3", "outpaint")
+
+    async def test_h3_master_rules_reach_generation_and_edit_tools(self):
+        definitions = {tool.name: tool for tool in await server.app.list_tools()}
+        for name in ("generate_image", "batch_generate", "edit_image"):
+            description = definitions[name].description
+            self.assertIn("minimax_h3_pseudo_image_master.txt", description)
+            self.assertIn("decoded rewritten_prompt as prompt", description)
+            self.assertIn("do not invent factual data", description)
+        for name in ("generate_image", "batch_generate"):
+            self.assertIn("H3 generation: open with medium", definitions[name].description)
+            self.assertNotIn("H3 editing: lead with", definitions[name].description)
+        self.assertIn("H3 editing: lead with", definitions['edit_image'].description)
+        self.assertNotIn("H3 master (", definitions['outpaint'].description)
+
     async def test_rules_are_in_tool_descriptions_without_initialize(self):
         definitions = {tool.name: tool for tool in await server.app.list_tools()}
         for name in ("generate_image", "edit_image", "outpaint", "batch_generate"):

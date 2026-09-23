@@ -7,7 +7,8 @@ from pathlib import Path
 from config import MASTER_PROMPT_DIR
 
 
-MASTER_FILES = {"flux2": "flux2prompt.txt", "anima": "anima_prompt.txt"}
+MASTER_FILES = {"flux2": "flux2prompt.txt", "anima": "anima_prompt.txt",
+                "minimax_h3": "minimax_h3_pseudo_image_master.txt"}
 QWEN_MASTER_FILES = {
     "generation": "qwen_image_2.1_system_prompt_t2i.txt",
     "editing": "qwen_image_2.1_system_prompt_edit.txt",
@@ -29,18 +30,29 @@ instructions take precedence over creative defaults. Inspect returned images or 
 preview_canvas after generation; do not claim to have inspected an unseen result."""
 
 MODEL_RULES = {
-    "minimax_h3": """MiniMax H3 still-image adaptation: describe one finished image, its
-subjects, composition, lighting, style and exact lettering. For edits, <Picture 1> is
+    "minimax_h3": """H3 master (minimax_h3_pseudo_image_master.txt): describe one completed
+still composition in the requested medium, with explicit subject counts, spatial
+relationships, lighting, materials and exact visible lettering. Preserve intentional
+blur, grain and non-photographic styles; do not append a universal photography suffix.
+For layouts, assign each panel/text block a location, hierarchy and reading order.
+Quote exact labels/values in their original language; do not invent factual data.
+The master's JSON uses rewritten_prompt, wh_ratio and ratio_follow. Pass only the
+decoded rewritten_prompt as prompt. Map sizing intent to actual tool arguments or
+canvas operations; the metadata fields are not MCP arguments. For edits, <Picture 1> is
 the canvas, <Picture 2> onward are reference_paths in order, and an optional mask is
 last. State each reference's role and what should change or remain. Do not invent
 camera motion, dialogue, audio, cuts or a video timeline for a still-image request.
-The installed non-turbo ref2va preset uses 20 steps, res_multistep/simple and BasicGuider.
+Text generation uses the installed fl2va model; reference edits use ref2va.
+Both non-turbo presets use 20 steps, res_multistep/simple and BasicGuider.
 It samples the minimum 5-frame block and saves only frame 0 as RGB; still use is
 experimental and reference fidelity is model-dependent. cfg and negative_prompt
 are unused; express desired constraints in prompt. Dimensions round up to multiples
 of 32. No audio VAE, audio decode, video save, LoRA or custom speed patches are required.
 Use backend=minimax_h3 for edits or model=minimax_h3 for generation/batches.
-H3 outpaint and transparent extraction are not exposed by these tools.""",
+For finer reference detail, edit_image accepts h3_reference_detail=max (more memory
+and compute); match is the default. max_side controls working output size separately.
+H3 outpaint and transparent extraction are not exposed by these tools. The external
+pseudo-image author's frame/index settings are empirical, not preset overrides.""",
     "flux2": """FLUX master (flux2prompt.txt): connected visual prose, usually 30–80 words;
 front-load the main priority, then setting/details, lighting and atmosphere. Expand only
 for meaningful requirements. No keyword dump, redundant quality adjectives or appended
@@ -126,6 +138,22 @@ outpaint keeps its existing internal resolution. Do not put ratios or size metad
 in the descriptive prompt, or pass wh_ratio/ratio_follow as unsupported tool fields.""",
 }
 
+H3_TASK_RULES = {
+    "generation": """H3 generation: open with medium, subject and composition; develop the
+visible scene in connected prose. Choose wh_ratio from the brief and set ratio_follow
+empty. Do not invent reference tags when no images are supplied. Describe a captured
+instant, including requested action or motion blur, rather than a temporal reveal.
+Requested grids are spatial panels, not video shots. Do not add video field wrappers,
+shot markers, audio, music or timestamps. Length follows the brief, not Qwen's word target.""",
+    "editing": """H3 editing: lead with the requested operation and target, then the intended
+result and one preservation clause. Keep untargeted identity, object design/count,
+framing and medium; do not weaken a strong requested change. Assign supplied reference
+roles explicitly using <Picture N>, even for a single image. For ordinary edits use
+wh_ratio empty and ratio_follow='<Picture 1>'; reframing needs an explicit canvas
+operation first. The MCP appends mask-role wording; do not invent an extra mask input.
+Avoid describing unchanged details so fully that the model reconstructs them.""",
+}
+
 TASK_RULES = {
     "generation": "Create one still-image description; map Anima positive_prompt to prompt and negative_prompt to its separate tool argument. Do not send code-block labels or the master instructions to the image model.",
     "editing": "Describe the smallest requested change and what must stay unchanged. Keep the source as the base; assign reference roles explicitly. Use region/mask_path for local edits. Undo an unsuccessful edit before retrying. The master file's standalone response format is not the MCP argument format.",
@@ -148,6 +176,8 @@ def model_prompt_rules(model, task):
     rules = MODEL_RULES[model]
     if model == "qwen21":
         rules += "\n" + QWEN_TASK_RULES["generation" if task == "generation" else "editing"]
+    elif model == "minimax_h3":
+        rules += "\n" + H3_TASK_RULES[task]
     return rules
 
 
@@ -156,12 +186,8 @@ def get_prompt_guidance(model, task):
         raise ValueError("Choose model flux2/qwen21/anima/minimax_h3 and task generation/editing/outpaint")
     if model == "anima" and task != "generation":
         raise ValueError("Anima supports generation only; use qwen21 or flux2 for this task")
-    if model == "minimax_h3":
-        if task == "outpaint":
-            raise ValueError("H3 supports generation and editing; use qwen21 or flux2 for outpaint")
-        return {"model": model, "task": task,
-                "rules": [COMMON_RULES, TASK_RULES[task], model_prompt_rules(model, task)],
-                "sources": [], "scope": "Built-in still-image adaptation of the supplied H3 workflow and installed ComfyUI nodes; no video master is applied."}
+    if model == "minimax_h3" and task == "outpaint":
+        raise ValueError("H3 supports generation and editing; use qwen21 or flux2 for outpaint")
     filename = QWEN_MASTER_FILES[task] if model == "qwen21" else MASTER_FILES[model]
     path = Path(MASTER_PROMPT_DIR) / filename
     try:

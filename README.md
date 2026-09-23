@@ -43,11 +43,13 @@ Projects are versioned JSON plus lossless PNGs in a ZIP archive, not PSD files. 
 | `flux2` (FLUX.2 Dev NVFP4, 32B) | Yes | Yes | Yes | 50 / embedded guidance 4 | Euler | Native `Flux2Scheduler` |
 | `qwen21` (Qwen Image 2.1; custom preset) | Yes; detail, typography, alpha | Yes | Yes | 30 / 3 | Euler | Simple |
 | `anima` (installed Aesthetic v1.1) | Yes; anime/illustration | No | No | 30 / 4 | `er_sde` | Simple |
-| `minimax_h3` (installed ref2va INT8) | Yes; experimental stills | Yes; RGB | No | 20 / BasicGuider | `res_multistep` | Simple |
+| `minimax_h3` (FL2VA generation / REF2VA editing, INT8) | Yes; experimental stills | Yes; RGB | No | 20 / BasicGuider | `res_multistep` | Simple |
 
 H3 is available through `generate_image`, `batch_generate`, `submit_generation_job` and `edit_image(backend="minimax_h3")`. It generates the minimum five-frame block and saves frame 0. Editing uses `<Picture 1>` for the canvas, subsequent pictures for references, and the final picture for an optional edit mask; the MCP restores outside-mask pixels afterward. `cfg` and `negative_prompt` are unused and reported when supplied with non-default values. Dimensions round up to multiples of 32 for generation; edits return the original canvas size. H3 allows 3600 seconds per image and does not provide transparent extraction or outpaint.
 
-This adapts `minimax_h3_ref2img_single.json` to installed weights: `minimax_h3_ref2va_pruned_int8_convrot.safetensors`, `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, and `minimax_h3_video_vae_fp16.safetensors`. The supplied file's hybrid model, Turbo LoRA and custom speed patches are not required or substituted silently. The installed H3 node makes the audio VAE optional for image references. Five frames are below its documented trained video duration, so still quality is experimental. A live 640x384, 20-step check generated a red mug and edited it blue successfully.
+This adapts `minimax_h3_ref2img_single.json` to installed weights: `minimax_h3_fl2va_pruned_int8_convrot.safetensors` for text generation and `minimax_h3_ref2va_pruned_int8_convrot.safetensors` for reference edits, with `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` and `minimax_h3_video_vae_fp16.safetensors`. Task-specific model/node availability is checked independently. The supplied file's hybrid model, Turbo LoRA and custom speed patches are not required or substituted silently. Five-frame still quality remains experimental. The previous REF2VA generation/recolor GPU check succeeded at 640x384 and 20 steps; the new FL2VA route has not yet been quality-benchmarked locally.
+
+For H3 edits, `h3_reference_detail="max"` retains original reference detail up to the native encoder's 2048px short-edge limit, at higher memory and sampling cost. The default `"match"` preserves the previous sizing behavior. `max_side` independently controls working output resolution; results return to the original canvas dimensions and retain exact outside-mask protection. Standalone H3 reference workflows follow the first image's proportions, with a configurable output area.
 
 [Nine ready-to-open workflows](workflows/README.md) include H3 text-to-image, one-reference edits, two-reference composition, Flux/Qwen generation and edits, Anima generation, and general 4x upscaling. Each has UI and API JSON versions. UI copies are installed under ComfyUI's **MCP Image Presets** folder. Save in-memory MCP work and reconnect the server to load the new H3 tool options.
 
@@ -79,6 +81,7 @@ The image tools apply the relevant rules from the master files in `MASTER_PROMPT
 | Anima generation and batch jobs | `anima_prompt.txt`: hybrid tags/prose, explicit character-to-attribute binding, separate compatible negatives, no score tags for Aesthetic |
 | Qwen generation and batch jobs | `qwen_image_2.1_system_prompt_t2i.txt`: detailed English observer prose (roughly 400–500 words), spatial layout, lighting, exact lettering in its original script |
 | Qwen edits and outpaint | `qwen_image_2.1_system_prompt_edit.txt`: clear requested changes with untargeted content preserved, separate prose/lettering language rules, correct reference roles |
+| H3 generation, batches and edits | `minimax_h3_pseudo_image_master.txt`: one completed still composition, medium-aware prose, spatial layouts, exact lettering/data and explicit `<Picture N>` reference roles |
 | `add_text` | Preserve exact supplied lettering; do not paraphrase or add image-prompt tags |
 
 `get_prompt_guidance(model="anima", task="generation")` reads the applicable full master on demand, with its source path and SHA-256. It works through both MCP transports without accessing ComfyUI or the GPU. Essential rules are also included directly in `generate_image`, `edit_image`, `outpaint` and `batch_generate` descriptions, because some clients ignore initialize instructions. Reading the full guide is optional, not an extra prerequisite for every image.
@@ -87,9 +90,11 @@ For Qwen, use `get_prompt_guidance(model="qwen21", task="generation")` for the t
 
 Qwen generation descriptions are English; edit descriptions are Chinese for Chinese instructions and English otherwise. Exact rendered text keeps the requested spelling/language. For edits without a specified text language, use the input's dominant text language, then the user's instruction language if the input has no text. Single-image edits/outpaint use natural image references; edits with references or an appended mask use numbered `<imageN>` tags.
 
+H3 uses the full master through `get_prompt_guidance(model="minimax_h3", task="generation")` or `task="editing"`. A copy ships in [masters/minimax_h3_pseudo_image_master.txt](masters/minimax_h3_pseudo_image_master.txt); when `MASTER_PROMPT_DIR` points elsewhere, install that file there too. Its standalone output has three fields: `rewritten_prompt`, `wh_ratio`, and `ratio_follow`. Pass only the decoded prompt string into MCP or ComfyUI. Generation ratios map to width/height; ordinary edits follow `<Picture 1>`, and requested reframing needs a canvas operation. These metadata fields are not new tool arguments. The master is an original still-image adaptation informed by the [community pseudo-image workflow](https://huggingface.co/reverentelusarca/minimax-h3-comfyui-workflows/blob/main/MiniMax-H3-Pseudo-Image-Generation-Workflow.json), its author's layout examples and official H3 guides; it does not impose the video/audio output format or change sampling presets.
+
 The server removes a single surrounding prompt code fence. For Anima Aesthetic/unknown checkpoints, it removes standalone comma-separated `score_*` tags from both positive and negative prompts, while preserving quoted text verbatim; known Anima base checkpoints retain scores. Generation/batch results disclose any normalization. It does not truncate prompts to editorial word targets or automatically append negative tags that could conflict with the request.
 
-Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the masters reviewed September 21, including the two newly supplied Qwen guides; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. H3 stills use built-in image guidance; H3 video, audio/music, historical review and backup files do not override active MCP sampling presets. Original master files are unchanged.
+Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the September 21 masters and September 22 H3 still master; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. H3 video, audio/music, historical review and backup files do not override active MCP sampling presets. Existing Flux, Anima, Qwen and video masters are unchanged.
 
 ### Instruction Editing
 - `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3), FLUX.2 Dev (`flux2`, 50 steps/embedded guidance 4), or experimental MiniMax H3 (`minimax_h3`, 20 steps/BasicGuider). Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. Flux/Qwen default to a 1800-second timeout; H3 uses 3600 seconds.
@@ -187,6 +192,12 @@ For reusable AI masks: create a selection, call `export_mask(path="selection.png
   - `sam3.pt` (checkpoints) — SAM 3 point/box prompts via `ImageOnlyCheckpointLoader`
   - `sam3.1_multiplex_fp16.safetensors` (checkpoints) — SAM 3.1 text prompts via `CheckpointLoaderSimple` + `CLIPTextEncode`
 
+  **MiniMax H3 (experimental stills, `minimax_h3`):**
+  - `minimax_h3_fl2va_pruned_int8_convrot.safetensors` (diffusion_models) — text generation
+  - `minimax_h3_ref2va_pruned_int8_convrot.safetensors` (diffusion_models) — reference editing
+  - `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` or `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (text_encoders)
+  - `minimax_h3_video_vae_fp16.safetensors` (vae)
+
 ### Install Dependencies
 ```bash
 cd mcp-photoshop-server
@@ -254,7 +265,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served at `/mcp`) |
 | `MCP_HTTP_HOST` | `127.0.0.1` | Bind address for the streamable-HTTP server; `0.0.0.0` (set by `run_openwebui.bat`) also admits tailnet peers via the allowlist |
 | `MCP_HTTP_ALLOWED_HOSTS` | *(empty)* | Optional comma-separated `host:port` patterns (e.g. a tailnet IP and MagicDNS name) admitted as Host + `http://` Origin; machine-specific, belongs in `.env` |
-| `MASTER_PROMPT_DIR` | `masters/` (repository-local, next to `server.py`) | Directory containing the current Flux, Anima and Qwen master files; read by `get_prompt_guidance` |
+| `MASTER_PROMPT_DIR` | `masters/` (repository-local, next to `server.py`) | Directory containing the current Flux, Anima, Qwen and H3 master files; read by `get_prompt_guidance` |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
@@ -273,7 +284,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 ```
 mcp-photoshop-server/
 ├── server.py           # MCP server; 50 tools including editing registrations (canvas tools accept session_id)
-├── editing.py          # Instruction editing backends (qwen21 / flux2) + semantic selection + live capabilities
+├── editing.py          # Instruction editing backends (qwen21 / flux2 / minimax_h3) + semantic selection + live capabilities
 ├── prompt_rules.py     # Tool-level master guidance, source reader and conservative prompt normalization
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
@@ -282,10 +293,10 @@ mcp-photoshop-server/
 ├── project.py          # Atomic layered-project save/load (versioned ZIP, JSON and PNG)
 ├── jobs.py             # Process-owned background generation, progress and graceful cancellation
 ├── requirements.txt    # Python dependencies
-├── masters/            # Master prompt files (Flux/Anima/Qwen) read by get_prompt_guidance
+├── masters/            # Master prompt files (Flux/Anima/Qwen/H3) read by get_prompt_guidance
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (202 tests)
+├── tests/              # Regression suite (206 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md

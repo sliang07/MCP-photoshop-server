@@ -25,6 +25,27 @@
       "image": "mcp_h3_example.png"
     }
   },
+  "source_size": {
+    "class_type": "ImageScaleToTotalPixels",
+    "inputs": {
+      "image": [
+        "4",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "megapixels": 0.75,
+      "resolution_steps": 32
+    }
+  },
+  "source_dimensions": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "source_size",
+        0
+      ]
+    }
+  },
   "5": {
     "class_type": "MiniMaxH3ReferenceToVideo",
     "inputs": {
@@ -37,8 +58,14 @@
         0
       ],
       "prompt": "Edit <Picture 1>. Change the mug to cobalt blue; preserve its shape, handle, tabletop, background, lighting and composition.",
-      "width": 1024,
-      "height": 768,
+      "width": [
+        "source_dimensions",
+        0
+      ],
+      "height": [
+        "source_dimensions",
+        1
+      ],
       "length": 5,
       "ref_image_size": "match",
       "ref_images.ref_image_0": [

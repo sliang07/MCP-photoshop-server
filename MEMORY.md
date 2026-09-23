@@ -4,6 +4,13 @@
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
 
+## 2026-09-22 H3 pseudo-image master
+
+- Added `masters/minimax_h3_pseudo_image_master.txt` and installed it in the configured `MASTER_PROMPT_DIR`. `get_prompt_guidance` reads it fresh, with path/SHA-256, for H3 generation and editing. Compact task-specific rules are embedded in generation, batch and edit descriptions; H3 outpaint remains unsupported.
+- The original local master draws on the linked pseudo-image graph, its author's infographic examples and official H3 documentation. It returns `rewritten_prompt`, `wh_ratio`, `ratio_follow`; only the decoded prompt goes to MCP/ComfyUI. Ratios map to tool dimensions or an explicit canvas operation, not new tool arguments. It covers medium-aware still composition, exact text/data and `<Picture N>` roles, without importing the video/audio format or changing sampling presets.
+- The three H3 UI presets include usage notes; the master is copied beside them and included in the nine-preset ZIP. Existing masters are unchanged. Local Qwen passed four authoring-format examples; 206 tests and fresh MCP stdio source/hash checks passed. This validates integration and sampled prompt behavior, not GPU image quality. Reconnect persistent MCP clients after saving canvases to load the new descriptions.
+- The H3 pseudo-image master is the only tracked master file: it is original repo content, and `tests/test_h3_stills.py` reads it from the repo `masters/` folder (the README links it the same way). Upstream-supplied Flux, Anima and Qwen masters remain local and untracked; when `MASTER_PROMPT_DIR` points elsewhere, install the H3 master there too.
+
 ## 2026-09-22 Idle cleanup follow-up
 
 - Reproduced two gaps after the adopted-PID change: attaching to an already-running backend did not arm an idle timer, and a dead owned Popen handle prevented fallback to an adopted process.
@@ -223,7 +230,7 @@
 | Tool | Signature | Description |
 |------|-----------|-------------|
 | `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="flux2", timeout=None)` | Extend canvas via Flux2 or Qwen 2.1 reference conditioning; preserve original pixels and layer/mask alignment |
-| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace")` | Qwen Image 2.1 (custom 30/3), FLUX.2 Dev (50/4) or MiniMax H3 ref2va (20/BasicGuider, experimental); 1800 s timeout (3600 s for H3); references, masks, composite/selected-layer replacement or Qwen extraction to a new layer |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace", h3_reference_detail="match")` | Qwen Image 2.1 (custom 30/3), FLUX.2 Dev (50/4) or MiniMax H3 ref2va (20/BasicGuider, experimental); 1800 s timeout (3600 s for H3); references, masks, composite/selected-layer replacement or Qwen extraction to a new layer; H3 detail `max` keeps full-resolution references independently of output `max_side` |
 | `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability per task: generation, editing, outpaint; notes carry the GPU batching rule |
 | `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
@@ -460,7 +467,7 @@ python server.py
 ## 9. Testing Status
 
 ### Verified Working (50 tools)
-- Prompt Guidance: `get_prompt_guidance` (full Flux/Anima masters and task-specific Qwen generation/edit masters; real MCP stdio verified 2026-09-21) ✅
+- Prompt Guidance: `get_prompt_guidance` (full Flux/Anima masters, task-specific Qwen generation/edit masters and the H3 still master; real MCP stdio verified 2026-09-21, H3 master re-verified 2026-09-22) ✅
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Local Projects: `save_project`, `open_project` (atomic `.mcpproj` ZIP/JSON/PNG, fresh undo history; unit + live MCP verified 2026-09-22) ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅

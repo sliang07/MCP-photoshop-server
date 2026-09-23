@@ -54,7 +54,7 @@ Model selection: generate_image, batch_generate and submit_generation_job accept
 
 Background generation: submit_generation_job returns an ID, retains the full input list, and exports each completed image before starting the next. Poll get_job_status or list_jobs on the same server. cancel_job finishes the current image and skips remaining images without interrupting other jobs. Jobs survive an HTTP client disconnect only while the MCP server process runs; closing a stdio server or restarting loses workers/status, but exported files remain. batch_generate still waits for the whole batch before exporting.
 
-Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3 uses its built-in still-image guidance; video and audio masters do not override still-image requests. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
+Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3 reads its still master (minimax_h3_pseudo_image_master.txt) through get_prompt_guidance; video and audio masters do not override still-image requests. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
@@ -311,7 +311,7 @@ async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima", "m
 
     No ComfyUI startup or GPU use. Returns the current full master with path and hash.
     Qwen generation selects the t2i master; editing/outpaint select the edit master.
-    minimax_h3 returns built-in still-image rules without reading a video master.
+    minimax_h3 reads the local H3 still master (minimax_h3_pseudo_image_master.txt), not a video master.
     Standalone code-block/JSON output instructions become raw MCP prompt arguments;
     size metadata maps to supported tool arguments, not text sent to the image model.
     Read when needed; the essential rules are already included in the image tools.

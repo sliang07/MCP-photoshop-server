@@ -382,4 +382,7 @@ mcp-photoshop-server/
 - [x] Multi-session support — all canvas tools accept `session_id`; `list_sessions`/`close_session` manage multiple open documents (2026-09-18)
 - [x] Batch processing — `batch_generate` queues a whole job list on one WebSocket connection, awaits completion, and exports all results (live-verified 2026-09-18)
 - [x] Legacy ControlNet/Redux workflow repair — Flux2 pixel-dim latents, `ControlNetApply.conditioning`, `CLIPVisionLoader` + `crop`/`strength_type`, plus live capability pre-checks in `get_editing_capabilities` (2026-09-18)
+- [ ] Music and sound generation additions
+- [ ] Potentially add MiniMax H3 video generations for systems with high Vram resource
 - [ ] Additional ComfyUI custom nodes integration (beyond ControlNet/Redux/SAM3 — e.g. new node packs)
+ 

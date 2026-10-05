@@ -75,7 +75,7 @@ Migration backup and live evidence: `verification/flux2_dev/`. All four saved wo
 
 ### Master prompt integration
 
-The image tools apply the relevant rules from the master files in `MASTER_PROMPT_DIR` (default: the repository-local `masters/` folder; set the variable in `.env` to point elsewhere):
+The image tools apply the relevant rules from the master files in `MASTER_PROMPT_DIR` (set it in `.env` or the environment; when unset, or when it does not point to an existing directory, the repository-local `masters/` folder is the fallback, holding blank example templates of the five expected filenames):
 
 | Tool/model | Source and application |
 |---|---|
@@ -92,7 +92,7 @@ For Qwen, use `get_prompt_guidance(model="qwen21", task="generation")` for the t
 
 Qwen generation descriptions are English; edit descriptions are Chinese for Chinese instructions and English otherwise. Exact rendered text keeps the requested spelling/language. For edits without a specified text language, use the input's dominant text language, then the user's instruction language if the input has no text. Single-image edits/outpaint use natural image references; edits with references or an appended mask use numbered `<imageN>` tags.
 
-H3 uses the full master through `get_prompt_guidance(model="minimax_h3", task="generation")` or `task="editing"`. A copy ships in [masters/minimax_h3_pseudo_image_master.txt](masters/minimax_h3_pseudo_image_master.txt); when `MASTER_PROMPT_DIR` points elsewhere, install that file there too. Its standalone output has three fields: `rewritten_prompt`, `wh_ratio`, and `ratio_follow`. Pass only the decoded prompt string into MCP or ComfyUI. Generation ratios map to width/height; ordinary edits follow `<Picture 1>`, and requested reframing needs a canvas operation. These metadata fields are not new tool arguments. The master is an original still-image adaptation informed by the [community pseudo-image workflow](https://huggingface.co/reverentelusarca/minimax-h3-comfyui-workflows/blob/main/MiniMax-H3-Pseudo-Image-Generation-Workflow.json), its author's layout examples and official H3 guides; it does not impose the video/audio output format or change sampling presets.
+H3 uses the full master through `get_prompt_guidance(model="minimax_h3", task="generation")` or `task="editing"`. The H3 master lives in the configured `MASTER_PROMPT_DIR`; the repository's `masters/` folder holds a blank example template of that filename, not the master itself. Its standalone output has three fields: `rewritten_prompt`, `wh_ratio`, and `ratio_follow`. Pass only the decoded prompt string into MCP or ComfyUI. Generation ratios map to width/height; ordinary edits follow `<Picture 1>`, and requested reframing needs a canvas operation. These metadata fields are not new tool arguments. The master is an original still-image adaptation informed by the [community pseudo-image workflow](https://huggingface.co/reverentelusarca/minimax-h3-comfyui-workflows/blob/main/MiniMax-H3-Pseudo-Image-Generation-Workflow.json), its author's layout examples and official H3 guides; it does not impose the video/audio output format or change sampling presets.
 
 The server removes a single surrounding prompt code fence. For Anima Aesthetic/unknown checkpoints, it removes standalone comma-separated `score_*` tags from both positive and negative prompts, while preserving quoted text verbatim; known Anima base checkpoints retain scores. Generation/batch results disclose any normalization. It does not truncate prompts to editorial word targets or automatically append negative tags that could conflict with the request.
 
@@ -267,7 +267,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served at `/mcp`) |
 | `MCP_HTTP_HOST` | `127.0.0.1` | Bind address for the streamable-HTTP server; `0.0.0.0` (set by `run_openwebui.bat`) also admits tailnet peers via the allowlist |
 | `MCP_HTTP_ALLOWED_HOSTS` | *(empty)* | Optional comma-separated `host:port` patterns (e.g. a tailnet IP and MagicDNS name) admitted as Host + `http://` Origin; machine-specific, belongs in `.env` |
-| `MASTER_PROMPT_DIR` | `masters/` (repository-local, next to `server.py`) | Directory containing the current Flux, Anima, Qwen and H3 master files; read by `get_prompt_guidance` |
+| `MASTER_PROMPT_DIR` | `masters/` fallback (repository-local, next to `server.py`; blank example templates) | Directory containing the current Flux, Anima, Qwen and H3 master files; used when it points to an existing directory, read by `get_prompt_guidance` |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
@@ -295,7 +295,7 @@ mcp-photoshop-server/
 ├── project.py          # Atomic layered-project save/load (versioned ZIP, JSON and PNG)
 ├── jobs.py             # Process-owned background generation, progress and graceful cancellation
 ├── requirements.txt    # Python dependencies
-├── masters/            # Master prompt files (Flux/Anima/Qwen/H3) read by get_prompt_guidance
+├── masters/            # Fallback master folder: blank example templates of the five expected files (the active directory comes from MASTER_PROMPT_DIR in .env)
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
 ├── tests/              # Regression suite (206 tests)

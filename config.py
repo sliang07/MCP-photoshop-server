@@ -67,11 +67,19 @@ MODEL_UPSCALE_GENERAL = "RealESRGAN_x4plus.pth"
 SERVER_NAME = "mcp-photoshop-server"
 # Master prompt files (flux2prompt.txt, anima_prompt.txt, the two Qwen 2.1 masters,
 # minimax_h3_pseudo_image_master.txt) read by get_prompt_guidance.
-# Defaults to the repository-local masters/ folder;
-# point MASTER_PROMPT_DIR elsewhere (e.g. in .env) for a personal collection.
-# Missing files raise a clear ValueError from get_prompt_guidance.
-MASTER_PROMPT_DIR = os.getenv("MASTER_PROMPT_DIR", os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "masters"))
+# MASTER_PROMPT_DIR (set in .env or the environment) is used when it points to an
+# existing directory; otherwise the repository-local masters/ folder is the fallback.
+# It holds blank example templates of the five expected filenames, so a fresh clone
+# shows which files to fill in. Missing files raise a clear ValueError from
+# get_prompt_guidance.
+def resolve_master_prompt_dir():
+    env_dir = os.getenv("MASTER_PROMPT_DIR", "").strip()
+    if env_dir and os.path.isdir(env_dir):
+        return env_dir
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters")
+
+
+MASTER_PROMPT_DIR = resolve_master_prompt_dir()
 
 # VRAM pressure management: kill ComfyUI entirely if free VRAM drops below this
 # threshold, otherwise just call free_memory(). Default 8192 MB (8 GB) for a

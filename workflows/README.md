@@ -28,7 +28,7 @@ For Flux, shared width/height nodes keep the latent and scheduler in sync. Seeds
 
 The standalone JSONs contain model graphs. MCP canvas layers, undo, masked compositing and exact outside-mask preservation are implemented by the MCP tools, not by these standalone reference-edit graphs.
 
-For H3 prompt authoring, give your LLM `minimax_h3_pseudo_image_master.txt` (in the ZIP, beside the installed UI presets, and in the repository's `masters/` folder) and your image brief. It returns `rewritten_prompt`, `wh_ratio` and `ratio_follow` in JSON, matching the existing authoring convention. Paste only the decoded `rewritten_prompt` into the H3 prompt widget; apply the requested sizing separately. The visual graph does not execute an LLM master automatically. The master covers generation, references, local edits and text-heavy layouts without adding video timelines or audio fields.
+For H3 prompt authoring, give your LLM `minimax_h3_pseudo_image_master.txt` (in the ZIP, beside the installed UI presets, and in the configured `MASTER_PROMPT_DIR`; the repository's `masters/` folder holds blank example templates) and your image brief. It returns `rewritten_prompt`, `wh_ratio` and `ratio_follow` in JSON, matching the existing authoring convention. Paste only the decoded `rewritten_prompt` into the H3 prompt widget; apply the requested sizing separately. The visual graph does not execute an LLM master automatically. The master covers generation, references, local edits and text-heavy layouts without adding video timelines or audio fields.
 
 After reconnecting the MCP, use:
 

@@ -182,8 +182,10 @@ class H3StillTests(unittest.IsolatedAsyncioTestCase):
         detail = definitions['edit_image'].inputSchema['properties']['h3_reference_detail']
         self.assertEqual(detail['enum'], ['match', 'max'])
         self.assertEqual(detail['default'], 'match')
-        with patch('prompt_rules.MASTER_PROMPT_DIR', Path(__file__).resolve().parents[1] / 'masters'):
-            guide = get_prompt_guidance('minimax_h3', 'editing')
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'minimax_h3_pseudo_image_master.txt').write_text('H3 stills: keep exact lettering.', encoding='utf-8')
+            with patch('prompt_rules.MASTER_PROMPT_DIR', Path(tmp)):
+                guide = get_prompt_guidance('minimax_h3', 'editing')
         self.assertEqual(len(guide['sources']), 1)
         self.assertEqual(Path(guide['sources'][0]['path']).name, 'minimax_h3_pseudo_image_master.txt')
         with self.assertRaisesRegex(ValueError, 'outpaint'):

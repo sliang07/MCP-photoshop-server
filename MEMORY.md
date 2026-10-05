@@ -1,8 +1,15 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-09-22
+> Last updated: 2026-10-05
 > Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-10-05 Master prompt dir: env-first resolution, blank example templates
+
+- `config.py` now resolves the master directory via `resolve_master_prompt_dir()`: the `MASTER_PROMPT_DIR` value from `.env`/the environment is used when it points to an existing directory; otherwise the repository-local `masters/` folder is the fallback. The configured personal collection directory is untouched and remains the live source.
+- The tracked H3 master copy in `masters/` (redundant with the collection copy) is gone: `masters/` now holds five blank example templates (flux2prompt.txt, anima_prompt.txt, qwen_image_2.1_system_prompt_t2i.txt, qwen_image_2.1_system_prompt_edit.txt, minimax_h3_pseudo_image_master.txt) so a fresh clone shows the expected filenames; `.gitkeep` was removed.
+- `tests/test_h3_stills.py` no longer reads the repo `masters/` folder; its H3 guidance assertion uses a temp-file fixture, matching the existing `tests/test_prompt_rules.py` convention. New unit tests cover env-dir-wins / missing-dir-fallback / blank-or-unset-fallback for `resolve_master_prompt_dir`.
+- Local (gitignored) verification scripts `check_protocol.py`, `check_qwen.py` and `install_presets.py` read the H3 master from the config-resolved directory instead of the repo `masters/` folder. No machine-specific paths were added to any tracked file.
 
 ## H3 redo review and sizing clarification
 

@@ -1,0 +1,3 @@
+Example slot - this file holds no real master content.
+Paste your Qwen 2.1 generation (t2i) master prompt here, or set MASTER_PROMPT_DIR in .env to point at your own master collection.
+See README.md, section "Master prompt integration".

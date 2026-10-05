@@ -1,0 +1,3 @@
+Example slot - this file holds no real master content.
+Paste your Anima master prompt here (applies to Anima generation and batch jobs), or set MASTER_PROMPT_DIR in .env to point at your own master collection.
+See README.md, section "Master prompt integration".

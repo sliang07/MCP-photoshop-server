@@ -1,0 +1,3 @@
+Example slot - this file holds no real master content.
+Paste your Flux master prompt here (applies to generate_image, edit_image, outpaint and batch_generate with model=flux2), or set MASTER_PROMPT_DIR in .env to point at your own master collection.
+See README.md, section "Master prompt integration".

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
+import config
 import prompt_rules
 import server
 from editing import png_bytes, register_editing_tools
@@ -115,6 +117,19 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
                     prompt_rules.get_prompt_guidance("minimax_h3", task)
             with self.assertRaisesRegex(ValueError, "H3 supports generation and editing"):
                 prompt_rules.get_prompt_guidance("minimax_h3", "outpaint")
+
+    def test_master_dir_prefers_existing_env_dir_and_falls_back_to_masters(self):
+        expected_fallback = os.path.join(os.path.dirname(os.path.abspath(config.__file__)), "masters")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"MASTER_PROMPT_DIR": tmp}):
+                self.assertEqual(config.resolve_master_prompt_dir(), tmp)
+            with patch.dict(os.environ, {"MASTER_PROMPT_DIR": str(Path(tmp) / "missing")}):
+                self.assertEqual(config.resolve_master_prompt_dir(), expected_fallback)
+            with patch.dict(os.environ, {"MASTER_PROMPT_DIR": "   "}):
+                self.assertEqual(config.resolve_master_prompt_dir(), expected_fallback)
+        env = {key: value for key, value in os.environ.items() if key != "MASTER_PROMPT_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(config.resolve_master_prompt_dir(), expected_fallback)
 
     async def test_h3_master_rules_reach_generation_and_edit_tools(self):
         definitions = {tool.name: tool for tool in await server.app.list_tools()}

@@ -11,7 +11,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from mcp.types import ImageContent, TextContent
 
 from config import (MODEL_ANIMA, MODEL_ANIMA_TEXT_ENCODER, MODEL_ANIMA_VAE,
-                    MODEL_FLUX2, MODEL_FLUX2_TEXT_ENCODER, MODEL_FLUX2_VAE)
+                    MODEL_KREA2, MODEL_KREA2_TEXT_ENCODER, MODEL_KREA2_VAE)
 from prompt_rules import unwrap_prompt, with_prompt_rules
 
 
@@ -46,9 +46,12 @@ def model_profiles(info, task):
     vaes = model_options(info, "VAELoader", "vae_name")
     profiles = {}
     for name, model_names, clip_names, vae_name, refs, steps, cfg, use_for in (
-        ("flux2", (MODEL_FLUX2, "flux2-dev.safetensors"),
-         (MODEL_FLUX2_TEXT_ENCODER, "mistral_3_small_flux2_bf16.safetensors"), MODEL_FLUX2_VAE, None, 50, 4.0,
-         "Generation, instruction edits and reference-guided edits (FLUX.2 Dev NVFP4, 32B guidance-distilled)."),
+        ("krea2", (MODEL_KREA2, "krea2_turbo_nvfp4.safetensors", "krea2_turbo_int8_convrot.safetensors",
+                   "krea2_turbo_bf16.safetensors"),
+          (MODEL_KREA2_TEXT_ENCODER, "qwen3vl_4b_bf16.safetensors", "qwen3vl_4b_int8_convrot.safetensors"),
+          MODEL_KREA2_VAE, None, 8, 1.0,
+          "Aesthetic-first text-to-image (Krea 2 Turbo FP8, 12B DiT, 8 steps, er_sde/simple, CFG off). "
+          "Generation only: instruction edits, reference conditioning and outpainting use qwen21."),
         ("qwen21", ("qwen_image_2.1_int8_convrot.safetensors", "qwen_image_2.1_bf16.safetensors"),
           ("qwen3vl_8b_int8_convrot.safetensors", "qwen3vl_8b_w4a8.safetensors", "qwen3vl_8b_bf16.safetensors"),
           "qwen_image_2.1_vae_bf16.safetensors", 15, 30, 3.0,
@@ -62,7 +65,7 @@ def model_profiles(info, task):
          "minimax_h3_video_vae_fp16.safetensors", None, 20, 1.0,
          "Experimental H3 still images and reference edits: sample 5 frames and save the first. RGB output."),
     ):
-        if name == "anima" and task != "generation":
+        if name in ("anima", "krea2") and task != "generation":
             continue
         if name == "minimax_h3" and task == "outpaint":
             continue
@@ -71,12 +74,13 @@ def model_profiles(info, task):
             "clip": resolve_model(clips, *clip_names),
             "vae": resolve_model(vaes, vae_name),
             "default_steps": steps, "default_cfg": cfg, "use_for": use_for,
-            "sampler": "er_sde" if name == "anima" else "euler",
-            "scheduler": "Flux2Scheduler" if name == "flux2" else "simple",
+            "sampler": "er_sde" if name in ("anima", "krea2") else "euler",
+            "scheduler": "simple",
             "denoise": 1.0,
         }
-        if name == "flux2":
-            profile["guidance_type"] = "embedded FluxGuidance (cfg argument)"
+        if name == "krea2":
+            profile["guidance_type"] = "Turbo is CFG-distilled (cfg 1.0 default); raising cfg runs true classifier-free guidance"
+            profile["negative_prompt_supported"] = False
             profile["negative_prompt_supported"] = False
         if name == "minimax_h3":
             profile.update(sampler="res_multistep", scheduler="simple",
@@ -101,8 +105,8 @@ def model_profiles(info, task):
 def build_generation_workflow(backend, profile, prompt, negative_prompt="", width=1024, height=1024,
                               steps=None, cfg=None, seed=None):
     """Native ComfyUI text-to-image graphs, with per-model sampling defaults."""
-    if backend not in ("flux2", "qwen21", "anima", "minimax_h3"):
-        raise ValueError("model must be flux2, qwen21, anima or minimax_h3")
+    if backend not in ("krea2", "qwen21", "anima", "minimax_h3"):
+        raise ValueError("model must be krea2, qwen21, anima or minimax_h3")
     steps = profile["default_steps"] if steps is None else steps
     cfg = profile["default_cfg"] if cfg is None else cfg
     seed = secrets.randbits(63) if seed is None else seed
@@ -116,37 +120,21 @@ def build_generation_workflow(backend, profile, prompt, negative_prompt="", widt
         return [key, 0]
 
     model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
-    clip_type = {"flux2": "flux2", "qwen21": "qwen_image", "anima": "stable_diffusion"}[backend]
+    clip_type = {"krea2": "krea2", "qwen21": "qwen_image", "anima": "stable_diffusion"}[backend]
     clip = node("CLIPLoader", clip_name=profile["clip"], type=clip_type)
     vae = node("VAELoader", vae_name=profile["vae"])
     if backend == "qwen21":
         encoded = node("TextEncodeQwenImage21", clip=clip, prompt=prompt,
                        negative_prompt=negative_prompt, resolution=1024)
         positive, negative = encoded, [encoded[0], 1]
-    elif backend == "flux2":
-        # FLUX.2-dev is guidance-distilled: one forward pass, guidance value
-        # embedded in the model (BFL default 4.0), no negative conditioning.
-        # negative_prompt is accepted for API compatibility but not encoded.
-        positive = node("CLIPTextEncode", clip=clip, text=prompt)
-        positive = node("FluxGuidance", conditioning=positive, guidance=cfg)
-        negative = None
     else:
         positive = node("CLIPTextEncode", clip=clip, text=prompt)
         negative = node("CLIPTextEncode", clip=clip, text=negative_prompt)
-    latent = node("EmptyFlux2LatentImage" if backend == "flux2" else "EmptyLatentImage",
-                  width=width, height=height, batch_size=1)
-    if backend == "flux2":
-        guider = node("BasicGuider", model=model, conditioning=positive)
-        noise = node("RandomNoise", noise_seed=seed)
-        sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
-        sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
-        sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
-                       sigmas=sigmas, latent_image=latent)
-    else:
-        sampled = node("KSampler", model=model, positive=positive, negative=negative,
-                       latent_image=latent, seed=seed, steps=steps, cfg=cfg,
-                       sampler_name=profile["sampler"],
-                       scheduler=profile["scheduler"], denoise=profile["denoise"])
+    latent = node("EmptyLatentImage", width=width, height=height, batch_size=1)
+    sampled = node("KSampler", model=model, positive=positive, negative=negative,
+                   latent_image=latent, seed=seed, steps=steps, cfg=cfg,
+                   sampler_name=profile["sampler"],
+                   scheduler=profile["scheduler"], denoise=profile["denoise"])
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix=f"mcp_{backend}")
     return graph
@@ -154,8 +142,8 @@ def build_generation_workflow(backend, profile, prompt, negative_prompt="", widt
 
 def build_edit_workflow(backend, profile, prompt, images, width, height, steps, seed, resolution=0, cfg=None):
     """Use reference conditioning, separate from the sampled output latent."""
-    if backend not in ("flux2", "qwen21", "minimax_h3"):
-        raise ValueError("Instruction editing requires qwen21, flux2 or minimax_h3; Anima supports generation only")
+    if backend not in ("qwen21", "minimax_h3"):
+        raise ValueError("Instruction editing requires qwen21 or minimax_h3; Krea 2 and Anima support generation only")
     if backend == "minimax_h3":
         return build_h3_image_workflow(profile, prompt, width, height, steps, seed, images)
     cfg = profile["default_cfg"] if cfg is None else cfg
@@ -167,7 +155,7 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         return [key, 0]
 
     model = node("UNETLoader", unet_name=profile["model"], weight_dtype="default")
-    clip = node("CLIPLoader", clip_name=profile["clip"], type="flux2" if backend == "flux2" else "qwen_image")
+    clip = node("CLIPLoader", clip_name=profile["clip"], type="qwen_image")
     vae = node("VAELoader", vae_name=profile["vae"])
     loaded = []
     for filename in images:
@@ -175,29 +163,14 @@ def build_edit_workflow(backend, profile, prompt, images, width, height, steps, 
         if backend == "qwen21":
             image = node("JoinImageWithAlpha", image=image, alpha=[image[0], 1])
         loaded.append(image)
-    if backend == "flux2":
-        positive = node("CLIPTextEncode", clip=clip, text=prompt)
-        positive = node("FluxGuidance", conditioning=positive, guidance=cfg)
-        for image in loaded:
-            latent = node("VAEEncode", pixels=image, vae=vae)
-            positive = node("ReferenceLatent", conditioning=positive, latent=latent)
-        guider = node("BasicGuider", model=model, conditioning=positive)
-
-        noise = node("RandomNoise", noise_seed=seed)
-        sigmas = node("Flux2Scheduler", steps=steps, width=width, height=height)
-        sampler = node("KSamplerSelect", sampler_name=profile["sampler"])
-        empty = node("EmptyFlux2LatentImage", width=width, height=height, batch_size=1)
-        sampled = node("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
-                       sigmas=sigmas, latent_image=empty)
-    else:
-        model = node("QwenImage21Cache", model=model, device="auto", dtype="default")
-        encoder = node("TextEncodeQwenImage21", clip=clip, vae=vae, prompt=prompt,
-                       negative_prompt="", resolution=resolution,
-                       **{f"images.image_{i + 1}": image for i, image in enumerate(loaded)})
-        positive, negative, latent = encoder, [encoder[0], 1], [encoder[0], 2]
-        sampled = node("KSampler", model=model, positive=positive, negative=negative,
-                       latent_image=latent, seed=seed, steps=steps, cfg=cfg,
-                       sampler_name=profile["sampler"], scheduler=profile["scheduler"], denoise=profile["denoise"])
+    model = node("QwenImage21Cache", model=model, device="auto", dtype="default")
+    encoder = node("TextEncodeQwenImage21", clip=clip, vae=vae, prompt=prompt,
+                   negative_prompt="", resolution=resolution,
+                   **{f"images.image_{i + 1}": image for i, image in enumerate(loaded)})
+    positive, negative, latent = encoder, [encoder[0], 1], [encoder[0], 2]
+    sampled = node("KSampler", model=model, positive=positive, negative=negative,
+                   latent_image=latent, seed=seed, steps=steps, cfg=cfg,
+                   sampler_name=profile["sampler"], scheduler=profile["scheduler"], denoise=profile["denoise"])
     decoded = node("VAEDecode", samples=sampled, vae=vae)
     node("SaveImage", images=decoded, filename_prefix="mcp_instruction_edit")
     return graph
@@ -388,8 +361,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
 
         No manual startup is required. This check does not load generation models.
         Set start_if_needed=False only for a passive check; offline does not mean editing is unavailable.
-        Choose qwen21 for detail/text/alpha, flux2 for reference-guided rendering, anima for anime generation,
-        or minimax_h3 for experimental H3 still generation and reference edits.
+        Choose qwen21 for detail/text/alpha and reference-guided rendering, krea2 for aesthetic-first
+        text-to-image, anima for anime generation, or minimax_h3 for experimental H3 stills.
         Anima is generation-only; upscaling and semantic selection use their dedicated models.
         """
         try:
@@ -409,8 +382,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
             "generation": model_profiles(info, "generation"),
             "outpaint": model_profiles(info, "outpaint"),
             "default_edit_backend": "qwen21",
-            "default_generation_model": "flux2", "default_outpaint_backend": "flux2",
-            "prompt_guidance": {"tool": "get_prompt_guidance", "models": ["flux2", "qwen21", "anima", "minimax_h3"],
+            "default_generation_model": "krea2", "default_outpaint_backend": "qwen21",
+            "prompt_guidance": {"tool": "get_prompt_guidance", "models": ["krea2", "qwen21", "anima", "minimax_h3"],
                                 "note": "Essential master rules are in tool descriptions; full applicable sources are available without GPU startup."},
             "models": {"diffusion_models": model_options(info, "UNETLoader", "unet_name"),
                        "text_encoders": model_options(info, "CLIPLoader", "clip_name"),
@@ -422,7 +395,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                       "edit_image supports independent white-to-edit masks. Default composite edits add a replacement layer; layer_index edits only that layer's pixels; output_mode=extract adds a Qwen 2.1 subject layer. Inspect the preview and reported has_transparency.",
                       "export_mask copies a layer selection to a reusable edit-mask PNG without changing the document; supports invert, expand/shrink and feather.",
                       "Legacy select_object uses color heuristics, not semantic object segmentation.",
-                      "outpaint supports flux2 or qwen21 reference conditioning; original pixels are restored after generation. Style/identity guidance uses edit_image reference_paths.",
+                      "outpaint supports qwen21 reference conditioning; original pixels are restored after generation. Style/identity guidance uses edit_image reference_paths.",
                       "batch_generate queues a whole job list, awaits completion, then exports. submit_generation_job returns an ID and exports between images; use get_job_status/list_jobs for progress and cancel_job to stop after the current image.",
                       "Background jobs survive HTTP client disconnect only while the same MCP server process runs. Server restart or closing stdio loses workers/status; exported files remain.",
                       "The GPU may be shared with the host LLM container (Ollama-compatible API on :11434). Never stop that LLM container without explicit approval.",
@@ -431,8 +404,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
     @app.tool("edit_image")
-    @with_prompt_rules("editing", ("qwen21", "flux2", "minimax_h3"))
-    async def edit_image(prompt: str, backend: Literal["qwen21", "flux2", "minimax_h3"] = "qwen21", reference_paths: list[str] | None = None,
+    @with_prompt_rules("editing", ("qwen21", "minimax_h3"))
+    async def edit_image(prompt: str, backend: Literal["qwen21", "minimax_h3"] = "qwen21", reference_paths: list[str] | None = None,
                          mask_path: str | None = None, region: list[int] | None = None,
                          feather: int = 0, steps: int | None = None, seed: int | None = None,
                          max_side: int = 1024, session_id: str = "default", timeout: int | None = None, cfg: float | None = None,
@@ -443,15 +416,15 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         Automatically starts ComfyUI when needed; no manual startup is required.
 
         backend: qwen21 (default, Qwen Image 2.1, custom 30 steps/CFG 3, RGBA)
-        or flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4). Both use Euler.
-        minimax_h3 uses the installed ref2va model, 20 steps/res_multistep/simple, saving frame 0 of 5.
+        or minimax_h3 (installed ref2va model, 20 steps/res_multistep/simple, saving frame 0 of 5).
+        Krea 2 and Anima are generation-only: they have no instruction or reference editing.
         H3 is experimental for stills, outputs RGB, and ignores cfg (BasicGuider); allow 3600 seconds.
         H3 references use <Picture 1> for the canvas, <Picture 2> onward for references, then the mask.
         h3_reference_detail='match' keeps the existing faster reference sizing. 'max' sends original-resolution
         H3 references to its native encoder (up to a 2048px short edge), preserving more detail at higher cost.
         max_side still controls the H3 output's working size independently of reference detail.
         These backends support object removal, background replacement, restyling and references.
-        Choose qwen21 for typography/alpha or flux2 for Dev's reference-guided rendering. Anima is generation-only.
+        Choose qwen21 for typography/alpha and reference-guided rendering; Krea 2 and Anima are generation-only.
         Qwen 2511 and the original Qwen editor have been retired. Open the source image first.
         Image 1 is the canvas or the specified layer; images 2 onward are reference_paths, in order. For Qwen use
         <image1>, <image2>, etc. with multiple inputs (including a mask); for a lone canvas
@@ -468,13 +441,13 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         has_transparency reports the result's actual alpha; inspect the returned layer preview.
         Inspect the returned preview before retrying; undo a failed attempt before another edit.
         timeout defaults to 1800 seconds, or 3600 for H3. Identity preservation is model-dependent.
-        Optional cfg overrides Qwen CFG or FLUX embedded guidance; H3 uses BasicGuider.
+        Optional cfg overrides Qwen CFG; H3 uses BasicGuider.
         """
         prompt = unwrap_prompt(prompt)
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
-        if backend not in ("flux2", "qwen21", "minimax_h3"):
-            raise ValueError("backend must be qwen21, flux2 or minimax_h3; qwen and qwen2511 have been retired")
+        if backend not in ("qwen21", "minimax_h3"):
+            raise ValueError("backend must be qwen21 or minimax_h3; qwen, qwen2511 and flux2 are retired")
         if max_side < 32:
             raise ValueError("max_side must be at least 32")
         if h3_reference_detail not in ("match", "max"):
@@ -504,7 +477,7 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
         limit = (15 - int(mask is not None)) if backend == "qwen21" else None
         if limit is not None and len(references) > limit:
             raise ValueError(f"{backend} supports at most {limit} additional references")
-        multiple = 16 if backend == "flux2" else 32
+        multiple = 32
         working = prepare_image(source, max_side, multiple)
         width, height = working.size
         full_h3_references = backend == "minimax_h3" and h3_reference_detail == "max"
@@ -515,10 +488,8 @@ def register_editing_tools(app, comfy, sessions, run_workflow):
                 images.append(reference.convert("RGBA") if full_h3_references else prepare_image(reference, max_side, multiple))
         if backend == "qwen21":
             image_name = (lambda i: f"<image{i}>") if references or mask is not None else (lambda i: "the image")
-        elif backend == "minimax_h3":
-            image_name = lambda i: f"<Picture {i}>"
         else:
-            image_name = lambda i: f"image {i}"
+            image_name = lambda i: f"<Picture {i}>"
         if output_mode == "extract":
             instruction = f"Extract the subject from {image_name(1)}. {prompt.strip()} Place the subject on a transparent background. Preserve the subject's appearance, position, and size exactly."
             if references:

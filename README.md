@@ -35,12 +35,12 @@ ComfyUI does not need to be running beforehand. Call the requested generation/ed
 Projects are versioned JSON plus lossless PNGs in a ZIP archive, not PSD files. Saving replaces the target atomically; a failed load leaves the current document intact. Opening starts a fresh undo history. Supply a path in an existing directory.
 
 ### AI Image Generation & Editing
-- `generate_image` — Text-to-image with `model="flux2"`, `"qwen21"`, `"anima"`, or `"minimax_h3"`
-- `outpaint` — Extend left/right/top/bottom with `backend="flux2"` or `"qwen21"`; restores the original pixels exactly after generating the new margin
+- `generate_image` — Text-to-image with `model="krea2"`, `"qwen21"`, `"anima"`, or `"minimax_h3"`
+- `outpaint` — Extend left/right/top/bottom with `backend="qwen21"` (Krea 2 and Anima are generation-only); restores the original pixels exactly after generating the new margin
 
 | Model | Generate / batch | Edit / masked edit / references | Outpaint | Default steps / guidance | Sampler | Scheduler |
 |---|---|---|---|---|---|---|
-| `flux2` (FLUX.2 Dev NVFP4, 32B) | Yes | Yes | Yes | 50 / embedded guidance 4 | Euler | Native `Flux2Scheduler` |
+| `krea2` (Krea 2 Turbo FP8, 12B DiT) | Yes | No | No | 8 / 1.0 (CFG-distilled, CFG off) | `er_sde` | Simple |
 | `qwen21` (Qwen Image 2.1; custom preset) | Yes; detail, typography, alpha | Yes | Yes | 30 / 3 | Euler | Simple |
 | `anima` (installed Aesthetic v1.1) | Yes; anime/illustration | No | No | 30 / 4 | `er_sde` | Simple |
 | `minimax_h3` (FL2VA generation / REF2VA editing, INT8) | Yes; experimental stills | Yes; RGB | No | 20 / BasicGuider | `res_multistep` | Simple |
@@ -53,25 +53,25 @@ For H3 edits, `h3_reference_detail="max"` retains original reference detail up t
 
 MCP working dimensions use `max_side` and nearest-32 rounding; standalone ComfyUI reference presets use `ImageScaleToTotalPixels` at 0.75MP and save the generated size without resizing back. The native 768-short-edge `adapt_canvas` rule handles reference-video frames only. Assess masked edits for both seamless integration and the requested content change; source preservation alone is insufficient.
 
-[Nine ready-to-open workflows](workflows/README.md) include H3 text-to-image, one-reference edits, two-reference composition, Flux/Qwen generation and edits, Anima generation, and general 4x upscaling. Each has UI and API JSON versions. UI copies are installed under ComfyUI's **MCP Image Presets** folder. Save in-memory MCP work and reconnect the server to load the new H3 tool options.
+[Eight ready-to-open workflows](workflows/README.md) include H3 text-to-image, one-reference edits, two-reference composition, Krea 2 and Qwen generation, Qwen instruction editing, Anima generation, and general 4x upscaling. Each has UI and API JSON versions. UI copies are installed under ComfyUI's **MCP Image Presets** folder. Save in-memory MCP work and reconnect the server to load the new H3 tool options.
 
 These are the active MCP presets for the installed models. Qwen generation, editing and outpainting all use the requested **30 steps / CFG 3** preset. This is a user preference, not the official Qwen 2.1 recommendation: ComfyUI's current 2.1 templates use **25 steps / CFG 1 / Euler / Simple**. Older Qwen base and Lightning/Flash recipes do not define the 2.1 defaults; no Lightning LoRA or AuraFlow shift is applied.
 
 All generation paths use a full denoising schedule (`denoise=1.0` on KSampler). Text-to-image defaults to 1024x1024; Anima also suits approximately 1MP portrait/landscape sizes such as 896x1152 and 1152x896. Anima Aesthetic's documented tuning range is 30–50 steps/CFG 4–5; the preset uses the lower end. Anima Turbo and Qwen Lightning/Flash are not active backends.
 
-FLUX.2 Dev uses `flux2-dev-nvfp4.safetensors`, `mistral_3_small_flux2_fp8.safetensors` with CLIP type `flux2`, and `flux2-vae.safetensors`. Its `cfg` argument controls embedded `FluxGuidance`, followed by `BasicGuider`; it is not conventional positive/negative CFG. The preset is 50 steps/guidance 4; 28 steps is a supported faster trade-off. NVFP4 quantizes weights and does not make Dev a four-step model. Negative prompts are unused and disclosed when supplied; express desired constraints positively. Klein's Qwen3 encoder, LoRAs, AuraFlow shift and old sampling recipes are not used.
+Krea 2 Turbo uses `krea2_turbo_fp8_scaled.safetensors` (12B DiT, FP8), `qwen3vl_4b_fp8_scaled.safetensors` with CLIP type `krea2`, and `qwen_image_vae.safetensors`. The preset is 8 steps, `er_sde`/simple, denoise 1.0, with CFG distilled off (`cfg` 1.0); raising `cfg` runs true classifier-free guidance and rarely helps. Negative prompts are unused and disclosed when supplied; express desired constraints positively. Krea 2 is generation-only — instruction edits, reference conditioning and outpainting use Qwen 2.1. FP8 scales weights; it does not change the eight-step recipe.
 
-Model selection is per call; batch jobs can each choose a different model. Omit `steps`/`cfg` to use the selected model's defaults; explicit values are preserved. `get_editing_capabilities` reports readiness separately for generation, editing and outpainting, including missing files/nodes. Missing or unsupported choices return an error without substituting another model. Defaults remain Flux for generation/outpaint and Qwen for editing. Upscaling and semantic selection retain their dedicated models.
+Model selection is per call; batch jobs can each choose a different model. Omit `steps`/`cfg` to use the selected model's defaults; explicit values are preserved. `get_editing_capabilities` reports readiness separately for generation, editing and outpainting, including missing files/nodes. Missing or unsupported choices return an error without substituting another model. Defaults remain Krea 2 for generation and Qwen for editing/outpaint. Upscaling and semantic selection retain their dedicated models.
 
-Generation uses native ComfyUI nodes, including `Flux2Scheduler` for Dev and `TextEncodeQwenImage21` for Qwen. Flux/Qwen generation, editing and outpaint default to 1800-second timeouts; batch defaults allocate that time for each Flux/Qwen job, including jobs with an omitted model. PNG exports preserve generated alpha; existing visible canvas layers still composite normally. Outpainting uses reference-guided editing, with original pixels restored by the server rather than relying on the model to preserve them.
+Generation uses native ComfyUI nodes, including `KSampler`/`EmptyLatentImage` for Krea 2 and `TextEncodeQwenImage21` for Qwen. Krea 2/Qwen generation, editing and outpaint default to 1800-second timeouts; batch defaults allocate that time for each Krea 2/Qwen job, including jobs with an omitted model. PNG exports preserve generated alpha; existing visible canvas layers still composite normally. Outpainting uses Qwen reference-guided editing, with original pixels restored by the server rather than relying on the model to preserve them.
 
 Qwen outpaint uses an opaque white margin and the guide's approximately 1-megapixel editing resolution before returning to the requested canvas size. Low-resolution transparent-margin tests produced blank/noisy borders; ordinary `edit_image` retains its existing resolution handling.
 
-References: [FLUX.2 Dev model and sampling](https://huggingface.co/black-forest-labs/FLUX.2-dev), [ComfyUI Dev guide](https://docs.comfy.org/tutorials/flux/flux-2-dev), [BFL FLUX.2 prompting guide (Pro/Max; shared prose guidance)](https://docs.bfl.ai/guides/prompting_guide_flux2), [Qwen 2.1 guide](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1), [Anima model settings](https://huggingface.co/circlestone-labs/Anima#generation-settings).
+References: [Krea 2 (krea.ai)](https://krea.ai), [Qwen 2.1 guide](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1), [Anima model settings](https://huggingface.co/circlestone-labs/Anima#generation-settings).
 
-The four saved `flux2_klein*.json` ComfyUI workflows now run Dev; filenames are retained for bookmarks. They use the same model/encoder/VAE and 50-step native scheduler, with shared width/height controls. Negative branches, the AuraFlow patch and the incompatible Klein N LoRA were removed. The N workflow therefore runs without its former adapter. Reference/prop branches, bypass states, output names and stitching remain available. The i2i workflow now opens an existing character sample instead of the missing `rx78.png`, and its view prompts preserve the supplied character. Select your own source in its first LoadImage node.
+Three saved krea2 character-sheet ComfyUI workflows replace the former FLUX.2 Dev sheets (see the local `krea2-setup` folder for the API graphs and builder). All use the Krea 2 Turbo model/encoder/VAE with 8-step `er_sde`/simple sampling (CFG 1.0) and shared width/height controls. Krea 2 is generation-only, so view consistency is carried by the repeated character description in each prompt rather than a reference latent. The text-to-image sheet renders one 1536x1024 three-view sheet; the multiview workflow generates three 960x1440 views (front/side/back) and stitches them into a 2880x1440 combined sheet; the i2i-style workflow generates three 1024x1024 views into a 3072x1024 combined sheet, with its `LoadImage` kept for reference display only — for true i2i identity locking use `edit_image` (Qwen 2.1). Select your own source in the i2i workflow's LoadImage node.
 
-Migration backup and live evidence: `verification/flux2_dev/`. All four saved workflows executed at half dimensions with 50 steps; saved production dimensions were preserved. Real MCP checks covered 1024x768 generation, recoloring, masked references, exact outside-mask preservation, outpaint to 1280x768 with exact original pixels, undo/redo, and a Flux/Qwen/Anima batch. These are functional and visual smoke checks; character/accessory fidelity remains model-dependent. Save canvases and reconnect persistent MCP processes to load the changes, and reopen the saved workflows in ComfyUI.
+Live verification covered the default Krea 2 MCP generation at 1024x1024, all three character-sheet workflows at full dimensions, and an eight-prompt diverse style test — all completed end to end through the MCP server. These are functional and visual smoke checks; character/accessory fidelity remains model-dependent. Save canvases and reconnect persistent MCP processes to load the changes, and reopen the saved workflows in ComfyUI.
 
 ### Master prompt integration
 
@@ -79,7 +79,7 @@ The image tools apply the relevant rules from the master files in `MASTER_PROMPT
 
 | Tool/model | Source and application |
 |---|---|
-| Flux generation, edits and outpaint | `flux2prompt.txt` adapted to Dev: connected prose, preserve explicit details/lighting, exact lettering, positive desired outcomes, no negative branch; the source's historical Klein heading does not define the installed backend |
+| Krea 2 generation | `krea2prompt.txt`: aesthetic-first connected prose (usually 20–60 words), concrete style language, exact quoted lettering, positive desired outcomes — Krea 2 is generation-only, so no edit/outpaint master applies |
 | Anima generation and batch jobs | `anima_prompt.txt`: hybrid tags/prose, explicit character-to-attribute binding, separate compatible negatives, no score tags for Aesthetic |
 | Qwen generation and batch jobs | `qwen_image_2.1_system_prompt_t2i.txt`: detailed English observer prose (roughly 400–500 words), spatial layout, lighting, exact lettering in its original script |
 | Qwen edits and outpaint | `qwen_image_2.1_system_prompt_edit.txt`: clear requested changes with untargeted content preserved, separate prose/lettering language rules, correct reference roles |
@@ -96,10 +96,10 @@ H3 uses the full master through `get_prompt_guidance(model="minimax_h3", task="g
 
 The server removes a single surrounding prompt code fence. For Anima Aesthetic/unknown checkpoints, it removes standalone comma-separated `score_*` tags from both positive and negative prompts, while preserving quoted text verbatim; known Anima base checkpoints retain scores. Generation/batch results disclose any normalization. It does not truncate prompts to editorial word targets or automatically append negative tags that could conflict with the request.
 
-Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the September 21 masters and September 22 H3 still master; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. H3 video, audio/music, historical review and backup files do not override active MCP sampling presets. Existing Flux, Anima, Qwen and video masters are unchanged.
+Semantic requirements—intent, lighting, composition, character identity, suitable negatives and inspecting results—remain instructions for the calling LLM, not a guaranteed visual validator. The compact descriptions reflect the September 21 masters and September 22 H3 still master; full-guide reads always return current file contents. If a master changes, refresh the corresponding compact rules in `prompt_rules.py` and restart/reconnect the server. H3 video, audio/music, historical review and backup files do not override active MCP sampling presets. Existing Krea 2, Anima, Qwen and video masters are unchanged.
 
 ### Instruction Editing
-- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3), FLUX.2 Dev (`flux2`, 50 steps/embedded guidance 4), or experimental MiniMax H3 (`minimax_h3`, 20 steps/BasicGuider). Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. Flux/Qwen default to a 1800-second timeout; H3 uses 3600 seconds.
+- `edit_image` — Qwen Image 2.1 (`qwen21`, default, custom 30 steps/CFG 3) or experimental MiniMax H3 (`minimax_h3`, 20 steps/BasicGuider); Krea 2 and Anima are generation-only. Qwen 2511 and the original Qwen backend are retired. For multiple Qwen inputs, the canvas is `<image1>` and references follow in order; a lone canvas uses natural wording without a tag. An optional white-to-edit mask is appended last and also preserves outside pixels exactly. Layer visibility masks are separate; supply `mask_path` or `region=[x,y,width,height]` explicitly. `max_side=1024` controls working resolution; use 2048 for more detail. Qwen accepts up to 16 total images in the installed node (10 recommended), including canvas and mask. Qwen defaults to a 1800-second timeout; H3 uses 3600 seconds.
 - `get_editing_capabilities` — Live ComfyUI model/node availability per task (generation, editing, outpaint; notes also carry the GPU batching rule)
 - `preview_canvas` — Render the current canvas so the assistant can inspect results
 
@@ -140,7 +140,7 @@ These layer operations accept an optional `index` (defaults to the active layer)
 
 Merge-down applies both layers' opacity, masks, and visibility once. Normal blends may have small 8-bit rounding differences. Combinations whose blend depends on deeper layers return an error without changing the document; keep those layers separate or explicitly flatten the document. Undo restores the original layers.
 
-`edit_image` accepts optional `cfg`: Qwen uses CFG, while FLUX.2 uses embedded guidance. Omitting it preserves the current Qwen 30-step/CFG-3 and FLUX.2 50-step/guidance-4 presets. With `layer_index`, the source is that layer's raw pixels and replacement preserves its mask and other settings. With `output_mode="extract"` (Qwen only), the result becomes a new layer while originals retain their pixels and visibility. Inspect the returned preview and `has_transparency`; actual extraction quality depends on the model output. Qwen Image 2.1 already provides the required RGBA capability, so no separate Layered download is needed.
+`edit_image` accepts optional `cfg`: Qwen uses conventional CFG; Krea 2 is generation-only, so no `cfg` reaches it. Omitting it preserves the current Qwen 30-step/CFG-3 preset. With `layer_index`, the source is that layer's raw pixels and replacement preserves its mask and other settings. With `output_mode="extract"` (Qwen only), the result becomes a new layer while originals retain their pixels and visibility. Inspect the returned preview and `has_transparency`; actual extraction quality depends on the model output. Qwen Image 2.1 already provides the required RGBA capability, so no separate Layered download is needed.
 
 ### Selections & Masks
 - `select_rect` — Rectangular mask
@@ -169,10 +169,10 @@ For reusable AI masks: create a selection, call `export_mask(path="selection.png
 - **⚠️ VRAM Warning:** Running ComfyUI without auto-kill causes major OOM on shared GPUs (e.g., 32GB GPU with vLLM). Set `COMFYUI_AUTO_KILL=1` (recommended) with `COMFYUI_IDLE_TIMEOUT=5` to kill ComfyUI 5 seconds after each task, preventing resource exhaustion and Cline freezes.
 - Required models installed in ComfyUI:
 
-  **FLUX.2 Dev (generation, editing and outpaint):**
-  - `flux2-dev-nvfp4.safetensors` (diffusion_models) — 32B, quantized; 50 steps / embedded guidance 4
-  - `mistral_3_small_flux2_fp8.safetensors` (text_encoders) — Mistral Small, CLIP type `flux2`
-  - `flux2-vae.safetensors` (vae)
+  **Krea 2 Turbo (generation):**
+  - `krea2_turbo_fp8_scaled.safetensors` (diffusion_models) — 12B DiT, FP8; 8 steps, `er_sde`/simple, CFG 1.0 (distilled, CFG off)
+  - `qwen3vl_4b_fp8_scaled.safetensors` (text_encoders) — Qwen3-VL 4B, CLIP type `krea2`
+  - `qwen_image_vae.safetensors` (vae, shared with ANIMA)
 
   **ANIMA (anime generation):**
   - `anima-aesthetic-v1.1.safetensors` (diffusion_models)
@@ -256,7 +256,7 @@ The server can also serve Open WebUI over MCP **streamable-HTTP** — it registe
 Known limitations (details in `MEMORY.md`):
 
 - Open WebUI discards the MCP `initialize` instructions, so the GPU batching rule never reaches the OWUI model. Compensate in the OWUI model's system prompt: use a distinct `session_id` per chat and include a summary of the GPU batching rule. Cline receives the instructions natively.
-- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Flux/Qwen edits (up to 1800 s server-side) fail unless the container is run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`. The current container already has it; if you ever recreate the container (e.g. via a local Docker manager script), include that env var in `docker run`.
+- OWUI caps tool calls at `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default 300 s). Long Krea 2/Qwen edits (up to 1800 s server-side) fail unless the container is run with `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER=1800`. The current container already has it; if you ever recreate the container (e.g. via a local Docker manager script), include that env var in `docker run`.
 - OWUI chat uploads land in OWUI storage, not Windows paths — `open_image` cannot see them directly. Use `export` to a shared folder, then `open_image` with that path.
 
 ### Environment Variables
@@ -267,7 +267,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` (default, e.g. Cline) or `streamable-http` (Open WebUI; served at `/mcp`) |
 | `MCP_HTTP_HOST` | `127.0.0.1` | Bind address for the streamable-HTTP server; `0.0.0.0` (set by `run_openwebui.bat`) also admits tailnet peers via the allowlist |
 | `MCP_HTTP_ALLOWED_HOSTS` | *(empty)* | Optional comma-separated `host:port` patterns (e.g. a tailnet IP and MagicDNS name) admitted as Host + `http://` Origin; machine-specific, belongs in `.env` |
-| `MASTER_PROMPT_DIR` | `masters/` fallback (repository-local, next to `server.py`; blank example templates) | Directory containing the current Flux, Anima, Qwen and H3 master files; used when it points to an existing directory, read by `get_prompt_guidance` |
+| `MASTER_PROMPT_DIR` | `masters/` fallback (repository-local, next to `server.py`; blank example templates) | Directory containing the current Krea 2, Anima, Qwen and H3 master files; used when it points to an existing directory, read by `get_prompt_guidance` |
 | `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI API endpoint |
 | `COMFYUI_START_CMD` | *(optional)* | Path to ComfyUI start .bat (alternative to COMFYUI_PYTHON + COMFYUI_MAIN) |
 | `COMFYUI_PYTHON` | *(required for auto-start)* | Path to ComfyUI's embedded `python.exe` |
@@ -286,7 +286,7 @@ See [`.env_example`](.env_example) for a complete reference. Key variables:
 ```
 mcp-photoshop-server/
 ├── server.py           # MCP server; 50 tools including editing registrations (canvas tools accept session_id)
-├── editing.py          # Instruction editing backends (qwen21 / flux2 / minimax_h3) + semantic selection + live capabilities
+├── editing.py          # Generation + instruction editing backends (krea2 / qwen21 / minimax_h3) + semantic selection + live capabilities
 ├── prompt_rules.py     # Tool-level master guidance, source reader and conservative prompt normalization
 ├── config.py           # Configuration & model names
 ├── comfy_client.py     # ComfyUI API client (REST + WebSocket)
@@ -298,7 +298,7 @@ mcp-photoshop-server/
 ├── masters/            # Fallback master folder: blank example templates of the five expected files (the active directory comes from MASTER_PROMPT_DIR in .env)
 ├── run_openwebui.bat   # Streamable-HTTP launcher for Open WebUI (sets MCP_TRANSPORT=streamable-http)
 ├── MEMORY.md           # Project memory bank
-├── tests/              # Regression suite (206 tests)
+├── tests/              # Regression suite (207 tests)
 ├── .env_example        # Environment variable template
 ├── .gitignore          # Git ignore rules
 └── README.md
@@ -367,7 +367,7 @@ mcp-photoshop-server/
 1. new_canvas(width=1024, height=1024, session_id="doc_a")
 2. open_image(path="photo.jpg", session_id="doc_b")
 3. edit_image(prompt="...", session_id="doc_a")   # doc_b stays untouched
-4. batch_generate(jobs=[{"prompt": "a lighthouse", "model": "flux2"},
+4. batch_generate(jobs=[{"prompt": "a lighthouse", "model": "krea2"},
                          {"prompt": "a poster reading HELLO", "model": "qwen21"},
                          {"prompt": "an anime paper crane illustration", "model": "anima"}],
                   export_dir="output/batch")

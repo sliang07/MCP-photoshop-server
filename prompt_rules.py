@@ -7,7 +7,7 @@ from pathlib import Path
 from config import MASTER_PROMPT_DIR
 
 
-MASTER_FILES = {"flux2": "flux2prompt.txt", "anima": "anima_prompt.txt",
+MASTER_FILES = {"krea2": "krea2prompt.txt", "anima": "anima_prompt.txt",
                 "minimax_h3": "minimax_h3_pseudo_image_master.txt"}
 QWEN_MASTER_FILES = {
     "generation": "qwen_image_2.1_system_prompt_t2i.txt",
@@ -56,21 +56,18 @@ For finer reference detail, edit_image accepts h3_reference_detail=max (more mem
 and compute); match is the default. max_side controls working output size separately.
 H3 outpaint and transparent extraction are not exposed by these tools. The external
 pseudo-image author's frame/index settings are empirical, not preset overrides.""",
-    "flux2": """FLUX master (flux2prompt.txt): connected visual prose, usually 30–80 words;
-front-load the main priority, then setting/details, lighting and atmosphere. Expand only
-for meaningful requirements. No keyword dump, redundant quality adjectives or appended
-tag suffix. Preserve requested lighting; 'normal' depends on the actual setting.
-The installed backend is FLUX.2 Dev NVFP4 (32B), not Klein. Use the subject, action,
-style and context in priority order; name each reference image's role for edits and
-describe the requested change and preserved identity explicitly. Describe desired
-results positively: Dev does not use negative_prompt. Quote lettering and specify its
-placement and typography; bind exact requested colors to their objects. Native sampling
-uses Mistral Small, flux2 VAE, Euler and Flux2Scheduler, 50 steps with embedded guidance
-4 (28 steps is a faster trade-off). The API's cfg means embedded FluxGuidance for this
-backend, not a second negative-conditioning pass. NVFP4 is weight quantization, not a
-four-step distilled recipe. The local master is the 2026-09-19 FLUX.2 [dev]
-revision; these Dev-specific task and sampling rules adapt it to the installed
-NVFP4 backend.""",
+    "krea2": """Krea 2 master (krea2prompt.txt): Krea 2 is an aesthetic-first model - open with
+the subject and its mood, then setting, light and style in vivid, specific prose (usually
+20-60 words); expand only for genuinely complex scenes. No keyword dumps, score_* tags or
+redundant quality adjectives. Style is prompt-driven: use concrete aesthetic language and,
+only when the matching style LoRA is installed and requested, append its trigger phrase
+verbatim (e.g. "monochrome ink wash style"). The installed backend is Krea 2 Turbo FP8
+(12B DiT, Qwen3-VL-4B encoder, Qwen Image VAE): 8 steps, er_sde/simple, CFG off (cfg 1.0
+default); raising cfg runs true classifier-free guidance and rarely helps. negative_prompt
+is unused; express desired constraints positively. Quote visible lettering exactly and
+specify its placement and typography. Krea 2 is generation-only: instruction edits,
+reference-guided edits and outpainting use qwen21. These rules adapt the local master to
+the installed Turbo preset.""",
     "anima": """Anima master (anima_prompt.txt): use a compact mix of lowercase visual tags
 and natural-language sentences; ordinary tags use spaces, not underscores. Keep each
 character's identity/appearance/clothes/action together. Use anime/illustration language
@@ -86,7 +83,7 @@ Do not append negatives mechanically or put a negative-prompt section inside pro
 to MCP arguments: pass only rewritten_prompt's text as prompt, never the JSON object or
 the master itself. Keep wh_ratio/ratio_follow and resolution out of descriptive prose
 (preserve literal lettering requested by the user). Use actual tool sizing arguments;
-the master does not add new MCP fields or change sampling presets. Do not apply Flux
+the master does not add new MCP fields or change sampling presets. Do not apply Krea 2
 word targets, Anima tags or H3/video syntax to Qwen.""",
 }
 
@@ -199,11 +196,11 @@ def model_prompt_rules(model, task):
 
 def get_prompt_guidance(model, task):
     if model not in MODEL_RULES or task not in TASK_RULES:
-        raise ValueError("Choose model flux2/qwen21/anima/minimax_h3 and task generation/editing/outpaint")
-    if model == "anima" and task != "generation":
-        raise ValueError("Anima supports generation only; use qwen21 or flux2 for this task")
+        raise ValueError("Choose model krea2/qwen21/anima/minimax_h3 and task generation/editing/outpaint")
+    if model in ("anima", "krea2") and task != "generation":
+        raise ValueError("Anima and Krea 2 support generation only; use qwen21 for this task")
     if model == "minimax_h3" and task == "outpaint":
-        raise ValueError("H3 supports generation and editing; use qwen21 or flux2 for outpaint")
+        raise ValueError("H3 supports generation and editing; use qwen21 for outpaint")
     filename = QWEN_MASTER_FILES[task] if model == "qwen21" else MASTER_FILES[model]
     path = Path(MASTER_PROMPT_DIR) / filename
     try:
@@ -254,9 +251,9 @@ def prepare_prompts(model, checkpoint, prompt, negative_prompt):
     adjustments = []
     if (positive, negative) != (prompt, negative_prompt):
         adjustments.append("Removed a surrounding prompt code fence")
-    if model == "flux2" and negative:
+    if model == "krea2" and negative:
         negative = ""
-        adjustments.append("FLUX.2 Dev does not use negative_prompt; express desired constraints in prompt")
+        adjustments.append("Krea 2 Turbo does not use negative_prompt; express desired constraints in prompt")
     if model == "minimax_h3" and negative:
         negative = ""
         adjustments.append("H3 uses BasicGuider without negative_prompt; express desired constraints in prompt")

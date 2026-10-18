@@ -1,4 +1,4 @@
-"""Regression tests for outpaint (Flux2 chain, 2026-09-20 rewrite)."""
+"""Regression tests for outpaint (qwen21 reference chain)."""
 import io
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -67,14 +67,16 @@ class OutpaintTests(unittest.IsolatedAsyncioTestCase):
              patch.object(server, "run_workflow", run):
             await server.outpaint_tool("extend the scene", direction="right", amount=16, steps=30, session_id="op")
         workflow = run.await_args.args[0]
-        scheduler = next(n for n in workflow.values() if n["class_type"] == "Flux2Scheduler")
-        self.assertEqual(scheduler["inputs"]["steps"], 30)
-        self.assertIn("ReferenceLatent", [n["class_type"] for n in workflow.values()])
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
+        self.assertEqual(sampler["inputs"]["steps"], 30)
+        classes = [n["class_type"] for n in workflow.values()]
+        self.assertNotIn("ReferenceLatent", classes)
+        self.assertIn("TextEncodeQwenImage21", classes)
         load = next(n for n in workflow.values() if n["class_type"] == "LoadImage")
         self.assertEqual(load["inputs"]["image"], "renamed/op.png")
 
     async def test_both_backends_preserve_original_pixels_and_undo(self):
-        for backend in ("flux2", "qwen21"):
+        for backend in ("qwen21",):
             for direction, offset in (("left", (16, 0)), ("right", (0, 0)), ("top", (0, 16)), ("bottom", (0, 0))):
                 with self.subTest(backend=backend, direction=direction):
                     canvas = self.canvas()

@@ -89,7 +89,7 @@ class LayerEditingTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_modes_and_indices_fail_before_backend_start(self):
         before = [layer.to_dict() for layer in self.canvas.layers]
         for arguments in ({"layer_index": -1}, {"layer_index": 2}, {"output_mode": "unknown"},
-                          {"output_mode": "extract", "backend": "flux2"}):
+                          {"output_mode": "extract", "backend": "krea2"}):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 await self.registry.tools["edit_image"]("subject", **arguments)
         self.client.start_comfyui.assert_not_awaited()

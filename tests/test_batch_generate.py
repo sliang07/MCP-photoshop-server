@@ -51,7 +51,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workflows[0]["class_type"] if False else sorted(n["class_type"] for n in workflows[0].values()),
                          sorted(n["class_type"] for n in workflows[1].values()))
 
-    async def test_flux2_jobs_use_flux2_conventions(self):
+    async def test_default_krea2_jobs_use_turbo_conventions(self):
         self.client.batch_run_workflows.return_value = [
             {"history": {"_cached_file_bytes": png_bytes()}, "error": None}]
         await self.server.batch_generate_tool(
@@ -59,10 +59,14 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
             export_dir=self.tmp.name)
         workflows = self.client.batch_run_workflows.await_args.args[0]
         by_type = {n["class_type"]: n for n in workflows[0].values()}
-        self.assertIn("EmptyFlux2LatentImage", by_type)
-        self.assertEqual(by_type["EmptyFlux2LatentImage"]["inputs"]["width"], 16)
-        self.assertEqual(by_type["EmptyFlux2LatentImage"]["inputs"]["height"], 16)
-        self.assertEqual(by_type["Flux2Scheduler"]["inputs"]["steps"], 30)
+        self.assertIn("EmptyLatentImage", by_type)
+        self.assertEqual(by_type["EmptyLatentImage"]["inputs"]["width"], 16)
+        self.assertEqual(by_type["EmptyLatentImage"]["inputs"]["height"], 16)
+        sampler = by_type["KSampler"]["inputs"]
+        self.assertEqual(sampler["steps"], 30)
+        self.assertEqual(sampler["cfg"], 1.0)
+        self.assertEqual(sampler["sampler_name"], "er_sde")
+        self.assertEqual(sampler["scheduler"], "simple")
 
     async def test_rejects_invalid_jobs_before_submission(self):
         out = await self.server.batch_generate_tool(jobs=[{"prompt": "  "}], export_dir=self.tmp.name)
@@ -71,7 +75,7 @@ class BatchGenerateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_unknown_model(self):
         out = await self.server.batch_generate_tool(jobs=[{"prompt": "x", "model": "sd15"}], export_dir=self.tmp.name)
-        self.assertIn("must be 'flux2', 'qwen21', 'anima' or 'minimax_h3'", out[0].text)
+        self.assertIn("must be 'krea2', 'qwen21', 'anima' or 'minimax_h3'", out[0].text)
         self.client.batch_run_workflows.assert_not_awaited()
 
     async def test_empty_job_list_rejected(self):

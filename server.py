@@ -46,20 +46,20 @@ logger = logging.getLogger(__name__)
 
 # Some clients ignore initialize instructions, so tool descriptions also state
 # the automatic-startup behavior.
-GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. Qwen/qwen2511 are retired; flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4) remains an explicit option. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
+GPU_BATCH_RULE = """Editing: open_image first, then edit_image (Qwen Image 2.1 by default). Use the same session_id throughout. Describe the requested change and what must stay the same. Reference images follow the canvas in order. For multiple Qwen inputs use numbered tags (<image1> is the canvas); for a lone canvas use natural wording without a tag. For local edits pass region or a white-to-edit mask_path; layer visibility masks are separate. Inspect the image returned by edit_image. Undo an unsuccessful attempt before retrying so errors do not accumulate. qwen, qwen2511 and flux2 are retired; krea2 (Krea 2 Turbo FP8, 8 steps) is the default generation model. Do not ask the user to choose a backend, seed, or steps for ordinary edits.
 
 Layer editing: edit_image(layer_index=...) edits only that layer's pixels and preserves its settings. output_mode=extract uses Qwen 2.1 to add an extracted subject as a new layer; inspect the preview and has_transparency. Use set_layer_visibility to compare layers, export_mask to reuse a selection as an independent edit mask, and save_project/open_project for layered documents. Project opening starts a fresh undo history.
 
-Model selection: generate_image, batch_generate and submit_generation_job accept model=flux2 (photorealistic), qwen21 (detail, typography, alpha), anima (anime/illustration), or minimax_h3 (experimental H3 stills). edit_image accepts backend=qwen21, flux2 or minimax_h3; outpaint accepts qwen21 or flux2. H3 uses <Picture 1> for the canvas and subsequent numbered pictures for references. Anima is generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
+Model selection: generate_image, batch_generate and submit_generation_job accept model=krea2 (aesthetic-first, 8-step Turbo), qwen21 (detail, typography, alpha), anima (anime/illustration), or minimax_h3 (experimental H3 stills). edit_image accepts backend=qwen21 or minimax_h3; outpaint accepts qwen21 only. H3 uses <Picture 1> for the canvas and subsequent numbered pictures for references. Anima and Krea 2 are generation-only. Choose for the user's task and omit steps/cfg to use model-specific defaults. get_editing_capabilities reports availability per task. Never claim a missing model ran, or substitute one silently. Upscaling and semantic selection use their dedicated models.
 
 Background generation: submit_generation_job returns an ID, retains the full input list, and exports each completed image before starting the next. Poll get_job_status or list_jobs on the same server. cancel_job finishes the current image and skips remaining images without interrupting other jobs. Jobs survive an HTTP client disconnect only while the MCP server process runs; closing a stdio server or restarting loses workers/status, but exported files remain. batch_generate still waits for the whole batch before exporting.
 
-Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Flux, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3 reads its still master (minimax_h3_pseudo_image_master.txt) through get_prompt_guidance; video and audio masters do not override still-image requests. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
+Prompt authoring: follow the master-prompt rules in each tool's description. get_prompt_guidance exposes the current local Krea 2, Anima and Qwen master text without starting ComfyUI. Qwen generation uses its t2i master; editing and outpaint use its edit master. Pass rewritten_prompt text as prompt; map size metadata to supported tool arguments instead of sending the master JSON to the image model. H3 reads its still master (minimax_h3_pseudo_image_master.txt) through get_prompt_guidance; video and audio masters do not override still-image requests. Keep exact user details and lettering, avoid unnecessary interviews, and keep positive/negative prompts separate from settings.
 
 ComfyUI starts automatically when a dependent tool is called, including get_editing_capabilities and get_comfyui_status. Call the requested tool directly; do not ask the user to start ComfyUI or open its browser UI. ComfyUI being stopped between operations is expected with idle shutdown enabled. If automatic startup actually fails, report the returned error.
 
 GPU batching rule: this host's single 32GB GPU may be shared with the LLM backend docker (Ollama-compatible API on :11434 - its container name is machine-local and kept out of the repo; identify it via `docker ps`) and Open WebUI (:3000). Check actual contention before proposing container changes. If the GPU is available, run the requested edit directly.
-- Single generation with sufficient free GPU memory: run it directly. FLUX.2 Dev defaults to 50 steps, not the retired Klein four-step recipe.
+- Single generation with sufficient free GPU memory: run it directly. Krea 2 Turbo defaults to 8 steps (er_sde/simple, CFG off).
 - For batches that need GPU memory currently occupied by the LLM container: first hand the complete input list to submit_generation_job on an independently running host MCP server, or to a detached host runner. Verify that the worker's process will remain running when the LLM connection ends. Sequential awaited edit_image calls are not a detached batch.
 - Only then ask the user for explicit approval to run `docker stop` on that LLM container (and optionally `open-webui`) so ComfyUI gets the full GPU. Stop only after approval and verified background ownership of the complete batch.
 - Warning: that container serves the LLM itself, so stopping it ends this session. That is acceptable only because the batch keeps running on the host; say so to the user and remind them to `docker start` the LLM (and optionally `open-webui`) afterwards.
@@ -305,7 +305,7 @@ async def get_info(session_id: str = "default"):
 
 
 @app.tool("get_prompt_guidance")
-async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima", "minimax_h3"] = "flux2",
+async def get_prompt_guidance_tool(model: Literal["krea2", "qwen21", "anima", "minimax_h3"] = "krea2",
                                    task: Literal["generation", "editing", "outpaint"] = "generation"):
     """Read the applicable local master prompt and its Photoshop tool adaptation.
 
@@ -320,25 +320,25 @@ async def get_prompt_guidance_tool(model: Literal["flux2", "qwen21", "anima", "m
 
 
 @app.tool("generate_image")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
-async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima", "minimax_h3"] = "flux2", width: int = 1024, height: int = 1024,
+@with_prompt_rules("generation", ("krea2", "qwen21", "anima", "minimax_h3"))
+async def generate_image(prompt: str, model: Literal["krea2", "qwen21", "anima", "minimax_h3"] = "krea2", width: int = 1024, height: int = 1024,
                          steps: Optional[int] = None, cfg: Optional[float] = None, seed: Optional[int] = None, negative_prompt: str = "",
                          session_id: str = "default", timeout: Optional[int] = None):
     """Generate an image from text. Automatically starts ComfyUI; no manual startup is required.
 
-    Choose model='flux2' for generation (FLUX.2 Dev NVFP4, 50 steps/guidance 4, guidance-distilled),
+    Choose model='krea2' for aesthetic-first generation (Krea 2 Turbo FP8, 8 steps/er_sde/simple, CFG off),
     'qwen21' for detail, typography or transparent output (custom 30 steps/CFG 3),
     'anima' for anime/illustration (30 steps/CFG 4), or 'minimax_h3' for experimental H3 stills
     (20 steps/res_multistep/simple, frame 0 of 5, RGB). Omit steps/cfg for these defaults.
     H3 ignores cfg and negative_prompt (reported), rounds dimensions up to 32, and allows 3600 seconds.
-    For flux2, cfg controls embedded FluxGuidance; negative_prompt is unused and reported
-    if supplied. Express desired constraints positively in prompt.
+    For krea2, negative_prompt is unused and reported if supplied; raising cfg above 1.0 runs
+    true classifier-free guidance. Express desired constraints positively in prompt.
     get_editing_capabilities reports installed choices. For changes to an existing
     image use edit_image instead. A missing model is reported, never silently substituted.
     """
     try:
-        if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
-            raise ValueError("model must be flux2, qwen21, anima or minimax_h3")
+        if model not in ("krea2", "qwen21", "anima", "minimax_h3"):
+            raise ValueError("model must be krea2, qwen21, anima or minimax_h3")
         await comfy.start_comfyui()
         profile = model_profiles(await comfy.get_object_info(), "generation")[model]
         if not profile["available"]:
@@ -348,7 +348,7 @@ async def generate_image(prompt: str, model: Literal["flux2", "qwen21", "anima",
                                              width, height, steps, cfg, seed)
         if model == "minimax_h3" and cfg is not None and cfg != 1.0:
             adjustments.append("H3 uses BasicGuider; the supplied cfg is unused")
-        result = await run_workflow(workflow, timeout=timeout or (3600 if model == "minimax_h3" else 1800 if model in ("flux2", "qwen21") else None))
+        result = await run_workflow(workflow, timeout=timeout or (3600 if model == "minimax_h3" else 1800 if model in ("krea2", "qwen21") else None))
         if not result:
             return [TextContent(text="Generation failed.")]
         img = Image.open(io.BytesIO(result)).convert("RGBA")
@@ -879,22 +879,22 @@ async def clear_vram_tool():
 
 
 @app.tool("outpaint")
-@with_prompt_rules("outpaint", ("flux2", "qwen21"))
+@with_prompt_rules("outpaint", ("qwen21",))
 async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256,
                         steps: Optional[int] = None, seed: Optional[int] = None,
-                        session_id: str = "default", backend: Literal["flux2", "qwen21"] = "flux2", timeout: Optional[int] = None):
+                        session_id: str = "default", backend: Literal["qwen21"] = "qwen21", timeout: Optional[int] = None):
     """AI outpaint: extend the canvas in a direction and fill the new area. Automatically starts ComfyUI; no manual startup is required.
 
-    direction: left, right, top, bottom. backend: flux2 (FLUX.2 Dev NVFP4, 50 steps/guidance 4)
-    or qwen21 (Qwen Image 2.1, custom 30 steps/CFG 3). Anima does not support instruction editing.
+    direction: left, right, top, bottom. backend: qwen21 (Qwen Image 2.1, custom 30 steps/CFG 3).
+    Krea 2 and Anima support generation only; MiniMax H3 does not support outpainting.
     Omit steps for the selected model's default. Extends the active layer using
     reference conditioning, then restores its original pixels exactly.
     Qwen works at about 1 megapixel internally, then returns the requested canvas size.
     """
     try:
         prompt = unwrap_prompt(prompt)
-        if backend not in ("flux2", "qwen21"):
-            raise ValueError("backend must be flux2 or qwen21; Anima supports generation only")
+        if backend not in ("qwen21",):
+            raise ValueError("backend must be qwen21; Krea 2 and Anima support generation only, MiniMax H3 does not outpaint")
         if amount <= 0:
             raise ValueError("amount must be positive")
         canvas = sessions.get_or_create(session_id)
@@ -913,7 +913,7 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
         steps = profile["default_steps"] if steps is None else steps
         seed = secrets.randbits(63) if seed is None else seed
         # Create padded canvas
-        padded = Image.new("RGBA", (target_w, target_h), "white" if backend == "qwen21" else (0, 0, 0, 0))
+        padded = Image.new("RGBA", (target_w, target_h), "white")
         if direction == "left":
             padded.paste(layer.image, (amount, 0))
         elif direction == "right":
@@ -924,19 +924,13 @@ async def outpaint_tool(prompt: str, direction: str = "right", amount: int = 256
             padded.paste(layer.image, (0, 0))
         # Upload padded image
         pad_name = f"outpaint_{uuid.uuid4().hex[:8]}.png"
-        working = prepare_image(padded, max(padded.size), 32 if backend == "qwen21" else 16)
+        working = prepare_image(padded, max(padded.size), 32)
         filename = await comfy.upload_image(png_bytes(working), pad_name)
-        if backend == "qwen21":
-            instruction = (f"Outpaint the image: replace the white strip on the {direction} with "
-                           f"a seamless continuation of the scene: {prompt}. "
-                           "Preserve the original image's placement, scale, content and style.")
-        else:
-            instruction = (f"Extend the scene in image 1 into the transparent {direction} margin. "
-                           f"Fill that margin with opaque image content: {prompt}. "
-                           "Keep the original image's placement, scale, content and style unchanged. "
-                           "Continue the scene seamlessly across the boundary.")
+        instruction = (f"Outpaint the image: replace the white strip on the {direction} with "
+                       f"a seamless continuation of the scene: {prompt}. "
+                       "Preserve the original image's placement, scale, content and style.")
         workflow = build_edit_workflow(backend, profile, instruction, [filename],
-                                       *working.size, steps, seed, resolution=1024 if backend == "qwen21" else 0)
+                                       *working.size, steps, seed, resolution=1024)
         result = await run_workflow(workflow, timeout=timeout or 1800)
         if not result:
             return [TextContent(text="Outpaint failed.")]
@@ -1184,7 +1178,7 @@ DEFAULT_BATCH_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "batch_ou
 
 
 @app.tool("batch_generate")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
+@with_prompt_rules("generation", ("krea2", "qwen21", "anima", "minimax_h3"))
 async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None,
                               export_format: str = "PNG", timeout: Optional[int] = None):
     """Batch text-to-image generation: queue a whole job list on ComfyUI in one pass, await completion, and export all results.
@@ -1192,11 +1186,11 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
     Automatically starts ComfyUI when needed; no manual startup is required.
 
     jobs: list of job objects, each with 'prompt' (required) and optional
-    'model' ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), 'width', 'height', 'steps', 'cfg',
+    'model' ('krea2' aesthetic-first / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), 'width', 'height', 'steps', 'cfg',
     'seed', 'negative_prompt', and 'filename' (output basename without extension).
     Models may differ per job. Omitted steps/cfg use model defaults:
-    flux2=50/4, qwen21=30/3 (custom preset), anima=30/4, minimax_h3=20/BasicGuider. H3 cfg/negative_prompt are unused and reported.
-    For flux2 jobs, cfg is embedded FluxGuidance and negative_prompt is unused/reported.
+    krea2=8/1.0, qwen21=30/3 (custom preset), anima=30/4, minimax_h3=20/BasicGuider. H3 cfg/negative_prompt are unused and reported.
+    For krea2 jobs, negative_prompt is unused/reported and cfg 1.0 keeps guidance off.
     This tool waits for the batch results before exporting. Use submit_generation_job for a returned job ID
     and per-image exports; its MCP server process must remain running. For work that must continue after
     the LLM stops, verify independent server lifetime or use a detached host runner (see MEMORY.md).
@@ -1214,16 +1208,16 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
         for i, job in enumerate(jobs):
             if not isinstance(job, dict) or not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job {i} is invalid: each job needs a non-empty 'prompt' string")]
-            model = job.get("model", "flux2")
-            if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
-                return [TextContent(text=f"Job {i}: 'model' must be 'flux2', 'qwen21', 'anima' or 'minimax_h3'")]
+            model = job.get("model", "krea2")
+            if model not in ("krea2", "qwen21", "anima", "minimax_h3"):
+                return [TextContent(text=f"Job {i}: 'model' must be 'krea2', 'qwen21', 'anima' or 'minimax_h3'")]
         await comfy.start_comfyui()
         profiles = model_profiles(await comfy.get_object_info(), "generation")
         workflows = []
         seeds = []
         settings = []
         for i, job in enumerate(jobs):
-            model = job.get("model", "flux2")
+            model = job.get("model", "krea2")
             profile = profiles[model]
             if not profile["available"]:
                 raise ValueError(f"Job {i}: {model} is unavailable: {profile['missing']}. Call get_editing_capabilities.")
@@ -1246,7 +1240,7 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
                 setting.update(prompt_adjustments=adjustments, effective_prompt=prompt, negative_prompt=negative_prompt)
             settings.append(setting)
         if timeout is None:
-            timeout = sum(3600 if job.get("model") == "minimax_h3" else 1800 if job.get("model", "flux2") in ("flux2", "qwen21") else WEBSOCKET_TIMEOUT for job in jobs)
+            timeout = sum(3600 if job.get("model") == "minimax_h3" else 1800 if job.get("model", "krea2") in ("krea2", "qwen21") else WEBSOCKET_TIMEOUT for job in jobs)
         batch = await comfy.batch_run_workflows(workflows, timeout=timeout)
         batch = batch[:len(jobs)]  # defensive: results must align 1:1 with jobs
         out_dir = Path(export_dir) if export_dir else DEFAULT_BATCH_DIR
@@ -1255,7 +1249,7 @@ async def batch_generate_tool(jobs: list[dict], export_dir: Optional[str] = None
         results = []
         for i, entry in enumerate(batch):
             job = jobs[i]
-            record = {"index": i, "prompt": job.get("prompt"), "model": job.get("model", "flux2"),
+            record = {"index": i, "prompt": job.get("prompt"), "model": job.get("model", "krea2"),
                       "seed": seeds[i], "status": "ok", "file": None, **settings[i]}
             history = entry.get("history")
             data = history.get("_cached_file_bytes") if history else None
@@ -1323,7 +1317,7 @@ generation_jobs = GenerationJobs(_generate_job_item)
 
 
 @app.tool("submit_generation_job")
-@with_prompt_rules("generation", ("flux2", "qwen21", "anima", "minimax_h3"))
+@with_prompt_rules("generation", ("krea2", "qwen21", "anima", "minimax_h3"))
 async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = None,
                                 export_format: str = "PNG", timeout_per_image: Optional[int] = None):
     """Submit a generation job for asynchronous processing.
@@ -1333,8 +1327,8 @@ async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = No
     restart/closed stdio process loses job state/worker; exported files persist.
     Cancellation is graceful: current image finishes and exports; remaining images skipped, no Comfy interrupt.
 
-    Supported job fields: prompt (required), model ('flux2' photorealistic / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), width, height, steps, cfg, seed, negative_prompt, filename.
-    Default steps/guidance: flux2=50/4, qwen21=30/3, anima=30/4, minimax_h3=20/BasicGuider (cfg and negative_prompt unused).
+    Supported job fields: prompt (required), model ('krea2' aesthetic-first / 'qwen21' detail, typography, alpha / 'anima' anime / 'minimax_h3' experimental stills), width, height, steps, cfg, seed, negative_prompt, filename.
+    Default steps/cfg: krea2=8/1.0, qwen21=30/3, anima=30/4, minimax_h3=20/BasicGuider (H3 cfg and negative_prompt unused).
     timeout_per_image: optional seconds per image; omitted uses the selected model's timeout.
     """
     try:
@@ -1350,9 +1344,9 @@ async def submit_generation_job(jobs: list[dict], export_dir: Optional[str] = No
                 return [TextContent(text=f"Job at index {i} must be a dict")]
             if not str(job.get("prompt", "")).strip():
                 return [TextContent(text=f"Job at index {i} must have a non-empty prompt")]
-            model = job.get("model", "flux2")
-            if model not in ("flux2", "qwen21", "anima", "minimax_h3"):
-                return [TextContent(text=f"Job at index {i} has invalid model '{model}'. Must be flux2, qwen21, anima or minimax_h3.")]
+            model = job.get("model", "krea2")
+            if model not in ("krea2", "qwen21", "anima", "minimax_h3"):
+                return [TextContent(text=f"Job at index {i} has invalid model '{model}'. Must be krea2, qwen21, anima or minimax_h3.")]
         report = generation_jobs.submit(jobs, export_dir=export_dir, export_format=fmt, timeout_per_image=timeout_per_image)
         return [TextContent(text=json.dumps(report, indent=2))]
     except Exception as e:

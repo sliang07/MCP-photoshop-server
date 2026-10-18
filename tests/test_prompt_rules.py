@@ -38,9 +38,9 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
             positive, negative, changes = prompt_rules.prepare_prompts(model, checkpoint, original, "score_1")
             self.assertEqual((positive, negative, changes), (original, "score_1", []))
 
-    def test_flux_dev_reports_unused_negative_without_rewriting_positive(self):
+    def test_krea_turbo_reports_unused_negative_without_rewriting_positive(self):
         positive = 'A sign reads "score_7" beside a blue bird.'
-        actual, negative, changes = prompt_rules.prepare_prompts("flux2", "flux2-dev-nvfp4.safetensors", positive, "watermark")
+        actual, negative, changes = prompt_rules.prepare_prompts("krea2", "krea2_turbo_fp8_scaled.safetensors", positive, "watermark")
         self.assertEqual(actual, positive)
         self.assertEqual(negative, "")
         self.assertIn("does not use negative_prompt", changes[0])
@@ -53,18 +53,18 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
 
     def test_descriptive_prose_and_long_prompts_are_not_changed(self):
         prompt = "The first person wears a blue coat; the second wears red. Intentionally blurred, soft studio lighting. " * 30
-        for model in ("flux2", "qwen21", "anima"):
+        for model in ("krea2", "qwen21", "anima"):
             actual, negative, changes = prompt_rules.prepare_prompts(model, "anima-aesthetic-v1.1.safetensors", prompt, "")
             self.assertEqual((actual, negative, changes), (prompt, "", []))
 
     def test_full_master_is_read_fresh_and_paths_are_fixed(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(prompt_rules, "MASTER_PROMPT_DIR", tmp):
-            path = Path(tmp) / "flux2prompt.txt"
+            path = Path(tmp) / "krea2prompt.txt"
             path.write_text("Current master: preserve studio lighting.", encoding="utf-8")
-            first = prompt_rules.get_prompt_guidance("flux2", "generation")
+            first = prompt_rules.get_prompt_guidance("krea2", "generation")
             self.assertEqual(first["sources"][0]["text"], path.read_text())
             path.write_text("Revised master: keep exact lettering.", encoding="utf-8")
-            second = prompt_rules.get_prompt_guidance("flux2", "generation")
+            second = prompt_rules.get_prompt_guidance("krea2", "generation")
             self.assertNotEqual(first["sources"][0]["sha256"], second["sources"][0]["sha256"])
             with self.assertRaisesRegex(ValueError, "Choose model"):
                 prompt_rules.get_prompt_guidance("../secret", "generation")
@@ -95,7 +95,7 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_qwen_master_does_not_fall_back_to_other_models(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(prompt_rules, "MASTER_PROMPT_DIR", tmp):
-            for filename in ("flux2prompt.txt", "anima_prompt.txt", "qwen_image_2.1_system_prompt_t2i.txt"):
+            for filename in ("krea2prompt.txt", "anima_prompt.txt", "qwen_image_2.1_system_prompt_t2i.txt"):
                 (Path(tmp) / filename).write_text("Other guide.", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "qwen_image_2.1_system_prompt_edit.txt"):
                 prompt_rules.get_prompt_guidance("qwen21", "editing")
@@ -154,7 +154,7 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("not a prerequisite", description)
         for name in ("generate_image", "batch_generate"):
             self.assertIn("omit score_* quality tags from BOTH", definitions[name].description)
-            self.assertIn("30–80 words", definitions[name].description)
+            self.assertIn("20-60 words", definitions[name].description)
             self.assertIn("qwen_image_2.1_system_prompt_t2i.txt", definitions[name].description)
             self.assertIn("400–500 words", definitions[name].description)
             self.assertNotIn("qwen_image_2.1_system_prompt_edit.txt", definitions[name].description)
@@ -186,11 +186,11 @@ class PromptRulesTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(server, "comfy", client):
             result = await server.batch_generate_tool(
                 [{"prompt": "score_7, a bird", "model": model, "negative_prompt": "score_1, artifacts"}
-                 for model in ("anima", "flux2")], export_dir=tmp)
+                 for model in ("anima", "krea2")], export_dir=tmp)
         graphs = client.batch_run_workflows.await_args.args[0]
         texts = [[n["inputs"]["text"] for n in graph.values() if n["class_type"] == "CLIPTextEncode"] for graph in graphs]
-        # flux2 (dev) is guidance-distilled: no negative conditioning is encoded.
-        self.assertEqual(texts, [["a bird", "artifacts"], ["score_7, a bird"]])
+        # krea2 (Turbo) is CFG-distilled: the negative branch encodes an empty prompt.
+        self.assertEqual(texts, [["a bird", "artifacts"], ["score_7, a bird", ""]])
         records = json.loads(result[0].text)["results"]
         self.assertIn("prompt_adjustments", records[0])
         self.assertIn("does not use negative_prompt", records[1]["prompt_adjustments"][0])

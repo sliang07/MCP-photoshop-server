@@ -31,16 +31,16 @@ class Registry:
 def node_info():
     data = {}
     models = {
-        "UNETLoader": ("unet_name", ["flux2-dev-nvfp4.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors", "anima-aesthetic-v1.1.safetensors"]),
-        "CLIPLoader": ("clip_name", ["mistral_3_small_flux2_fp8.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors", "qwen_3_06b_base.safetensors"]),
-        "VAELoader": ("vae_name", ["flux2-vae.safetensors", "qwen_image_2.1_vae_bf16.safetensors", "qwen_image_vae.safetensors"]),
+        "UNETLoader": ("unet_name", ["krea2_turbo_fp8_scaled.safetensors", "qwen/qwen_image_2.1_int8_convrot.safetensors", "anima-aesthetic-v1.1.safetensors"]),
+        "CLIPLoader": ("clip_name", ["qwen3vl_4b_fp8_scaled.safetensors", "qwen/qwen3vl_8b_int8_convrot.safetensors", "qwen_3_06b_base.safetensors"]),
+        "VAELoader": ("vae_name", ["qwen_image_2.1_vae_bf16.safetensors", "qwen_image_vae.safetensors"]),
     }
     for loader, (field, names) in models.items():
         data[loader] = {"input": {"required": {field: [names]}}}
-    for name in ["LoadImage", "CLIPTextEncode", "VAEEncode", "ReferenceLatent", "BasicGuider",
-                 "RandomNoise", "Flux2Scheduler", "KSamplerSelect", "EmptyFlux2LatentImage",
-                 "SamplerCustomAdvanced", "VAEDecode", "SaveImage", "TextEncodeQwenImage21",
-                 "QwenImage21Cache", "JoinImageWithAlpha", "KSampler", "EmptyLatentImage", "CFGGuider", "FluxGuidance"]:
+    for name in ["LoadImage", "CLIPTextEncode", "VAEEncode", "BasicGuider",
+                 "RandomNoise", "KSamplerSelect", "SamplerCustomAdvanced", "VAEDecode", "SaveImage",
+                 "TextEncodeQwenImage21", "QwenImage21Cache", "JoinImageWithAlpha", "KSampler",
+                 "EmptyLatentImage", "CFGGuider"]:
         data[name] = {}
     return data
 
@@ -134,29 +134,17 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loads, ["renamed/source.png"])
 
     async def test_retired_backends_are_not_silently_substituted(self):
-        for backend in ("qwen", "qwen2511"):
+        for backend in ("qwen", "qwen2511", "flux2"):
             with self.assertRaisesRegex(ValueError, "retired"):
                 await self.registry.tools["edit_image"]("change", backend=backend)
         self.client.upload_image.assert_not_called()
 
-    def test_reference_images_are_connected_to_guider(self):
-        profile = edit_profiles(node_info())["flux2"]
-        graph = build_edit_workflow("flux2", profile, "edit", ["source.png", "ref.png"], 512, 512, 4, 0)
-        classes = [n["class_type"] for n in graph.values()]
-        self.assertNotIn("CFGGuider", classes)
-        guider = next(n for n in graph.values() if n["class_type"] == "BasicGuider")
-
-        conditioning = guider["inputs"]["conditioning"]
-        for expected in ("ref.png", "source.png"):
-            ref = graph[conditioning[0]]
-            self.assertEqual(ref["class_type"], "ReferenceLatent")
-            encoded = graph[ref["inputs"]["latent"][0]]
-            loaded = graph[encoded["inputs"]["pixels"][0]]
-            self.assertEqual(loaded["inputs"]["image"], expected)
-            conditioning = ref["inputs"]["conditioning"]
-        guided = graph[conditioning[0]]
-        self.assertEqual(guided["class_type"], "FluxGuidance")
-        self.assertEqual(guided["inputs"]["guidance"], profile["default_cfg"])
+    def test_editing_backends_exclude_generation_only_models(self):
+        profiles = edit_profiles(node_info())
+        self.assertIn("qwen21", profiles)
+        self.assertIn("minimax_h3", profiles)
+        self.assertNotIn("krea2", profiles)
+        self.assertNotIn("anima", profiles)
 
     def test_model_detection_handles_new_combo_and_nested_paths(self):
         info = {"Loader": {"input": {"required": {"model": ["COMBO", {"options": ["a.pth"]}]}}}}
@@ -164,8 +152,8 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(edit_profiles(node_info())["qwen21"]["available"])
         self.assertNotIn("qwen2511", edit_profiles(node_info()))
         broken = node_info()
-        del broken["ReferenceLatent"]
-        self.assertFalse(edit_profiles(broken)["flux2"]["available"])
+        del broken["JoinImageWithAlpha"]
+        self.assertFalse(edit_profiles(broken)["qwen21"]["available"])
 
     def test_preview_is_valid_png_and_bounded(self):
         preview = preview_content(Image.new("RGB", (2048, 1024)), 512)
@@ -302,8 +290,7 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image.getpixel((0, 0))[3], 128)
 
     async def test_cfg_resolution_and_workflow_nodes(self):
-        cases = [("flux2", None, 4.0, 50), ("flux2", 0.0, 0.0, 50), ("flux2", 1.25, 1.25, 50),
-                 ("qwen21", None, 3.0, 30), ("qwen21", 0.0, 0.0, 30), ("qwen21", 1.25, 1.25, 30)]
+        cases = [("qwen21", None, 3.0, 30), ("qwen21", 0.0, 0.0, 30), ("qwen21", 1.25, 1.25, 30)]
         for backend, cfg, expected_cfg, expected_steps in cases:
             with self.subTest(backend=backend, cfg=cfg):
                 result = await self.registry.tools["edit_image"]("test", backend=backend, cfg=cfg)
@@ -311,12 +298,8 @@ class EditingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(report["cfg"], expected_cfg)
                 self.assertEqual(report["steps"], expected_steps)
                 graph = self.run.call_args.args[0]
-                if backend == "flux2":
-                    guidance_node = next(n for n in graph.values() if n["class_type"] == "FluxGuidance")
-                    self.assertEqual(guidance_node["inputs"]["guidance"], expected_cfg)
-                else:
-                    sampler = next(n for n in graph.values() if n["class_type"] == "KSampler")
-                    self.assertEqual(sampler["inputs"]["cfg"], expected_cfg)
+                sampler = next(n for n in graph.values() if n["class_type"] == "KSampler")
+                self.assertEqual(sampler["inputs"]["cfg"], expected_cfg)
 
     def test_build_edit_workflow_positional_resolution_compatibility(self):
         info = node_info()

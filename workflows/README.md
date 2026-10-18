@@ -7,8 +7,7 @@ Open a file from `ui/` in ComfyUI, or find it in **Workflows → MCP Image Prese
 | `minimax_h3_text_to_image` | H3 still from text, using the installed fl2va checkpoint without keyframes |
 | `minimax_h3_reference_edit` | H3 edit/restyle from one image (`<Picture 1>`) |
 | `minimax_h3_two_references` | H3 composition from two images (`<Picture 1>` and `<Picture 2>`) |
-| `flux2_text_to_image` | FLUX.2 Dev generation, 50 steps/embedded guidance 4 |
-| `flux2_reference_edit` | FLUX.2 Dev reference-guided editing |
+| `krea2_text_to_image` | Krea 2 Turbo generation, 8 steps/CFG 1.0 (`er_sde`/simple) |
 | `qwen21_text_to_image` | Qwen Image 2.1 generation, existing custom 30 steps/CFG 3 preset |
 | `qwen21_reference_edit` | Qwen Image 2.1 instruction editing |
 | `anima_text_to_image` | Anima Aesthetic illustration, 30 steps/CFG 4 |
@@ -24,7 +23,7 @@ Generation examples start at 1024x768. Keep H3 dimensions at multiples of 32. H3
 
 The standalone reference graphs save the generated dimensions. MCP `edit_image` instead computes its working dimensions with `max_side`, then resizes the result back to the source canvas dimensions before compositing. It does not use the standalone 0.75MP sizing node. Both paths approximately follow source proportions after grid rounding. Native `adapt_canvas` applies to reference-video frames only; it does not force still-image canvases to a 768px short edge.
 
-For Flux, shared width/height nodes keep the latent and scheduler in sync. Seeds are fixed for repeatability. Qwen edits use the first image's resolution; select an appropriate input or change its encoder's resolution setting. Images are saved in ComfyUI's output folder under the MCP filename prefixes.
+For Krea 2, shared width/height nodes keep the latent and sampler in sync. Seeds are fixed for repeatability. Qwen edits use the first image's resolution; select an appropriate input or change its encoder's resolution setting. Images are saved in ComfyUI's output folder under the MCP filename prefixes.
 
 The standalone JSONs contain model graphs. MCP canvas layers, undo, masked compositing and exact outside-mask preservation are implemented by the MCP tools, not by these standalone reference-edit graphs.
 

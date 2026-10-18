@@ -1,8 +1,17 @@
 # Memory Bank — MCP Photoshop Server
 
-> Last updated: 2026-10-05
-> Current editing behavior: `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple). `qwen` and `qwen2511` are retired. `flux2` now selects FLUX.2 Dev NVFP4, 32B, at 50 steps/embedded guidance 4 with Mistral Small FP8. Earlier Klein sampling values below are historical.
+> Last updated: 2026-10-18
+> Current generation/editing behavior: `generate_image` defaults to Krea 2 Turbo (`krea2`, 8 steps, `er_sde`/simple, CFG 1.0 distilled) — generation only. `edit_image` defaults to Qwen Image 2.1 (`qwen21`, user-requested 30 steps, CFG 3, Euler/simple); `outpaint` accepts `qwen21` only. `qwen` and `qwen2511` are retired; the FLUX.2 Dev (`flux2`) backend is removed. Earlier FLUX.2/Klein sampling values below are historical.
 > Location: project root of this repository (mcp-photoshop-server)
+
+## 2026-10-18 Krea 2 Turbo (krea2) replaces FLUX.2 Dev as the default generation model
+
+- `config.py`: `MODEL_FLUX2`/encoder/VAE constants replaced by `MODEL_KREA2` (`krea2_turbo_fp8_scaled.safetensors`), `MODEL_KREA2_TEXT_ENCODER` (`qwen3vl_4b_fp8_scaled.safetensors`, CLIP type `krea2` — native to ComfyUI 0.41.0) and `MODEL_KREA2_VAE` (`qwen_image_vae.safetensors`, shared with ANIMA). Model discovery also accepts fallback weight names (nvfp4 / int8_convrot / bf16 variants of the UNET and encoder).
+- `editing.model_profiles`: new krea2 profile — 8 steps, CFG 1.0 (Turbo is CFG-distilled; raising `cfg` runs true classifier-free guidance), `er_sde`/simple, denoise 1.0, generation-only (task gate like anima), `negative_prompt` unsupported (supplied negatives are reported as unused). Generation graph: **UNETLoader → CLIPLoader(krea2) → VAELoader → CLIPTextEncode (positive, empty negative) → EmptyLatentImage → KSampler → VAEDecode → SaveImage**. The `FluxGuidance`/`BasicGuider`/`Flux2Scheduler`/`ReferenceLatent`/`EmptyFlux2LatentImage`/`SamplerCustomAdvanced` chains are retired. 1800 s default timeout; batches budget 1800 s per Krea 2/Qwen job.
+- `outpaint` is now `qwen21`-backend only (Krea 2/Anima are generation-only; H3 does not outpaint); `edit_image` backends are `qwen21` (default) and `minimax_h3`. `prompt_rules`: `MODEL_RULES["krea2"]` compact rules; `get_prompt_guidance` model enum is now krea2/qwen21/anima/minimax_h3, default `krea2`.
+- Files: `masters/flux2prompt.txt` removed; `masters/krea2prompt.txt` blank example template added (the live krea2 master lives in the configured `MASTER_PROMPT_DIR` personal collection). Workflows pack: `krea2_text_to_image.json` (api + ui; 1024x768, 8 steps/CFG 1.0, `er_sde`/simple, `mcp_krea2` prefix) added; `flux2_text_to_image.json` and `flux2_reference_edit.json` removed from `workflows/{api,ui}`.
+- Tests 206 → 207, all green. Live MCP verification (RTX 5090, local LLM container untouched): defaulted-to-krea2 1024x1024 generation (~81 s), all three krea2 character-sheet workflows at full dimensions (T2T 1536x1024 three-view; 3x960x1440 multiview → 2880x1440 stitched; i2i-style 3x1024x1024 → 3072x1024 with `LoadImage` display-only), and an 8/8 diverse-style test. Evidence lives in the local `krea2-setup` folder on the desktop (outside this repo); the gitignored `verification/flux2_dev/` backup folder was removed the same day.
+- The FLUX.2 Dev model files (`flux2-dev-nvfp4`, Mistral encoder, `flux2-vae`) remain installed on disk for standalone ComfyUI workflows only; no MCP code references them. Save canvases and reconnect persistent MCP clients to load the new schemas.
 
 ## 2026-10-05 Master prompt dir: env-first resolution, blank example templates
 
@@ -112,18 +121,18 @@
 - Verification: all 103 regression tests passed. A fresh real MCP stdio connection listed 39 tools, confirmed master rules in all four image-tool descriptions, and successfully read Flux, Anima and Qwen guidance without starting ComfyUI. Evidence: `verification/master_prompt_mcp_status.json`. The persistent HTTP server was not restarted.
 - After adding the Qwen files: all 106 tests passed, including task-based source selection, missing-file errors, single-image wording and mask-only numbering. Real MCP stdio calls returned exact full text and matching SHA-256 for Qwen generation/editing/outpaint and unchanged Flux/Anima sources; all four tool descriptions selected the correct Qwen master. Evidence: `verification/qwen_master_prompt_mcp_status.json`. No GPU inference or persistent-server restart was needed.
 
-## Active sampling presets (updated 2026-09-21)
+## Active sampling presets (updated 2026-10-18)
 
 | Installed backend | Steps | CFG | Sampler | Scheduler |
 |---|---|---|---|---|
 | `qwen21` | 30 | 3 | Euler | Simple |
-| `flux2` (Dev NVFP4, embedded guidance) | 50 | 4 | Euler | Native `Flux2Scheduler` |
+| `krea2` (Turbo FP8, CFG-distilled) | 8 | 1.0 | `er_sde` | Simple |
 | `anima` (Aesthetic v1.1) | 30 | 4 | `er_sde` | Simple |
 
 - User requested these presets. Qwen's 30/3 is a custom preference; the [official Qwen 2.1 workflow](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2-1#sampler-settings) still recommends 25/1. Do not describe 30/3 as official or attach older Lightning/Flash/AuraFlow recipes to 2.1.
 - Sampling defaults live in `editing.model_profiles` and are consumed by generation, batch generation, editing and outpainting. Qwen editing/outpaint CFG now reads that profile instead of a hard-coded 1. The capability report includes sampler, scheduler and denoise. Removed unused global 20-step/CFG-1.5 constants from config.py.
 - Denoise is 1.0 (full schedule); generation defaults to 1024x1024. Anima's documented range is 30–50 steps/CFG 4–5 at roughly 1MP, e.g. 1024x1024 or 896x1152. Existing explicit steps/CFG arguments remain honored where exposed; samplers/schedulers use the profile.
-- [FLUX.2 Dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) uses embedded guidance 4 with 50 steps, Mistral Small and flux2 VAE. Both Klein checkpoints are retired from these workflows and the MCP backend. [Anima Aesthetic](https://huggingface.co/circlestone-labs/Anima#generation-settings) is not Turbo. README lists the same active values.
+- [Krea 2 Turbo](https://krea.ai) is CFG-distilled: 8 steps, `er_sde`/simple, CFG 1.0, Qwen3-VL 4B FP8 encoder (CLIP type `krea2`) and the shared Qwen Image VAE. Both FLUX.2 checkpoints (Klein and Dev) are retired from the MCP backend; the Dev weights remain on disk for standalone ComfyUI workflows. [Anima Aesthetic](https://huggingface.co/circlestone-labs/Anima#generation-settings) is not Turbo. README lists the same active values.
 - Verification: all 92 tests passed. Live Qwen 30/3 generation, cabin recolor, and outpaint completed; outpaint preserved original pixels exactly. Samples and settings are in `verification/sampling_presets/`. These are smoke checks, not a quality comparison against the official preset.
 
 ## 2026-09-20 Model selection by task
@@ -215,7 +224,7 @@
 | `project.py` | Local layered-project persistence | `save_project()`, `load_project()`; atomic save, versioned manifest and lossless PNG members |
 | `jobs.py` | Process-owned background generation | `GenerationJobs`: submit, status, list, graceful cancel; serial workers and per-image results |
 | `server.py` | MCP server + all tool registrations + workflow builders | 45 `@app.tool()` registrations (canvas tools take `session_id`), `GPU_BATCH_RULE` passed as FastMCP `instructions`, `build_upscale_workflow` (outpaint reuses `editing.build_edit_workflow` with server-side PIL padding), `run_workflow()` helper, `free_or_kill_based_on_pressure()` |
-| `editing.py` | Generation and instruction editing backends + live capabilities | 5 `@app.tool()` registrations: `edit_image` (qwen21 default / flux2 Dev; references, masks, layer editing and extraction), `export_mask`, `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `model_profiles`, `build_generation_workflow`, `build_edit_workflow` / `build_semantic_select_workflow` |
+| `editing.py` | Generation and instruction editing backends + live capabilities | 5 `@app.tool()` registrations: `edit_image` (qwen21 default / minimax_h3; krea2 and anima are generation-only; references, masks, layer editing and extraction), `export_mask`, `semantic_select` (SAM 3 text/point/box), `get_editing_capabilities`, `preview_canvas`; `model_profiles`, `build_generation_workflow`, `build_edit_workflow` / `build_semantic_select_workflow` |
 | `prompt_rules.py` | Master prompt integration | Tool description rules, current master-file reader, outer-fence and Anima score-tag normalization |
 | `requirements.txt` | Python dependencies | `mcp<2.0.0`, `Pillow>=10.1.0`, `httpx>=0.27.0`, `websockets>=12.0`, `numpy>=1.24.0`, `python-dotenv>=1.0.0` |
 | `README.md` | User documentation | Installation, usage examples, architecture overview |
@@ -238,18 +247,18 @@
 ### AI Image Generation (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `generate_image` | `(prompt, model="flux2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Flux2, Qwen 2.1, Anima, or MiniMax H3 (experimental stills); model-specific sampling defaults |
+| `generate_image` | `(prompt, model="krea2", width=1024, height=1024, steps=None, cfg=None, seed=None, negative_prompt="", session_id="default", timeout=None)` | txt2img via Krea 2 (Turbo, default), Qwen 2.1, Anima, or MiniMax H3 (experimental stills); model-specific sampling defaults |
 
 ### Prompt Guidance (1)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `get_prompt_guidance` | `(model="flux2", task="generation")` | Current applicable master and tool-specific rules; no ComfyUI or GPU required |
+| `get_prompt_guidance` | `(model="krea2", task="generation")` | Current applicable master and tool-specific rules; no ComfyUI or GPU required |
 
 ### AI Editing + Instruction Editing (4)
 | Tool | Signature | Description |
 |------|-----------|-------------|
-| `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="flux2", timeout=None)` | Extend canvas via Flux2 or Qwen 2.1 reference conditioning; preserve original pixels and layer/mask alignment |
-| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace", h3_reference_detail="match")` | Qwen Image 2.1 (custom 30/3), FLUX.2 Dev (50/4) or MiniMax H3 ref2va (20/BasicGuider, experimental); 1800 s timeout (3600 s for H3); references, masks, composite/selected-layer replacement or Qwen extraction to a new layer; H3 detail `max` keeps full-resolution references independently of output `max_side` |
+| `outpaint` | `(prompt, direction="right", amount=256, steps=None, seed=None, session_id="default", backend="qwen21", timeout=None)` | Extend canvas via Qwen 2.1 reference conditioning (qwen21 only; Krea 2/Anima generation-only, H3 does not outpaint); preserve original pixels and layer/mask alignment |
+| `edit_image` | `(prompt, backend="qwen21", reference_paths=None, mask_path=None, region=None, feather=0, steps=None, seed=None, max_side=1024, session_id="default", timeout=None, cfg=None, layer_index=None, output_mode="replace", h3_reference_detail="match")` | Qwen Image 2.1 (custom 30/3, default) or MiniMax H3 ref2va (20/BasicGuider, experimental); Krea 2 is generation-only; 1800 s timeout (3600 s for H3); references, masks, composite/selected-layer replacement or Qwen extraction to a new layer; H3 detail `max` keeps full-resolution references independently of output `max_side` |
 | `get_editing_capabilities` | `(start_if_needed=True)` | Live model/node availability per task: generation, editing, outpaint; notes carry the GPU batching rule |
 | `preview_canvas` | `(max_size=1024, session_id="default")` | Render current canvas as an image for assistant inspection |
 
@@ -327,7 +336,7 @@
 |------|-----------|-------------|
 | `list_sessions` | `()` | All open document sessions with size/layers/active layer/undo depth |
 | `close_session` | `(session_id="default")` | Close a session, freeing its canvas |
-| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (flux2/qwen21/anima/minimax_h3) on one WebSocket; returns exported paths, model, steps, CFG and seed |
+| `batch_generate` | `(jobs: list[dict], export_dir=None, export_format="PNG", timeout=None)` | Mixed-model txt2img queue (krea2/qwen21/anima/minimax_h3) on one WebSocket; returns exported paths, model, steps, CFG and seed |
 | `submit_generation_job` | `(jobs, export_dir=None, export_format="PNG", timeout_per_image=None)` | Return an ID; generate and export one image at a time in the MCP process |
 | `get_job_status` | `(job_id)` | Progress and per-image results for this server instance |
 | `list_jobs` | `()` | Job summaries for this server instance |
@@ -397,8 +406,8 @@
 
 | Builder | Description | Key Nodes |
 |---------|-------------|-----------|
-| `build_generation_workflow()` | Text-to-image for flux2/qwen21/anima via per-model profiles | flux2: **UNETLoader**, **CLIPLoader** (flux2), **VAELoader**, **CLIPTextEncode** (positive only — Dev does not encode negatives), **FluxGuidance** (embedded guidance), **BasicGuider**, **RandomNoise**, **Flux2Scheduler**, **KSamplerSelect**, **EmptyFlux2LatentImage**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** (50 steps/embedded guidance 4, Euler); qwen21: **TextEncodeQwenImage21** (positive + negative) + **EmptyLatentImage** + **KSampler**; anima: **CLIPTextEncode** (positive + negative) + **EmptyLatentImage** + **KSampler** |
-| Outpaint (in the `outpaint` tool) | Padded canvas built server-side (PIL), then run through `build_edit_workflow` reference conditioning; original pixels restored by the server | flux2: **LoadImage**, **VAEEncode**, **ReferenceLatent** chain, **CLIPTextEncode** (positive only) → **FluxGuidance** → **BasicGuider**, **RandomNoise**, **Flux2Scheduler**, **KSamplerSelect**, **EmptyFlux2LatentImage**, **SamplerCustomAdvanced**, **VAEDecode**, **SaveImage** (50 steps/embedded guidance 4, Euler) |
+| `build_generation_workflow()` | Text-to-image for krea2/qwen21/anima via per-model profiles | krea2: **UNETLoader**, **CLIPLoader** (type `krea2`), **VAELoader**, **CLIPTextEncode** (positive; empty negative — Turbo is CFG-distilled), **EmptyLatentImage**, **KSampler** (8 steps / CFG 1.0, `er_sde`/simple, denoise 1.0), **VAEDecode**, **SaveImage**; qwen21: **TextEncodeQwenImage21** (positive + negative) + **EmptyLatentImage** + **KSampler**; anima: **CLIPTextEncode** (positive + negative) + **EmptyLatentImage** + **KSampler** |
+| Outpaint (in the `outpaint` tool) | Padded canvas built server-side (PIL), then run through `build_edit_workflow` reference conditioning (qwen21 backend only); original pixels restored by the server | qwen21: **LoadImage** (padded canvas) → **JoinImageWithAlpha**, **QwenImage21Cache**, **TextEncodeQwenImage21** (reference conditioning) → **KSampler** (30 steps/CFG 3, Euler/simple), **VAEDecode**, **SaveImage** |
 | `build_upscale_workflow()` | AI upscaling | **LoadImage**, **UpscaleModelLoader**, **ImageUpscaleWithModel**, **SaveImage** |
 
 ---
@@ -424,9 +433,9 @@
 ### Image Generation
 | Model | Directory | Purpose |
 |-------|-----------|---------|
-| `flux2-dev-nvfp4.safetensors` | diffusion_models | FLUX.2 Dev 32B, generation/editing/outpaint; 50 steps / embedded guidance 4 |
-| `mistral_3_small_flux2_fp8.safetensors` | text_encoders | Dev Mistral Small encoder; CLIP type `flux2` |
-| `flux2-vae.safetensors` | vae | FLUX.2 VAE |
+| `krea2_turbo_fp8_scaled.safetensors` | diffusion_models | Krea 2 Turbo 12B DiT (FP8) — generation only; 8 steps, `er_sde`/simple, CFG 1.0 (distilled) |
+| `qwen3vl_4b_fp8_scaled.safetensors` | text_encoders | Krea 2 text encoder; CLIP type `krea2` |
+| `qwen_image_vae.safetensors` | vae | Krea 2 VAE (shared with ANIMA) |
 | `anima-aesthetic-v1.1.safetensors` | diffusion_models | Text-to-image (anime — ANIMA) |
 | `qwen_3_06b_base.safetensors` | text_encoders | ANIMA text encoder |
 | `qwen_image_vae.safetensors` | vae | ANIMA VAE |
@@ -486,7 +495,7 @@ python server.py
 ## 9. Testing Status
 
 ### Verified Working (50 tools)
-- Prompt Guidance: `get_prompt_guidance` (full Flux/Anima masters, task-specific Qwen generation/edit masters and the H3 still master; real MCP stdio verified 2026-09-21, H3 master re-verified 2026-09-22) ✅
+- Prompt Guidance: `get_prompt_guidance` (full Krea 2/Anima masters, task-specific Qwen generation/edit masters and the H3 still master; real MCP stdio verified 2026-09-21, H3 master re-verified 2026-09-22) ✅
 - Canvas Management: `new_canvas`, `export`, `get_info` ✅
 - Local Projects: `save_project`, `open_project` (atomic `.mcpproj` ZIP/JSON/PNG, fresh undo history; unit + live MCP verified 2026-09-22) ✅
 - Transforms: `crop`, `resize`, `rotate`, `flip` ✅
@@ -497,9 +506,9 @@ python server.py
 - Selections: `select_rect`, `select_ellipse`, `clear_mask`, `export_mask` (independent edit-mask PNG with invert/expand/feather; 2026-09-22) ✅
 - History: `undo`, `redo` ✅
 - System: `get_comfyui_status`, `clear_vram` ✅
-- AI Generation: `generate_image` (Flux2 + ANIMA) ✅
-- AI Editing: `outpaint` (Flux2 chain, rewritten + live-verified 2026-09-20) ✅
-- Instruction Editing: `edit_image` (qwen21 + flux2), `get_editing_capabilities`, `preview_canvas` ✅
+- AI Generation: `generate_image` (Krea 2 + ANIMA + Qwen 2.1 + H3) ✅
+- AI Editing: `outpaint` (Qwen 2.1 reference conditioning, live-verified 2026-10-18) ✅
+- Instruction Editing: `edit_image` (qwen21 + minimax_h3), `get_editing_capabilities`, `preview_canvas` ✅
 - Removed 2026-09-20 (models deleted from ComfyUI / superseded): `img2img`, `character_transform`, `inpaint`, `controlnet_generate`, `style_transfer` — see "2026-09-20 Tool Cleanup"
 - Upscale: `upscale` (anime + face + x4plus general-photo model, live MCP test 2026-09-17) ✅
 - Semantic Selection: `semantic_select` (SAM 3 text/point/box, live CPU MCP test 2026-09-17) ✅
@@ -539,7 +548,7 @@ python server.py
 | `searxng` | `:8080` | No (CPU-only) | Never stop it for GPU speed |
 
 **Procedure (any LLM client):**
-1. Single generation with sufficient GPU memory: run it directly. Dev defaults to 50 steps; the four-step Klein recipe is retired.
+1. Single generation with sufficient GPU memory: run it directly. Krea 2 Turbo defaults to 8 steps; the FLUX.2 50-step and four-step Klein recipes are retired.
 2. Multiple generations or any long job (e.g. `qwen21` edits, full batches):
    a. Plan the complete job list with the user first.
    b. Hand the complete input list to `submit_generation_job` on an independently running host MCP server, or to a detached host runner. Verify that its process survives loss of the LLM connection; sequential awaited tool calls do not establish background ownership.
@@ -555,6 +564,15 @@ python server.py
 ---
 
 ## 12. Changelog
+
+### 2026-10-18 — Krea 2 Turbo (krea2) replaces FLUX.2 Dev as default generation model
+- `config.py`: `MODEL_FLUX2` → `MODEL_KREA2` (`krea2_turbo_fp8_scaled.safetensors`), `MODEL_KREA2_TEXT_ENCODER` (`qwen3vl_4b_fp8_scaled.safetensors`; CLIP type `krea2`, native in ComfyUI 0.41.0), `MODEL_KREA2_VAE` (`qwen_image_vae.safetensors`, shared with ANIMA). Fallback weight names (nvfp4/int8_convrot/bf16 variants) accepted by discovery.
+- `editing.model_profiles`: krea2 profile — 8 steps, CFG 1.0 (Turbo is CFG-distilled; higher cfg = true CFG), `er_sde`/simple, denoise 1.0, generation-only, negative prompts unsupported (reported as unused). Generation graph: UNETLoader → CLIPLoader(krea2) → VAELoader → CLIPTextEncode (positive, empty negative) → EmptyLatentImage → KSampler → VAEDecode → SaveImage; the FluxGuidance/BasicGuider/Flux2Scheduler/ReferenceLatent/EmptyFlux2LatentImage/SamplerCustomAdvanced chains are retired. 1800 s default timeout; batch budget 1800 s per Krea 2/Qwen job.
+- `outpaint`: qwen21-only backend (Krea 2/Anima generation-only; H3 no outpaint). `edit_image` backends: qwen21 (default) / minimax_h3.
+- `masters/`: `flux2prompt.txt` removed; `krea2prompt.txt` blank example template added (live krea2 master in the configured `MASTER_PROMPT_DIR` collection). `prompt_rules`: `MODEL_RULES["krea2"]` compact rules; `get_prompt_guidance` model enum krea2/qwen21/anima/minimax_h3, default `krea2`.
+- Workflows pack: `krea2_text_to_image.json` (api + ui; 1024x768, 8 steps/CFG 1.0/`er_sde`/simple, `mcp_krea2` prefix) added; `flux2_text_to_image.json` and `flux2_reference_edit.json` removed from `workflows/{api,ui}`.
+- Tests 206 → 207, all green. Live MCP verification (RTX 5090, local LLM container untouched): defaulted-to-krea2 1024x1024 generation (~81 s); three krea2 character-sheet workflows at full dimensions (T2T 1536x1024 three-view; 3x960x1440 multiview → 2880x1440 stitched; i2i-style 3x1024x1024 → 3072x1024, `LoadImage` display-only) all produced complete sheets; 8/8 diverse-style test. Evidence in the local `krea2-setup` folder (desktop, outside the repo); the gitignored `verification/flux2_dev/` backup folder removed the same day.
+- FLUX.2 Dev model files remain installed for standalone ComfyUI workflows only; no MCP code references them. Save canvases and reconnect persistent MCP clients.
 
 ### 2026-09-22 — Master-prompt compliance audit and live Qwen21/Anima proof
 - Re-verified all four local master files through live MCP `get_prompt_guidance` (path + SHA-256 + full text per call): qwen21 t2i/edit and anima hashes matched the previously verified records; `flux2prompt.txt` had drifted to the 2026-09-19 FLUX.2 [dev] revision (SHA `eda66664…870f`) and the served text now reflects it.

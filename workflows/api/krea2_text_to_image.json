@@ -14,21 +14,21 @@
   "1": {
     "class_type": "UNETLoader",
     "inputs": {
-      "unet_name": "flux2-dev-nvfp4.safetensors",
+      "unet_name": "krea2_turbo_fp8_scaled.safetensors",
       "weight_dtype": "default"
     }
   },
   "2": {
     "class_type": "CLIPLoader",
     "inputs": {
-      "clip_name": "mistral_3_small_flux2_fp8.safetensors",
-      "type": "flux2"
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+      "type": "krea2"
     }
   },
   "3": {
     "class_type": "VAELoader",
     "inputs": {
-      "vae_name": "flux2-vae.safetensors"
+      "vae_name": "qwen_image_vae.safetensors"
     }
   },
   "4": {
@@ -42,17 +42,17 @@
     }
   },
   "5": {
-    "class_type": "FluxGuidance",
+    "class_type": "CLIPTextEncode",
     "inputs": {
-      "conditioning": [
-        "4",
+      "clip": [
+        "2",
         0
       ],
-      "guidance": 4.0
+      "text": ""
     }
   },
   "6": {
-    "class_type": "EmptyFlux2LatentImage",
+    "class_type": "EmptyLatentImage",
     "inputs": {
       "width": [
         "size_width",
@@ -66,74 +66,37 @@
     }
   },
   "7": {
-    "class_type": "BasicGuider",
+    "class_type": "KSampler",
     "inputs": {
       "model": [
         "1",
         0
       ],
-      "conditioning": [
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
         "5",
-        0
-      ]
-    }
-  },
-  "8": {
-    "class_type": "RandomNoise",
-    "inputs": {
-      "noise_seed": 20260922
-    }
-  },
-  "9": {
-    "class_type": "Flux2Scheduler",
-    "inputs": {
-      "steps": 50,
-      "width": [
-        "size_width",
-        0
-      ],
-      "height": [
-        "size_height",
-        0
-      ]
-    }
-  },
-  "10": {
-    "class_type": "KSamplerSelect",
-    "inputs": {
-      "sampler_name": "euler"
-    }
-  },
-  "11": {
-    "class_type": "SamplerCustomAdvanced",
-    "inputs": {
-      "noise": [
-        "8",
-        0
-      ],
-      "guider": [
-        "7",
-        0
-      ],
-      "sampler": [
-        "10",
-        0
-      ],
-      "sigmas": [
-        "9",
         0
       ],
       "latent_image": [
         "6",
         0
-      ]
+      ],
+      "seed": 20260922,
+      "steps": 8,
+      "cfg": 1.0,
+      "sampler_name": "er_sde",
+      "scheduler": "simple",
+      "denoise": 1.0
     }
   },
-  "12": {
+  "8": {
     "class_type": "VAEDecode",
     "inputs": {
       "samples": [
-        "11",
+        "7",
         0
       ],
       "vae": [
@@ -142,14 +105,14 @@
       ]
     }
   },
-  "13": {
+  "9": {
     "class_type": "SaveImage",
     "inputs": {
       "images": [
-        "12",
+        "8",
         0
       ],
-      "filename_prefix": "mcp_flux2"
+      "filename_prefix": "mcp_krea2"
     }
   }
 }

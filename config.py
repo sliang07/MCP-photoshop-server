@@ -49,9 +49,9 @@ DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 
 # Model names (match installed models)
-MODEL_FLUX2 = "flux2-dev-nvfp4.safetensors"
-MODEL_FLUX2_TEXT_ENCODER = "mistral_3_small_flux2_fp8.safetensors"
-MODEL_FLUX2_VAE = "flux2-vae.safetensors"
+MODEL_KREA2 = "krea2_turbo_fp8_scaled.safetensors"
+MODEL_KREA2_TEXT_ENCODER = "qwen3vl_4b_fp8_scaled.safetensors"
+MODEL_KREA2_VAE = "qwen_image_vae.safetensors"
 
 # ANIMA model (anime-style generation)
 MODEL_ANIMA = "anima-aesthetic-v1.1.safetensors"
@@ -65,7 +65,7 @@ MODEL_UPSCALE_GENERAL = "RealESRGAN_x4plus.pth"
 
 # Server settings
 SERVER_NAME = "mcp-photoshop-server"
-# Master prompt files (flux2prompt.txt, anima_prompt.txt, the two Qwen 2.1 masters,
+# Master prompt files (krea2prompt.txt, anima_prompt.txt, the two Qwen 2.1 masters,
 # minimax_h3_pseudo_image_master.txt) read by get_prompt_guidance.
 # MASTER_PROMPT_DIR (set in .env or the environment) is used when it points to an
 # existing directory; otherwise the repository-local masters/ folder is the fallback.
